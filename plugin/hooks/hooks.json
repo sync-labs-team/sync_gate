@@ -1,0 +1,1 @@
+{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"sync_gate hook session-start","timeout":10,"statusMessage":"sync_gate: checking the queue setup"}]}]}}

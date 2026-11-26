@@ -1,0 +1,48 @@
+# The proof scenario: four heavy lanes at once (as 4 agents would run them) plus 10 idle MCP
+# sessions. Read by `cargo xtask bench` (docs/benchmark.md). Placeholders: {dir} the lane's
+# folder, {target} a build folder of its own, {bin} the sync_gate binaries, {exe} ".exe" on Windows.
+
+[server]
+# NOT YET MEASURED on a loaded machine: package and version checked with `npm view` on 2026-11-20.
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-everything@2.3.1"]
+
+# NOT YET MEASURED: the two Next.js apps below were picked for license (MIT) and for building
+# without a secret, from their package.json and file list. The first `setup` + `next build` of
+# each has not run (the peak of a build alone, which should be 1.5 GB or more, is a Task 10 check).
+[[lane]]
+name = "next-a"
+repo = "https://github.com/steven-tey/precedent"
+rev = "3be40205d7cdf56082cd284f07f12251b9208f79"
+license = "MIT"
+prepare = [["pnpm", "install", "--frozen-lockfile"]]
+command = ["node", "{dir}/node_modules/next/dist/bin/next", "build"]
+clean = [".next"]
+done = { file = ".next/BUILD_ID" }
+
+[[lane]]
+name = "next-b"
+repo = "https://github.com/vercel/nextjs-postgres-nextauth-tailwindcss-template"
+rev = "fe026711c19ac3ee4589c86a738f59b84e611559"
+license = "MIT"
+prepare = [["pnpm", "install", "--frozen-lockfile"]]
+command = ["node", "{dir}/node_modules/next/dist/bin/next", "build"]
+clean = [".next"]
+done = { file = ".next/BUILD_ID" }
+
+# No repo: this lane runs in the clone of the candidate. No nested sync_gate (unlike pg_e2e).
+[[lane]]
+name = "cargo"
+prepare = [["cargo", "fetch", "--locked"]]
+command = ["cargo", "build", "--release", "--locked", "-p", "sync_gate", "-p", "sync_gated", "-p", "sync_gate_shim"]
+env = { CARGO_TARGET_DIR = "{target}", CARGO_NET_OFFLINE = "true" }
+done = { file = "{target}/release/sync_gated{exe}" }
+
+# The base image is pulled by `setup`; the phase starts without the image this lane builds, so
+# the image that exists afterwards is new.
+[[lane]]
+name = "docker"
+prepare = [["docker", "pull", "rust:1.100-slim"]]
+command = ["docker", "build", "--no-cache", "-t", "sync_gate-bench:docker", "tools/linux-pg"]
+clean_commands = [["docker", "rmi", "-f", "sync_gate-bench:docker"]]
+done = { command = ["docker", "image", "inspect", "sync_gate-bench:docker"] }

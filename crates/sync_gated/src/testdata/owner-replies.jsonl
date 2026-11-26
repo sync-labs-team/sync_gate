@@ -1,0 +1,10 @@
+{"Admitted":{"id":1001}}
+{"Queued":{"id":1002,"position":0}}
+{"Status":{"snapshot":{"total":4294967296,"available":2147483648,"reclaimable":0,"swap_used":0,"swap_total":0,"vram":null},"running":[[1001,"cargo build @ site",0]],"queued":[[1002,"cargo test @ site",0]],"paused":[],"decisions":["[0s] admitted #1001"],"mcp":[],"daemon":{"pid":1,"start_time":2,"data_dir":null},"services":[]}}
+"Ack"
+{"Queued":{"id":1002,"position":0}}
+"Ack"
+"Ack"
+{"Status":{"snapshot":{"total":4294967296,"available":2147483648,"reclaimable":0,"swap_used":0,"swap_total":0,"vram":null},"running":[],"queued":[],"paused":[],"decisions":["[0s] admitted #1001","[0s] dormant #1002: nobody waiting","[0s] cancelled #1002: by client","[0s] finished #1001: peak 700 MiB, exit 0"],"mcp":[],"daemon":{"pid":1,"start_time":2,"data_dir":null},"services":[]}}
+{"Error":{"message":"unknown ticket #42"}}
+{"Error":{"message":"postgres is not configured"}}

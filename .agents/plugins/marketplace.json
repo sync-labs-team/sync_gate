@@ -1,0 +1,12 @@
+{
+  "name": "sync_gate",
+  "interface": { "displayName": "sync_gate" },
+  "plugins": [
+    {
+      "name": "sync-gate",
+      "source": { "source": "local", "path": "./plugin" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+      "category": "Developer Tools"
+    }
+  ]
+}

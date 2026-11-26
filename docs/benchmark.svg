@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 230" role="img" aria-labelledby="t d">
+<title id="t">sync_gate benchmark</title><desc id="d">proxy: heavy commands of 4 agents + 10 MCP sessions; agent processes not included</desc>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--without:#c0392b;--with:#1a7f4b}
+@media (prefers-color-scheme: dark){:root{--bg:#0d1117;--fg:#e6edf3;--without:#ff7b72;--with:#56d364}}
+text{fill:var(--fg);font:12px sans-serif}
+.bg{fill:var(--bg)}.without{fill:var(--without)}.with{fill:var(--with)}
+</style>
+<rect class="bg" width="620" height="230"/>
+<g id="lost"><text x="20" y="28">Jobs lost to memory</text>
+<text x="20" y="60">Without</text><rect class="without" x="20" y="68" width="0" height="24"/><text x="26" y="86">0</text>
+<text x="20" y="140">With</text><rect class="with" x="20" y="148" width="0" height="24"/><text x="26" y="166">0</text>
+</g>
+<g id="ram"><text x="220" y="28">Peak RAM (%)</text>
+<text x="220" y="60">Without</text><rect class="without" x="220" y="68" width="147" height="24"/><text x="373" y="86">98</text>
+<text x="220" y="140">With</text><rect class="with" x="220" y="148" width="134" height="24"/><text x="360" y="166">90</text>
+</g>
+<g id="mcp"><text x="420" y="28">MCP processes</text>
+<text x="420" y="60">Without</text><rect class="without" x="420" y="68" width="150" height="24"/><text x="576" y="86">40</text>
+<text x="420" y="140">With</text><rect class="with" x="420" y="148" width="15" height="24"/><text x="441" y="166">4</text>
+</g>
+</svg>

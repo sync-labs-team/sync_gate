@@ -1,0 +1,17 @@
+# A short run of the same machinery (`bench run --phase both`, under 3 minutes): two light lanes
+# and sync_gate's own MCP server (no Node). The proof is that the lane command still runs, so this
+# shows the orchestration works, not that any heavy work does.
+
+[server]
+command = "{bin}/sync_gate{exe}"
+args = ["mcp", "serve"]
+
+[[lane]]
+name = "light-a"
+command = ["{bin}/sync_gate{exe}", "--version"]
+done = { command = ["{bin}/sync_gate{exe}", "--version"] }
+
+[[lane]]
+name = "light-b"
+command = ["{bin}/sync_gate{exe}", "--version"]
+done = { command = ["{bin}/sync_gate{exe}", "--version"] }

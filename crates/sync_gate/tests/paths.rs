@@ -1,0 +1,161 @@
+//! `sync_gate paths` through the real binary (no daemon, no pipe touched), and the CLI against a
+//! daemon on a `SYNC_GATE_SOCKET` of its own.
+
+use std::path::PathBuf;
+use std::process::{Command, Output};
+use std::sync::Arc;
+use sync_gate_core::Config;
+use sync_gate_probe::Probe;
+use sync_gated::{OsControl, OsLauncher};
+
+struct Env {
+    dir: PathBuf,
+}
+
+impl Env {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("sync_gate-t1p-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Env { dir }
+    }
+    fn data(&self) -> PathBuf {
+        self.dir.join("data")
+    }
+    fn config(&self) -> PathBuf {
+        self.dir.join("config.toml")
+    }
+    fn cmd(&self, args: &[&str], socket: Option<&str>) -> Command {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_sync_gate"));
+        c.args(args)
+            .env("SYNC_GATE_DATA_DIR", self.data())
+            .env("SYNC_GATE_CONFIG", self.config())
+            .env_remove("SYNC_GATE_SOCKET");
+        if let Some(s) = socket {
+            c.env("SYNC_GATE_SOCKET", s);
+        }
+        c
+    }
+    fn paths(&self, socket: Option<&str>) -> Output {
+        self.cmd(&["paths"], socket).output().unwrap()
+    }
+}
+
+impl Drop for Env {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn lines(out: &Output) -> Vec<(String, String)> {
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout.clone())
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let (k, v) = l.split_once('=').unwrap();
+            (k.to_owned(), v.to_owned())
+        })
+        .collect()
+}
+
+fn get<'a>(l: &'a [(String, String)], key: &str) -> &'a str {
+    &l.iter().find(|(k, _)| k == key).unwrap().1
+}
+
+#[test]
+fn paths_reports_the_temporary_locations_and_the_socket_override() {
+    let e = Env::new("a");
+    let l = lines(&e.paths(Some("x")));
+    let keys: Vec<_> = l.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        keys,
+        ["config", "data", "shims", "adopted", "socket", "hub"]
+    );
+    assert_eq!(get(&l, "config"), e.config().to_str().unwrap());
+    assert_eq!(get(&l, "data"), e.data().to_str().unwrap());
+    assert_eq!(get(&l, "shims"), e.data().join("shims").to_str().unwrap());
+    assert_eq!(
+        get(&l, "adopted"),
+        e.data().join("mcp-adopted.json").to_str().unwrap()
+    );
+    assert_eq!(get(&l, "socket"), "x");
+    assert_eq!(get(&l, "hub"), "x-mcp");
+}
+
+#[test]
+fn empty_socket_override_falls_back_to_the_default_names() {
+    let e = Env::new("b");
+    let default = lines(&e.paths(None));
+    let empty = lines(&e.paths(Some("")));
+    for k in ["socket", "hub"] {
+        assert_eq!(get(&empty, k), get(&default, k), "{k}");
+        assert!(!get(&empty, k).is_empty(), "{k}");
+    }
+    assert_ne!(get(&empty, "hub"), "-mcp");
+}
+
+#[test]
+fn cli_reaches_a_daemon_named_by_sync_gate_socket() {
+    let e = Env::new("c");
+    let account = format!("fgt1x{}", std::process::id());
+    let sock = if cfg!(windows) {
+        format!("sync_gate-t1p-{}", std::process::id())
+    } else {
+        e.dir.join("s.sock").to_string_lossy().into_owned()
+    };
+    let daemon = sync_gated::run_with(
+        Config::default(),
+        &sock,
+        Probe::new(),
+        OsControl,
+        Some(e.data()),
+        Arc::new(OsLauncher::default()),
+    )
+    .unwrap();
+    let outs: Vec<_> = [vec!["status"], vec!["mcp", "list"]]
+        .iter()
+        .map(|a| {
+            let mut c = e.cmd(a, Some(&sock));
+            // The daemon's account is fake: only the override can lead the CLI to it.
+            c.env(if cfg!(windows) { "USERNAME" } else { "USER" }, &account);
+            c.output().unwrap()
+        })
+        .collect();
+    daemon.shutdown();
+    for out in outs {
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("not running"));
+    }
+}
+
+#[test]
+fn the_default_folders_are_under_the_sync_labs_vendor_folder() {
+    let e = Env::new("v");
+    let mut c = e.cmd(&["paths"], Some("x"));
+    c.env_remove("SYNC_GATE_DATA_DIR")
+        .env_remove("SYNC_GATE_CONFIG");
+    let l = lines(&c.output().unwrap());
+    let (config, data) = (get(&l, "config").to_owned(), get(&l, "data").to_owned());
+    // The vendor folder exists on Windows (`sync_labs\sync_gate`) and macOS (`dev.sync_labs.sync_gate`) only.
+    if cfg!(any(windows, target_os = "macos")) {
+        assert!(
+            config.contains("sync_labs") && data.contains("sync_labs"),
+            "{config} {data}"
+        );
+    }
+    assert!(
+        !config.contains("synclabs") && !data.contains("synclabs"),
+        "{config} {data}"
+    );
+}

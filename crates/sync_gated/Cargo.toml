@@ -1,0 +1,44 @@
+[package]
+name = "sync_gated"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+description = "sync_gate: the daemon that admits, queues and supervises heavy jobs"
+rust-version.workspace = true
+
+[dependencies]
+ctrlc = { version = "3.5", features = ["termination"] }
+directories = "6"
+sync_gate_core = { path = "../sync_gate_core", features = ["ipc"] }
+sync_gate_hub = { path = "../sync_gate_hub" }
+sync_gate_probe = { path = "../sync_gate_probe" }
+interprocess = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sysinfo = { workspace = true }
+
+[features]
+# Test support (`services::testkit`) for other crates' tests; always on in this crate's tests.
+testkit = []
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+nix = { workspace = true, features = ["fs", "signal", "user"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+] }
+widestring = "1"

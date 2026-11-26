@@ -1,0 +1,38 @@
+[package]
+name = "sync_gate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+description = "sync_gate: the CLI that asks the daemon for admission"
+rust-version.workspace = true
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+ctrlc = "3.5"
+sync_gate_core = { path = "../sync_gate_core", features = ["ipc"] }
+sync_gate_probe = { path = "../sync_gate_probe" }
+sync_gate_shim = { path = "../sync_gate_shim" }
+interprocess = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["user", "fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+sync_gated = { path = "../sync_gated", features = ["testkit"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true, features = ["signal"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+widestring = "1"
+# xuser_windows.rs: read the daemon's own stderr line (SetStdHandle).
+windows-sys = { workspace = true, features = ["Win32_System_Console", "Win32_System_Threading"] }

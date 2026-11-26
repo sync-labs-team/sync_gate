@@ -1,0 +1,13 @@
+{
+  "name": "sync_gate",
+  "description": "sync_gate: a queue for heavy builds, tests and installs.",
+  "owner": { "name": "sync_labs" },
+  "plugins": [
+    {
+      "name": "sync-gate",
+      "description": "Session hook, skill and MCP server for the sync_gate queue.",
+      "source": "./plugin",
+      "category": "development"
+    }
+  ]
+}

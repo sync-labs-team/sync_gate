@@ -1,0 +1,55 @@
+name: CI
+
+# The checks run on the developer's machine: `cargo xtask ci --publish` runs rustfmt, clippy for
+# the three systems and the tests (Windows or macOS host, plus Linux in a container) and records
+# the result on the commit as the statuses `local/<system>`.
+#
+# Hosted runners are billed by the minute (Linux x1, Windows x2, macOS x10), so this workflow
+# never starts by itself. It stays for a manual run from the Actions tab: Linux and Windows,
+# plus macOS when the `macos` box is ticked. macOS has no local run yet: that box is the only
+# place where the tests execute on it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      macos:
+        description: Also run on macOS (billed x10)
+        type: boolean
+        default: false
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - if: runner.os == 'Linux'
+        run: echo "SYNC_GATE_TEST_PG_BIN=$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)" >> "$GITHUB_ENV"
+      - if: runner.os == 'Windows'
+        run: echo "SYNC_GATE_TEST_PG_BIN=$env:PGBIN" >> $env:GITHUB_ENV
+      - run: cargo test --workspace
+
+  test-macos:
+    if: inputs.macos
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: brew install postgresql@17 && echo "SYNC_GATE_TEST_PG_BIN=$(brew --prefix postgresql@17)/bin" >> "$GITHUB_ENV"
+      - run: cargo test --workspace
