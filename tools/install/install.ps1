@@ -20,7 +20,7 @@ param(
 
 # The domain appears only in the commands printed at the end; files are always fetched from GitHub.
 $script:SgCommandUrl = 'https://gate.synclabs.team/install.ps1'
-$script:SgRepo = 'Sync-Labs-team/sync_gate'
+$script:SgRepo = 'sync-labs-team/sync_gate'
 $script:SgTarget = 'x86_64-pc-windows-msvc'
 $script:SgExes = @('sync_gate.exe', 'sync_gated.exe', 'sync_gate_mcp.exe')   # the sync_gate_shim crate builds sync_gate_mcp.exe; sync_gate_shim.exe is only the shims folder's copy of sync_gate.exe
 $script:SgOwnNames = @('SYNC_GATE_SOCKET', 'SYNC_GATE_DATA_DIR', 'SYNC_GATE_CONFIG', 'SYNC_GATE_INSTALL_DIR')
@@ -1025,9 +1025,9 @@ function Write-SgGuestHint {
 
 function Write-SgPluginHints {
     Write-SgLine 'Agent plugin (the installer does not install it):'
-    Write-SgLine '  claude plugin marketplace add Sync-Labs-team/sync_gate'
+    Write-SgLine '  claude plugin marketplace add sync-labs-team/sync_gate'
     Write-SgLine '  claude plugin install sync-gate@sync_gate'
-    Write-SgLine '  codex plugin marketplace add Sync-Labs-team/sync_gate'
+    Write-SgLine '  codex plugin marketplace add sync-labs-team/sync_gate'
     Write-SgLine '  codex plugin add sync-gate@sync_gate'
 }
 

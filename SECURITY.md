@@ -10,7 +10,7 @@
 ## Report a vulnerability
 
 Report it in private: on the repository page, open **Security**, then **Report a vulnerability**
-(https://github.com/Sync-Labs-team/sync_gate/security/advisories/new). Do not open a public issue
+(https://github.com/sync-labs-team/sync_gate/security/advisories/new). Do not open a public issue
 for a vulnerability. Include the version (`sync_gate --version`), the operating system, what you ran
 and what happened.
 

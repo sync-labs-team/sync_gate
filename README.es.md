@@ -60,7 +60,7 @@ Sin permisos de administrador. Solo escribe en tus carpetas. Actualizar, desinst
 ## Inicio rápido
 
 ```sh
-claude plugin marketplace add Sync-Labs-team/sync_gate
+claude plugin marketplace add sync-labs-team/sync_gate
 claude plugin install sync-gate@sync_gate
 sync_gate mcp adopt
 ```

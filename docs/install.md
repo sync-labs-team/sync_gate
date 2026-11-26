@@ -11,8 +11,8 @@ before anything is changed.
 
 To skip the domain, use the GitHub addresses of the same files:
 
-- `https://github.com/Sync-Labs-team/sync_gate/releases/latest/download/install.ps1`
-- `https://github.com/Sync-Labs-team/sync_gate/releases/latest/download/install.sh`
+- `https://github.com/sync-labs-team/sync_gate/releases/latest/download/install.ps1`
+- `https://github.com/sync-labs-team/sync_gate/releases/latest/download/install.sh`
 
 Pin a version with `-Version 0.1.0` (Windows, in the scriptblock form above) or
 `sh -s -- --version 0.1.0` (macOS, Linux). Running the install command again updates.
@@ -95,7 +95,7 @@ until the new daemon answers.
   Close the program it names and run the command again. If it fails again, the folder holds
   the old programs, the old launcher, unit or plist,
   the old `PATH` text and the old profile or shell files: copy back by hand what is missing, then
-  run the install command. Report it at https://github.com/Sync-Labs-team/sync_gate/issues without
+  run the install command. Report it at https://github.com/sync-labs-team/sync_gate/issues without
   pasting paths of your machine.
 
 ## Own values
@@ -143,7 +143,7 @@ throwaway names, so a test cannot touch your real setup.
 ## Install by hand
 
 1. Download the archive for your system from the
-   [release](https://github.com/Sync-Labs-team/sync_gate/releases) and check it against
+   [release](https://github.com/sync-labs-team/sync_gate/releases) and check it against
    `SHA256SUMS`.
 2. Put `sync_gate`, `sync_gated` and `sync_gate_mcp` in one folder and add it to your `PATH`.
 3. Run `sync_gate shims install`. It creates the shortcuts folder and prints it; put that folder

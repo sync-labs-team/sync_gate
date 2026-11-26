@@ -598,7 +598,7 @@ s410() {
   case $(uname -m) in aarch64 | arm64) apple=aarch64-apple-darwin ;; *) apple=x86_64-apple-darwin ;; esac
   run_install
   [ "$RC" -eq 0 ] || fail 4.10 "install with cargo exited $RC"
-  grep -E "^cargo install --locked --git https://github.com/Sync-Labs-team/sync_gate --tag v0.1.0 --root .+ sync_gate sync_gated sync_gate_shim\$" "$HOME/calls.log" > /dev/null \
+  grep -E "^cargo install --locked --git https://github.com/sync-labs-team/sync_gate --tag v0.1.0 --root .+ sync_gate sync_gated sync_gate_shim\$" "$HOME/calls.log" > /dev/null \
     || fail 4.10 "cargo install call not found in calls.log"
   mk_home mac
   mv "$FAKE/cargo" "$FAKE/cargo.off"

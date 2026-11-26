@@ -59,7 +59,7 @@ No administrator rights. It only writes to your own folders. Update, uninstall a
 ## Quickstart
 
 ```sh
-claude plugin marketplace add Sync-Labs-team/sync_gate
+claude plugin marketplace add sync-labs-team/sync_gate
 claude plugin install sync-gate@sync_gate
 sync_gate mcp adopt
 ```

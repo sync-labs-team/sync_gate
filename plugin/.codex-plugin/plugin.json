@@ -1,10 +1,10 @@
 {
   "name": "sync-gate",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "sync_gate: queue heavy builds, tests and installs so parallel AI agents do not fight over the machine.",
   "author": { "name": "sync_labs" },
   "homepage": "https://gate.synclabs.team",
-  "repository": "https://github.com/Sync-Labs-team/sync_gate",
+  "repository": "https://github.com/sync-labs-team/sync_gate",
   "license": "MIT OR Apache-2.0",
   "skills": "./skills/",
   "hooks": "./hooks/hooks.json",

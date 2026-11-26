@@ -5,7 +5,7 @@ Codex or any other) working in this repository or using sync_gate on someone's m
 
 ## Contribute on GitHub
 
-Repository: https://github.com/Sync-Labs-team/sync_gate
+Repository: https://github.com/sync-labs-team/sync_gate
 
 - **Report bugs.** When sync_gate misbehaves (a command blocked or slowed for no reason, a wrong exit code, a crash, a
   queue that never moves, a shared MCP server that fails), draft an issue with what you ran, what you expected, what
@@ -25,7 +25,7 @@ people's names, user names, paths of a machine, and data of any project. Use neu
 
 Issues and pull requests are public and go out under the user's GitHub account.
 
-1. Search the existing issues first (`gh issue list --repo Sync-Labs-team/sync_gate --state all --search "<terms>"`);
+1. Search the existing issues first (`gh issue list --repo sync-labs-team/sync_gate --state all --search "<terms>"`);
    if one already covers it, add what is new as a comment instead of opening another.
 2. Remove secrets, tokens, private paths, client names and project data from everything you paste.
 3. Show the user the draft and open the issue or pull request only after the user approves.

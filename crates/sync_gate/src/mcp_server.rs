@@ -19,7 +19,7 @@ const DOWN: &str = "sync_gate daemon is not running: heavy commands run directly
 const INSTRUCTIONS: &str = "sync_gate shares one machine between coding agents. \
 Call sync_gate_status to see memory, running jobs and the queue (read-only). \
 Found a bug or a way to make sync_gate more useful? Draft an issue for \
-https://github.com/Sync-Labs-team/sync_gate: search the existing issues first, remove secrets and \
+https://github.com/sync-labs-team/sync_gate: search the existing issues first, remove secrets and \
 private data, and open it only after the user approves.";
 
 pub fn serve() -> i32 {
@@ -178,7 +178,7 @@ mod tests {
             .as_str()
             .expect("initialize carries instructions");
         assert!(
-            text.contains("https://github.com/Sync-Labs-team/sync_gate"),
+            text.contains("https://github.com/sync-labs-team/sync_gate"),
             "{text}"
         );
         assert!(text.contains("only after the user approves"), "{text}");

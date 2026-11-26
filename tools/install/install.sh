@@ -11,7 +11,7 @@
 set -eu
 
 COMMAND_URL=https://gate.synclabs.team/install.sh
-REPO_URL=https://github.com/Sync-Labs-team/sync_gate
+REPO_URL=https://github.com/sync-labs-team/sync_gate
 # 1: values with $, % or \ go into the systemd unit escaped as esc_env/esc_exec say. Proven on a real systemd 255
 # (Task 4 Step 3: the daemon's environ held the raw text). 0 refuses them (fail closed).
 # shortcut: proven only on systemd 255.4, set to 0 if another version reads the unit differently.
