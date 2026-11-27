@@ -13,7 +13,9 @@ automatically, through shims on the `PATH`. Light commands (`ls`, `git status`) 
 
 - **75**: still queued after the maximum wait. The command did NOT run. The output has
   `queued: ticket N`. Resume with `sync_gate wait N`: it
-  takes the slot AND runs the stored command, so never run the original command again. If
+  takes the slot AND runs the stored command, so never run the original command again. The stored
+  command runs with the environment of the shell that calls it, not the one it was first run in:
+  call `wait` from a shell that has the same variables. If
   `wait` exits 75 again, resume with the ticket it prints. The stored command is deleted 25 h
   after it was saved or its last `sync_gate wait` began, unless a wait on it is in progress;
   after that, `wait N` exits 2 with `sync_gate: ticket N expired or is gone` and nothing runs:

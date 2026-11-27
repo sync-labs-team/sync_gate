@@ -127,6 +127,7 @@ fn the_skill_names_the_exit_code_and_the_resume() {
         "SKILL.md must say wait runs the stored command"
     );
     assert!(skill.contains("never run the original command again"));
+    assert!(skill.contains("environment of the shell that calls it"));
     assert!(!skill.contains("then run the same command again"));
     assert!(skill.contains("could not be started"));
     assert!(skill.contains(".ps1"));
