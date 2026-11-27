@@ -25,15 +25,6 @@ fn program(arg: &OsStr) -> String {
         .to_lowercase()
 }
 
-/// Arguments that do not start with `-`, lossy-converted.
-fn words(argv: &[OsString]) -> Vec<String> {
-    argv.iter()
-        .skip(1)
-        .map(|a| a.to_string_lossy().into_owned())
-        .filter(|a| !a.starts_with('-'))
-        .collect()
-}
-
 /// A word shaped like a subcommand: 1 to 24 bytes of `a-z 0-9 . _ -`, starting with `a-z`.
 /// Options, `KEY=value`, URLs, paths and long or upper-case tokens never are.
 fn is_key_word(w: &str) -> bool {
@@ -100,13 +91,48 @@ pub const HEAVY_PROGRAMS: &[&str] = &[
     "jest", "tsc", "gradle", "mvn",
 ];
 
+/// Global options that take their value as the next argument, per program (checked against
+/// each tool's `--help` or docs). npm and bun are left out: not verified.
+/// shortcut: only the `--opt value` form is skipped; `--opt=value` already starts with `-`.
+/// Add a program here when a new one is confirmed.
+fn value_options(prog: &str) -> &'static [&'static str] {
+    match prog {
+        "cargo" => &["--color", "-C", "--config", "-Z"],
+        "go" => &["-C"],
+        "docker" => &["--config", "-c", "--context", "-H", "--host"],
+        "yarn" => &["--cwd"],
+        "pnpm" => &["-C", "--dir"],
+        _ => &[],
+    }
+}
+
+/// Like `words`, but also drops `+toolchain` (cargo) and the value of a global option, so the
+/// first word is the subcommand. Only for `is_heavy`; the job key keeps using `words`.
+fn heavy_words(prog: &str, argv: &[OsString]) -> Vec<String> {
+    let opts = value_options(prog);
+    let mut out = Vec::new();
+    let mut skip = false;
+    for a in argv.iter().skip(1).map(|a| a.to_string_lossy()) {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        if opts.contains(&a.as_ref()) {
+            skip = true;
+        } else if !a.starts_with('-') && !(prog == "cargo" && a.starts_with('+')) {
+            out.push(a.to_lowercase());
+        }
+    }
+    out
+}
+
 pub fn is_heavy(argv: &[OsString]) -> bool {
     let Some(first) = argv.first() else {
         return false;
     };
-    let w: Vec<String> = words(argv).iter().map(|s| s.to_lowercase()).collect();
+    let prog = program(first);
+    let w = heavy_words(&prog, argv);
     let sub = |i: usize| w.get(i).map(String::as_str);
-    match program(first).as_str() {
+    match prog.as_str() {
         "npm" | "pnpm" | "yarn" | "bun" => match sub(0) {
             Some("test" | "build" | "install" | "ci") => true,
             Some("run") => matches!(sub(1), Some("build" | "test")),
@@ -119,7 +145,7 @@ pub fn is_heavy(argv: &[OsString]) -> bool {
                     && sub(1) == Some("up")
                     && argv.iter().any(|a| a == "--build"))
         }
-        "cargo" => matches!(sub(0), Some("build" | "test" | "clippy")),
+        "cargo" => matches!(sub(0), Some("build" | "test" | "clippy" | "xtask")),
         "go" => matches!(sub(0), Some("build" | "test")),
         "pytest" | "vitest" | "jest" | "tsc" | "gradle" | "mvn" => true,
         _ => false,
@@ -312,6 +338,20 @@ mod tests {
             &["pnpm", "run", "test"],
             &["docker", "compose", "up", "--build"],
             &["pytest"],
+            // every `cargo xtask` is heavy: it always compiles the xtask crate
+            &["cargo", "xtask"],
+            &["cargo", "xtask", "ci"],
+            &["cargo", "xtask", "dist"],
+            // tool options (some with a value) before the subcommand
+            &["cargo", "+nightly", "build"],
+            &["cargo", "--color", "always", "test"],
+            &["cargo", "-C", "web", "build"],
+            &["go", "-C", "web", "build"],
+            &["docker", "-c", "ctx", "build", "."],
+            &["docker", "--context", "ctx", "build", "."],
+            &["yarn", "--cwd", "web", "build"],
+            &["pnpm", "-C", "web", "test"],
+            &["pnpm", "--dir", "web", "run", "build"],
         ] {
             assert!(is_heavy(&os(c)), "{c:?}");
         }
@@ -320,6 +360,11 @@ mod tests {
             &["ls"],
             &["npm", "--version"],
             &["docker", "compose", "up"],
+            &["cargo", "run"],
+            &["cargo", "--version"],
+            &["cargo", "--color", "always", "run"],
+            &["go", "-C", "web", "vet"],
+            &["docker", "-c", "ctx", "ps"],
         ] {
             assert!(!is_heavy(&os(c)), "{c:?}");
         }
