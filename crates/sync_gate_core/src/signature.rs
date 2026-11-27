@@ -92,22 +92,39 @@ pub const HEAVY_PROGRAMS: &[&str] = &[
 ];
 
 /// Global options that take their value as the next argument, per program (checked against
-/// each tool's `--help` or docs). npm and bun are left out: not verified.
+/// each tool's `--help` or docs: docker `--help`, npm `--prefix`/`-C` (config definitions),
+/// bun `--cwd` (install/run docs), pnpm `--filter`/`-F` (filtering docs). `docker compose`'s
+/// `-f`, `-p` and `--project-directory` ride on docker's list, so `compose -f x up --build` is seen.
 /// shortcut: only the `--opt value` form is skipped; `--opt=value` already starts with `-`.
 /// Add a program here when a new one is confirmed.
 fn value_options(prog: &str) -> &'static [&'static str] {
     match prog {
         "cargo" => &["--color", "-C", "--config", "-Z"],
         "go" => &["-C"],
-        "docker" => &["--config", "-c", "--context", "-H", "--host"],
-        "yarn" => &["--cwd"],
-        "pnpm" => &["-C", "--dir"],
+        "docker" => &[
+            "--config",
+            "-c",
+            "--context",
+            "-H",
+            "--host",
+            "-l",
+            "--log-level",
+            "--tlscacert",
+            "--tlscert",
+            "--tlskey",
+            "-f",
+            "-p",
+            "--project-directory",
+        ],
+        "yarn" | "bun" => &["--cwd"],
+        "npm" => &["--prefix", "-C"],
+        "pnpm" => &["-C", "--dir", "--filter", "-F"],
         _ => &[],
     }
 }
 
-/// Like `words`, but also drops `+toolchain` (cargo) and the value of a global option, so the
-/// first word is the subcommand. Only for `is_heavy`; the job key keeps using `words`.
+/// Drops `+toolchain` (cargo) and the value of a global option, so the first word is the
+/// subcommand. Only for `is_heavy`; the job key uses `key_words`.
 fn heavy_words(prog: &str, argv: &[OsString]) -> Vec<String> {
     let opts = value_options(prog);
     let mut out = Vec::new();
@@ -352,6 +369,28 @@ mod tests {
             &["yarn", "--cwd", "web", "build"],
             &["pnpm", "-C", "web", "test"],
             &["pnpm", "--dir", "web", "run", "build"],
+            &["npm", "--prefix", "x", "install"],
+            &["npm", "-C", "x", "test"],
+            &["bun", "--cwd", "x", "install"],
+            &["pnpm", "--filter", "x", "build"],
+            &["pnpm", "-F", "x", "test"],
+            &["docker", "-l", "debug", "build", "."],
+            &["docker", "--log-level", "debug", "build", "."],
+            &["docker", "--tlscacert", "ca.pem", "build", "."],
+            &["docker", "--tlscert", "c.pem", "build", "."],
+            &["docker", "--tlskey", "k.pem", "build", "."],
+            &["docker", "--tls", "build", "."],
+            &["docker", "--tlsverify", "build", "."],
+            &["docker", "compose", "-f", "x.yml", "up", "--build"],
+            &["docker", "compose", "-p", "x", "up", "--build"],
+            &[
+                "docker",
+                "compose",
+                "--project-directory",
+                "x",
+                "up",
+                "--build",
+            ],
         ] {
             assert!(is_heavy(&os(c)), "{c:?}");
         }
@@ -365,6 +404,10 @@ mod tests {
             &["cargo", "--color", "always", "run"],
             &["go", "-C", "web", "vet"],
             &["docker", "-c", "ctx", "ps"],
+            &["docker", "-l", "debug", "ps"],
+            &["docker", "compose", "-f", "x.yml", "up"],
+            &["npm", "--prefix", "x", "--version"],
+            &["pnpm", "--filter", "x", "outdated"],
         ] {
             assert!(!is_heavy(&os(c)), "{c:?}");
         }
