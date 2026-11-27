@@ -600,11 +600,14 @@ fn server_the_daemon_cannot_find_runs_per_session() {
 
 #[test]
 fn daemon_down_from_the_start_runs_directly() {
-    let sb = Sandbox::new(&[("docs", "mcp-legacy", "shared", "")]);
+    let mut sb = Sandbox::new(&[("docs", "mcp-legacy", "shared", "")]);
     let mut r = sb.relay("docs", &[]);
     r.open();
     assert_eq!(r.call(1)["pid"], sb.pids("docs")[0]);
-    assert!(r.stderr().contains("hub not available"), "{}", r.stderr());
+    // The relay logs before it answers, but the thread that reads its stderr can lag.
+    sb.wait_for("the relay never said the hub was not available", || {
+        r.stderr().contains("hub not available")
+    });
     assert_eq!(r.close(), 0);
 }
 
