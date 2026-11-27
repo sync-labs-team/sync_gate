@@ -3141,7 +3141,10 @@ fn hook_session_writes_plain_lines_and_prints_context() {
     let (ctx, after) = h.start(HOOK_STDIN, Hook::base_path());
     assert!(ctx.contains("sync_gate wait N"), "{ctx}");
     assert!(ctx.contains("cargo build|test|clippy|xtask"), "{ctx}");
-    assert!(ctx.contains("environment of the shell that calls it"), "{ctx}");
+    assert!(
+        ctx.contains("environment of the shell that calls it"),
+        "{ctx}"
+    );
     assert!(
         ctx.contains("ahead of the shims folder on PATH for Bash"),
         "{ctx}"
