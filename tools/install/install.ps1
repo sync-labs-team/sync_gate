@@ -215,10 +215,10 @@ function Get-SyncGateLayout {
 }
 
 function Save-SgState {
-    param($Layout, [string]$Version, [string[]]$PathPlaced, $Vars, $ProfileEntries)
+    param($Layout, [string]$Version, [string[]]$PathPlaced, $Vars, $ProfileEntries, $Original = ([ordered]@{}))
     $s = [ordered]@{
         version = $Version; root = $Layout.Root; overrides = $Layout.Overrides; test = $Layout.Test
-        path_placed = @($PathPlaced); vars = $Vars; profiles = @($ProfileEntries)
+        path_placed = @($PathPlaced); vars = $Vars; vars_original = $Original; profiles = @($ProfileEntries)
     }
     Write-SgTextFile $Layout.StatePath ($s | ConvertTo-Json -Depth 6)
 }
@@ -366,17 +366,44 @@ function Read-SgUserVar {
     try { $k.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) } finally { $k.Dispose() }
 }
 
+function Read-SgUserVarOriginal {
+    # What was in the user variable before sync_gate: @{ value; kind } (raw text), or $null when absent.
+    # Only text values (REG_SZ, REG_EXPAND_SZ) can be given back as they were; any other type is refused.
+    param([string]$Key, [string]$Name)
+    $k = Open-SgEnvKey $Key
+    if ($null -eq $k) { return $null }
+    try {
+        if (@($k.GetValueNames()) -inotcontains $Name) { return $null }
+        $kind = $k.GetValueKind($Name).ToString()
+        if ($kind -ne 'String' -and $kind -ne 'ExpandString') {
+            throw "user variable $Name is of type $kind and sync_gate keeps only text values; remove or change it, then run again (nothing was changed)"
+        }
+        @{ value = [string]$k.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames); kind = $kind }
+    } finally { $k.Dispose() }
+}
+
+function Get-SgOriginals {
+    # vars_original of a state; a state written by 0.1.0 or 0.1.1 has none (those originals are lost).
+    param($State)
+    if ($State -and $State.PSObject.Properties['vars_original']) { $State.vars_original }
+}
+
 function Set-SyncGateUserVars {
-    # Writes -Vars; first drops the names of -Previous that are not in -Vars (only if still our value).
-    param([string]$Key, [System.Collections.IDictionary]$Vars = @{}, $Previous, [switch]$Remove)
+    # Writes -Vars; first drops the names of -Previous that are not in -Vars (only if still our value) and gives
+    # back the -Original ({ value; kind } by name) that was there before sync_gate.
+    param([string]$Key, [System.Collections.IDictionary]$Vars = @{}, $Previous, $Original, [switch]$Remove)
     if ($Remove) { $Vars = @{} }
     $prev = ConvertTo-SgHashtable $Previous
+    $orig = if ($Original -is [System.Collections.IDictionary]) { $Original } else { ConvertTo-SgHashtable $Original }
     $k = Open-SgEnvKey $Key -Write
     try {
         foreach ($n in $prev.Keys) {
             if ($Vars.Contains($n)) { continue }
             $cur = $k.GetValue($n, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
-            if ($null -ne $cur -and $cur -ceq $prev[$n]) { $k.DeleteValue($n) }
+            if ($null -ne $cur -and $cur -is [string] -and $cur -ceq $prev[$n]) {
+                $o = $orig[$n]
+                if ($null -ne $o) { $k.SetValue($n, [string]$o.value, [Microsoft.Win32.RegistryValueKind]$o.kind) } else { $k.DeleteValue($n) }
+            }
             elseif ($null -ne $cur) { Write-SgLine "user variable $n changed by someone else; left as it is" }
         }
         foreach ($n in $Vars.Keys) { $k.SetValue($n, [string]$Vars[$n], [Microsoft.Win32.RegistryValueKind]::String) }
@@ -718,6 +745,10 @@ function Save-SyncGateRollback {
     $vars = [ordered]@{}
     foreach ($n in ($names | Select-Object -Unique)) { $vars[$n] = Read-SgUserVar $Layout.EnvKey $n }
     Write-SgTextFile (Join-Path $rb 'vars.json') ($vars | ConvertTo-Json)
+    # The kind of a value that expands (a journal of 0.1.1 has no such file: everything was written as text).
+    $kinds = [ordered]@{}
+    foreach ($n in $vars.Keys) { if ($vars[$n] -is [string]) { if ((Read-SgUserVarOriginal $Layout.EnvKey $n).kind -eq 'ExpandString') { $kinds[$n] = 'ExpandString' } } }
+    Write-SgTextFile (Join-Path $rb 'vars-kinds.json') ($kinds | ConvertTo-Json)
     $paths = @($Layout.Profiles | ForEach-Object { $_.Path })
     if ($Layout.State -and $Layout.State.profiles) { $paths += @($Layout.State.profiles | ForEach-Object { $_.path }) }
     $meta = @()
@@ -801,6 +832,8 @@ function Restore-SyncGateRollback {
         # user variables
         $origVars = ConvertTo-SgHashtable (Get-Content -LiteralPath (Join-Path $rb 'vars.json') -Raw | ConvertFrom-Json)
         $wv = @{}; if ($wrote.PSObject.Properties['vars']) { $wv = ConvertTo-SgHashtable $wrote.vars }
+        $kf = Join-Path $rb 'vars-kinds.json'
+        $origKinds = @{}; if (Test-Path -LiteralPath $kf) { $origKinds = ConvertTo-SgHashtable (Get-Content -LiteralPath $kf -Raw | ConvertFrom-Json) }
         $k = Open-SgEnvKey $Layout.EnvKey -Write
         try {
             foreach ($n in $origVars.Keys) {
@@ -808,7 +841,10 @@ function Restore-SyncGateRollback {
                 $c = $k.GetValue($n, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
                 $o = $origVars[$n]; $wn = $wv[$n]
                 if (($c -ceq $wn) -or ($c -ceq $o) -or ($null -eq $c -and $null -eq $wn) -or ($null -eq $c -and $null -eq $o)) {
-                    if ($null -eq $o) { if ($null -ne $c) { $k.DeleteValue($n) } } else { $k.SetValue($n, [string]$o, [Microsoft.Win32.RegistryValueKind]::String) }
+                    if ($null -eq $o) { if ($null -ne $c) { $k.DeleteValue($n) } } else {
+                        $kind = 'String'; if ($origKinds.Contains($n)) { $kind = $origKinds[$n] }
+                        $k.SetValue($n, [string]$o, [Microsoft.Win32.RegistryValueKind]$kind)
+                    }
                 } else { $problems += "user variable $n (changed by someone else; left as it is)" }
             }
         } finally { $k.Dispose() }
@@ -1056,18 +1092,32 @@ function Invoke-SgConfigure {
     $L = $Layout
     $oldPlaced = @(); $oldVars = $null; $oldProfiles = @()
     if ($Old) { $oldPlaced = @($Old.path_placed); $oldVars = $Old.vars; $oldProfiles = @($Old.profiles) }
+    # What the user had in a variable before we first wrote it. A name that is already ours keeps the original of
+    # the first time (the registry holds our value now); a new name is read from the registry, before anything changes.
+    $oldOrig = Get-SgOriginals $Old
+    $oldOrigH = ConvertTo-SgHashtable $oldOrig
+    $oldVarsH = ConvertTo-SgHashtable $oldVars
+    $orig = [ordered]@{}
+    foreach ($n in $L.Overrides.Keys) {
+        if ($oldVarsH.Contains($n)) { if ($oldOrigH.Contains($n)) { $orig[$n] = $oldOrigH[$n] } }
+        else { $o = Read-SgUserVarOriginal $L.EnvKey $n; if ($null -ne $o) { $orig[$n] = $o } }
+    }
     # Write-ahead: what a mutation will leave is recorded in wrote.json BEFORE it happens, so a failure or a
     # crash inside the step is still undone (a name to be deleted is recorded with a null value).
     $plan = Set-SyncGatePath -Key $L.EnvKey -Front @($Shims, $L.Bin) -Placed $oldPlaced -Plan
     Set-SgWrote $L 'path' @{ Present = $plan.Present; Raw = $plan.Raw }
     [void](Set-SyncGatePath -Key $L.EnvKey -Front @($Shims, $L.Bin) -Placed $oldPlaced)
     $placed = @($Shims, $L.Bin)
-    foreach ($n in (ConvertTo-SgHashtable $oldVars).Keys) { if (-not $L.Overrides.Contains($n)) { Set-SgWrote $L 'vars' $null $n } }
+    foreach ($n in $oldVarsH.Keys) {
+        if ($L.Overrides.Contains($n)) { continue }
+        $w = $null; if ($oldOrigH.Contains($n)) { $w = [string]$oldOrigH[$n].value }   # a removed name goes back to its original
+        Set-SgWrote $L 'vars' $w $n
+    }
     foreach ($n in $L.Overrides.Keys) { Set-SgWrote $L 'vars' ([string]$L.Overrides[$n]) $n }
-    $vars = Set-SyncGateUserVars -Key $L.EnvKey -Vars $L.Overrides -Previous $oldVars
+    $vars = Set-SyncGateUserVars -Key $L.EnvKey -Vars $L.Overrides -Previous $oldVars -Original $oldOrig
     $profiles = @(Set-SyncGateProfileBlock -Profiles $L.Profiles -Shims $Shims -Previous $oldProfiles -Ahead { param($ap, $ah) Set-SgWrote $L 'profiles' $ah $ap })
     Write-SyncGateLauncher -Layout $L
-    Save-SgState -Layout $L -Version $Version -PathPlaced $placed -Vars $vars -ProfileEntries $profiles
+    Save-SgState -Layout $L -Version $Version -PathPlaced $placed -Vars $vars -ProfileEntries $profiles -Original $orig
     @{ Placed = $placed; Vars = $vars; Profiles = $profiles }
 }
 
@@ -1185,11 +1235,12 @@ function Invoke-SyncGateUninstall {
         Invoke-SgStep $L 'U6' {
             $placed = @(); $vars = $null; $profs = @()
             if ($old) { $placed = @($old.path_placed); $vars = $old.vars; $profs = @($old.profiles) }
+            $origH = ConvertTo-SgHashtable (Get-SgOriginals $old)
             $plan = Set-SyncGatePath -Key $L.EnvKey -Placed $placed -Remove -Plan
             Set-SgWrote $L 'path' @{ Present = $plan.Present; Raw = $plan.Raw }
             [void](Set-SyncGatePath -Key $L.EnvKey -Placed $placed -Remove)
-            foreach ($n in (ConvertTo-SgHashtable $vars).Keys) { Set-SgWrote $L 'vars' $null $n }
-            [void](Set-SyncGateUserVars -Key $L.EnvKey -Previous $vars -Remove)
+            foreach ($n in (ConvertTo-SgHashtable $vars).Keys) { $w = $null; if ($origH.Contains($n)) { $w = [string]$origH[$n].value }; Set-SgWrote $L 'vars' $w $n }
+            [void](Set-SyncGateUserVars -Key $L.EnvKey -Previous $vars -Original $origH -Remove)
             [void](Set-SyncGateProfileBlock -Profiles $L.Profiles -Previous $profs -Remove -Ahead { param($ap, $ah) Set-SgWrote $L 'profiles' $ah $ap })
             Unregister-ScheduledTask -TaskName $L.Task -Confirm:$false -ErrorAction SilentlyContinue
             foreach ($f in @($L.Launcher, $L.StatePath)) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }

@@ -213,6 +213,25 @@ function Set-TestPath {
 function Get-Snap {
     $L = Get-TestLayout
     $task = ''
+function Set-TestVar {
+    param([string]$Name, [string]$Value, [string]$Kind = 'String')
+    $k = Open-SgEnvKey $B.SYNC_GATE_ENV_KEY -Write
+    try { $k.SetValue($Name, $Value, [Microsoft.Win32.RegistryValueKind]$Kind) } finally { $k.Dispose() }
+}
+function Get-TestVarKind {
+    param([string]$Name)
+    $k = Open-SgEnvKey $B.SYNC_GATE_ENV_KEY
+    if ($null -eq $k) { return $null }
+    try { if (@($k.GetValueNames()) -icontains $Name) { $k.GetValueKind($Name).ToString() } } finally { $k.Dispose() }
+}
+function Assert-TestVar {
+    param([string]$Name, $Value, [string]$Kind, [string]$Msg)
+    $now = Read-SgUserVar $B.SYNC_GATE_ENV_KEY $Name
+    if ($null -eq $Value) { Assert-That ($null -eq $now) "$Msg`: $Name should be absent, is '$now'"; return }
+    Assert-That ($null -ne $now -and $now -ceq $Value) "$Msg`: $Name is '$now', expected '$Value'"
+    Assert-That ((Get-TestVarKind $Name) -eq $Kind) "$Msg`: $Name kind is $(Get-TestVarKind $Name), expected $Kind"
+}
+
     if (Get-ScheduledTask -TaskName $L.Task -ErrorAction SilentlyContinue) { $task = ([string](Export-ScheduledTask -TaskName $L.Task)) -replace '<Date>[^<]*</Date>', '' }
     $vars = [ordered]@{}; foreach ($n in $script:SgOwnNames) { $vars[$n] = Read-SgUserVar $L.EnvKey $n }
     $prof = @($L.Profiles | ForEach-Object { Get-SgHash $(if (Test-Path -LiteralPath $_.Path) { [IO.File]::ReadAllBytes($_.Path) } else { $null }) })
@@ -372,6 +391,109 @@ Invoke-Scenario '3.17u' {
 Invoke-Scenario '3.0g' {
     # I-4: a binary that ignores the test variables (here a stand-in that always prints the real values) is refused.
     $leaky = Join-Path $tmp 'leaky.cmd'
+Invoke-Scenario '3.18u' {
+    # #6 follow-up: a user variable that existed before sync_gate took it over comes back on uninstall,
+    # with its value and kind, also when the override equals it; names that did not exist are deleted.
+    [void](New-Item -ItemType Directory -Force -Path $B.SYNC_GATE_INSTALL_DIR)
+    $L = Get-TestLayout
+    Assert-That ($L.EnvKey -like 'HKCU:\Software\synclabs-test-*') "not an isolated key: $($L.EnvKey)"
+    Set-TestVar 'SYNC_GATE_DATA_DIR' 'C:\sg-orig-data'
+    Set-TestVar 'SYNC_GATE_CONFIG' '%TEMP%\sg-orig.toml' 'ExpandString'
+    Set-TestVar 'SYNC_GATE_SOCKET' $B.SYNC_GATE_SOCKET   # equal to the override: the most common case
+    Save-SyncGateRollback -Layout $L -Fresh $true -Stamp 's1' -FirstStep 'S1'
+    Set-SgStep $L 'S5'
+    [void](Invoke-SgConfigure -Layout $L -Shims (Join-Path $tmp 'shims') -Version '0.0.0' -Old $null)
+    $st = Read-SgState $L.StatePath
+    Assert-That ((@($st.vars_original.PSObject.Properties.Name) | Sort-Object) -join ',' -ceq 'SYNC_GATE_CONFIG,SYNC_GATE_DATA_DIR,SYNC_GATE_SOCKET') "vars_original names: $(@($st.vars_original.PSObject.Properties.Name) -join ',')"
+    Assert-That ($st.vars_original.SYNC_GATE_DATA_DIR.value -ceq 'C:\sg-orig-data' -and $st.vars_original.SYNC_GATE_DATA_DIR.kind -eq 'String') 'DATA_DIR original'
+    Assert-That ($st.vars_original.SYNC_GATE_CONFIG.value -ceq '%TEMP%\sg-orig.toml' -and $st.vars_original.SYNC_GATE_CONFIG.kind -eq 'ExpandString') 'CONFIG original'
+    Assert-TestVar 'SYNC_GATE_DATA_DIR' $B.SYNC_GATE_DATA_DIR 'String' 'after configure'
+    [void](Invoke-SgConfigure -Layout $L -Shims (Join-Path $tmp 'shims') -Version '0.0.0' -Old $st)
+    $st2 = Read-SgState $L.StatePath
+    Assert-That ($st2.vars_original.SYNC_GATE_DATA_DIR.value -ceq 'C:\sg-orig-data') "second pass replaced the original: $($st2.vars_original.SYNC_GATE_DATA_DIR.value)"
+    [void](Set-SyncGateUserVars -Key $L.EnvKey -Previous $st2.vars -Original $st2.vars_original -Remove)
+    Assert-TestVar 'SYNC_GATE_DATA_DIR' 'C:\sg-orig-data' 'String' 'after remove'
+    Assert-TestVar 'SYNC_GATE_CONFIG' '%TEMP%\sg-orig.toml' 'ExpandString' 'after remove'
+    Assert-TestVar 'SYNC_GATE_SOCKET' $B.SYNC_GATE_SOCKET 'String' 'after remove'
+    Assert-TestVar 'SYNC_GATE_INSTALL_DIR' $null $null 'after remove'
+}
+
+Invoke-Scenario '3.19u' {
+    # -ClearOverrides restores the original (an empty one included); a changed or deleted variable is left alone;
+    # a pre-0.1.2 state (no vars_original) deletes as before; a value that is not text is refused before any change.
+    [void](New-Item -ItemType Directory -Force -Path $B.SYNC_GATE_INSTALL_DIR)
+    $L = Get-TestLayout
+    Set-TestVar 'SYNC_GATE_DATA_DIR' ''
+    Save-SyncGateRollback -Layout $L -Fresh $true -Stamp 's1' -FirstStep 'S1'
+    Set-SgStep $L 'S5'
+    $shims = Join-Path $tmp 'shims'
+    [void](Invoke-SgConfigure -Layout $L -Shims $shims -Version '0.0.0' -Old $null)
+    Assert-TestVar 'SYNC_GATE_DATA_DIR' $B.SYNC_GATE_DATA_DIR 'String' 'after configure'
+    $L2 = Get-SyncGateLayout -ClearOverrides
+    [void](Invoke-SgConfigure -Layout $L2 -Shims $shims -Version '0.0.0' -Old (Read-SgState $L.StatePath))
+    Assert-TestVar 'SYNC_GATE_DATA_DIR' '' 'String' 'after -ClearOverrides'
+    Assert-TestVar 'SYNC_GATE_SOCKET' $null $null 'after -ClearOverrides'
+    # guards: changed and deleted in the meantime
+    [void](Invoke-SgConfigure -Layout $L -Shims $shims -Version '0.0.0' -Old $null)
+    $st = Read-SgState $L.StatePath
+    Set-TestVar 'SYNC_GATE_DATA_DIR' 'by-user'
+    $k = Open-SgEnvKey $L.EnvKey -Write
+    try { $k.DeleteValue('SYNC_GATE_CONFIG') } finally { $k.Dispose() }
+    $lines = @(Set-SyncGateUserVars -Key $L.EnvKey -Previous $st.vars -Original $st.vars_original -Remove 6>&1 | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { "$_" })
+    Assert-TestVar 'SYNC_GATE_DATA_DIR' 'by-user' 'String' 'changed variable'
+    Assert-TestVar 'SYNC_GATE_CONFIG' $null $null 'deleted variable'
+    Assert-That ($lines.Count -eq 1 -and $lines[0] -like '*SYNC_GATE_DATA_DIR*') "expected one warning, only for DATA_DIR: [$($lines -join ' | ')]"
+    # a state written by 0.1.0 or 0.1.1 has no vars_original
+    $legacy = [pscustomobject]@{ vars = [pscustomobject]@{ SYNC_GATE_DATA_DIR = 'ours' } }
+    Assert-That ($null -eq (Get-SgOriginals $legacy)) 'a legacy state produced originals'
+    Set-TestVar 'SYNC_GATE_DATA_DIR' 'ours'
+    [void](Set-SyncGateUserVars -Key $L.EnvKey -Previous $legacy.vars -Original (Get-SgOriginals $legacy) -Remove)
+    Assert-TestVar 'SYNC_GATE_DATA_DIR' $null $null 'legacy state'
+    # not text: refused before any change
+    $k = Open-SgEnvKey $L.EnvKey -Write
+    try { $k.SetValue('SYNC_GATE_DATA_DIR', 42, [Microsoft.Win32.RegistryValueKind]::DWord) } finally { $k.Dispose() }
+    $msg = ''; try { [void](Invoke-SgConfigure -Layout $L -Shims $shims -Version '0.0.0' -Old $null) } catch { $msg = $_.Exception.Message }
+    Assert-That ($msg -like '*SYNC_GATE_DATA_DIR*DWord*') "a DWord variable was not refused: '$msg'"
+    Assert-That ((Get-TestVarKind 'SYNC_GATE_DATA_DIR') -eq 'DWord' -and $null -eq (Read-SgUserVar $L.EnvKey 'SYNC_GATE_SOCKET')) 'the refusal changed the key'
+    # a non-text current value is never taken for ours
+    $lines = @(Set-SyncGateUserVars -Key $L.EnvKey -Previous ([pscustomobject]@{ SYNC_GATE_DATA_DIR = '42' }) -Remove 6>&1 | Where-Object { $_ -is [System.Management.Automation.InformationRecord] })
+    Assert-That ((Get-TestVarKind 'SYNC_GATE_DATA_DIR') -eq 'DWord' -and $lines.Count -eq 1) 'a DWord equal to our text was deleted'
+}
+
+Invoke-Scenario '3.20' {
+    # Whole flow with a daemon: install, update, a failed uninstall (U7) that must roll back, then the uninstall.
+    Set-TestVar 'SYNC_GATE_DATA_DIR' 'C:\sg-orig-data'
+    Set-TestVar 'SYNC_GATE_CONFIG' '%TEMP%\sg-orig.toml' 'ExpandString'
+    Set-TestVar 'SYNC_GATE_SOCKET' $B.SYNC_GATE_SOCKET
+    [void](Install-Ok $FromOld)
+    [void](Install-Ok $FromNew)
+    $s = Get-Snap
+    $r = Invoke-Inst -Uninstall -Extra @{ SYNC_GATE_INSTALL_FAIL_AT = 'U7' }
+    Assert-That ($r.Code -eq 1) "U7: exit $($r.Code): $($r.Text)"
+    Assert-That ((Get-Snap) -ceq $s) 'U7: the installation changed after the rollback'
+    $r = Invoke-Inst -Uninstall
+    Assert-That ($r.Code -eq 0) "uninstall exited $($r.Code): $($r.Text)"
+    Assert-That ($r.Text -notmatch 'changed by someone else') "uninstall warned: $($r.Text)"
+    Assert-TestVar 'SYNC_GATE_DATA_DIR' 'C:\sg-orig-data' 'String' 'after uninstall'
+    Assert-TestVar 'SYNC_GATE_CONFIG' '%TEMP%\sg-orig.toml' 'ExpandString' 'after uninstall'
+    Assert-TestVar 'SYNC_GATE_SOCKET' $B.SYNC_GATE_SOCKET 'String' 'after uninstall'
+    Assert-TestVar 'SYNC_GATE_INSTALL_DIR' $null $null 'after uninstall'
+}
+
+Invoke-Scenario '3.21u' {
+    # A failed FIRST install gives the user variable back with its kind (the rollback journal kept only the text).
+    [void](New-Item -ItemType Directory -Force -Path $B.SYNC_GATE_INSTALL_DIR)
+    $L = Get-TestLayout
+    Set-TestVar 'SYNC_GATE_CONFIG' '%TEMP%\sg-orig.toml' 'ExpandString'
+    Save-SyncGateRollback -Layout $L -Fresh $true -Stamp 's1' -FirstStep 'S1'
+    Set-SgStep $L 'S5'
+    [void](Invoke-SgConfigure -Layout $L -Shims (Join-Path $tmp 'shims') -Version '0.0.0' -Old $null)
+    Set-SgStep $L 'S6'
+    $problems = @(Restore-SyncGateRollback -Layout $L)
+    Assert-That ($problems.Count -eq 0) "restore problems: $($problems -join '; ')"
+    Assert-TestVar 'SYNC_GATE_CONFIG' '%TEMP%\sg-orig.toml' 'ExpandString' 'after the rollback'
+}
+
     $lines = @('@echo off', "echo config=$($real.config)", "echo data=$($real.data)", 'echo shims=x', 'echo adopted=x', "echo socket=$($real.socket)", 'echo hub=x')
     Set-Content -LiteralPath $leaky -Value $lines -Encoding ASCII
     $msg = ''
