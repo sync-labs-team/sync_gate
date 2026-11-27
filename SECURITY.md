@@ -34,12 +34,14 @@ and what happened.
 - **How long a pending command stays on disk.** Until it runs, or for up to 25 hours. The daemon
   sweeps every 10 minutes. A guest in `elevated` mode that does not enqueue stays without a time
   limit, and so does an orphan marker.
-- **The cost key leaves the machine.** sync_gate keeps a key for each heavy command in
+- **The cost key leaves the machine.** sync_gate keeps a key for each command it queued in
   `cost.json` and shows it in `sync_gate status` and over MCP. That text enters the agent's context,
   and from there it reaches the provider of the agent's model. The key is the program, up to two
   short lowercase words right after it (`cargo test hunter2` enters) and the folder name. A
   credential in a URL, an `X=Y` pair, an option value or a long or upper-case token does not enter.
-  With `SYNC_GATE_FORCE_HEAVY=1` any program gets a key. The old history was reset.
+  Only a queued command gets a key: every command typed after `sync_gate run`, whatever the
+  program, a heavy command reached through a shim, and any program with `SYNC_GATE_FORCE_HEAVY=1`.
+  A light command reached through a shim gets none. The old history was reset.
 - **Unsigned binaries.** The release binaries are not code-signed. Check them against `SHA256SUMS`.
   The installer changes only what belongs to the user. The list is in
   [`docs/install.md`](docs/install.md).
