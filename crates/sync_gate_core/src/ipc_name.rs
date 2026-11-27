@@ -305,7 +305,8 @@ fn restricted_from_group_count(count: Option<u32>) -> Option<bool> {
 /// instance's server pid), with its pin. `list`: the kernel's list of pids that hold the pipe
 /// (None: failed). `open`: pins one pid (None: gone or denied). Each round lists; done when the
 /// list names only pinned pids, else it opens every listed pid not pinned yet and lists again. At
-/// most 4 lists, else None. Returns the pids of the last list with their pins. Common case: the
+/// most 4 lists, else `Unsettled` (worth another attempt). A failed list, or the same list twice
+/// with a pid that cannot be pinned, is `Failed`: permanent, so not retried. Returns the pids of the last list with their pins. Common case: the
 /// server pinned first is the only holder, one list.
 ///
 /// A pid is trusted only while pinned by an open handle, and only if it is listed after the pin
@@ -315,17 +316,25 @@ fn settle_holders<P>(
     first: Option<(u32, P)>,
     mut list: impl FnMut() -> Option<Vec<u32>>,
     mut open: impl FnMut(u32) -> Option<P>,
-) -> Option<Vec<(u32, P)>> {
+) -> Result<Vec<(u32, P)>, Settle> {
     let mut pinned: Vec<(u32, P)> = first.into_iter().collect();
+    let mut prev: Option<Vec<u32>> = None;
     for _ in 0..4 {
-        let listed = list()?;
+        let listed = list().ok_or(Settle::Failed)?;
         if listed
             .iter()
             .all(|pid| pinned.iter().any(|(p, _)| p == pid))
         {
             pinned.retain(|(p, _)| listed.contains(p));
-            return Some(pinned);
+            return Ok(pinned);
         }
+        // Unchanged since the round that opened every unpinned pid: those opens failed for good.
+        let mut now = listed.clone();
+        now.sort_unstable();
+        if prev.as_ref() == Some(&now) {
+            return Err(Settle::Failed);
+        }
+        prev = Some(now);
         for &pid in &listed {
             if pinned.iter().any(|(p, _)| *p == pid) {
                 continue;
@@ -335,22 +344,58 @@ fn settle_holders<P>(
             }
         }
     }
-    None
+    Err(Settle::Unsettled)
 }
 
-/// Runs `attempt` (one [`settle_holders`]) again, up to `tries` times, while it gives None,
-/// calling `pause(n)` before attempt n+1. Other clients of the same pipe that connect or leave
+/// Why [`settle_holders`] gave no list.
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq)]
+enum Settle {
+    /// Holders kept changing: another attempt may settle.
+    Unsettled,
+    /// The kernel query failed or a holder cannot be pinned: retrying cannot help.
+    Failed,
+}
+
+/// Attempts of [`settle_retrying`]: ten sessions starting at once keep a round from settling.
+#[cfg(any(windows, test))]
+const HOLDER_TRIES: u32 = 8;
+
+/// [`retry_unsettled`] over [`settle_holders`] with `HOLDER_TRIES`: the whole holders read, each
+/// attempt pinning `server` (with `pin_server`) before its lists. None: refuse.
+#[cfg(any(windows, test))]
+fn settle_retrying<P>(
+    server: Option<u32>,
+    mut list: impl FnMut() -> Option<Vec<u32>>,
+    mut pin_server: impl FnMut(u32) -> Option<P>,
+    mut open: impl FnMut(u32) -> Option<P>,
+    pause: impl FnMut(u32),
+) -> Option<Vec<(u32, P)>> {
+    retry_unsettled(
+        HOLDER_TRIES,
+        || {
+            let first = server.and_then(|pid| Some((pid, pin_server(pid)?)));
+            settle_holders(first, &mut list, &mut open)
+        },
+        pause,
+    )
+}
+
+/// Runs `attempt` (one [`settle_holders`]) again, up to `tries` times, while it gives `Unsettled`
+/// (`Failed` stops at once), calling `pause(n)` before attempt n+1. Other clients of the same pipe that connect or leave
 /// while the holders are read keep one round from settling; once they are in, the next round
 /// does. Never trusts more than a settled round does: after `tries` the answer is still None.
 #[cfg(any(windows, test))]
 fn retry_unsettled<T>(
     tries: u32,
-    mut attempt: impl FnMut() -> Option<T>,
+    mut attempt: impl FnMut() -> Result<T, Settle>,
     mut pause: impl FnMut(u32),
 ) -> Option<T> {
     for n in 0..tries {
-        if let Some(settled) = attempt() {
-            return Some(settled);
+        match attempt() {
+            Ok(settled) => return Some(settled),
+            Err(Settle::Failed) => return None,
+            Err(Settle::Unsettled) => {}
         }
         if n + 1 < tries {
             pause(n);
@@ -694,7 +739,7 @@ mod tests {
                 (!deny.contains(&pid)).then_some(pid * 10)
             },
         );
-        let got = got.map(|v| {
+        let got = got.ok().map(|v| {
             assert!(v.iter().all(|(pid, pin)| *pin == pid * 10));
             v.into_iter().map(|(pid, _)| pid).collect()
         });
@@ -711,7 +756,11 @@ mod tests {
             5,
             || {
                 calls += 1;
-                (calls == 3).then_some("settled")
+                if calls == 3 {
+                    Ok("settled")
+                } else {
+                    Err(Settle::Unsettled)
+                }
             },
             |n| pauses.push(n),
         );
@@ -722,11 +771,78 @@ mod tests {
             4,
             || {
                 calls += 1;
-                None
+                Err(Settle::Unsettled)
             },
             |_| {},
         );
         assert_eq!((got, calls), (None, 4));
+    }
+
+    /// A permanent failure (the kernel query failed, a holder cannot be pinned) is refused at
+    /// once, with no repeat and no pause; still a refusal (None), never trusted.
+    #[test]
+    fn a_permanent_failure_is_refused_at_once() {
+        let (mut calls, mut pauses) = (0, 0);
+        let got: Option<()> = retry_unsettled(
+            8,
+            || {
+                calls += 1;
+                Err(Settle::Failed)
+            },
+            |_| pauses += 1,
+        );
+        assert_eq!((got, calls, pauses), (None, 1, 0));
+
+        // Through the real seam: a failing list is one list; a stable unpinnable holder is two.
+        assert_eq!(
+            settle_holders::<u8>(None, || None, |_| None),
+            Err(Settle::Failed)
+        );
+        let mut lists = 0;
+        let stuck = settle_holders::<u8>(
+            Some((7, 1)),
+            || {
+                lists += 1;
+                Some(vec![7, 9])
+            },
+            |_| None,
+        );
+        assert_eq!((stuck, lists), (Err(Settle::Failed), 2));
+        let mut lists = 0;
+        let got = settle_retrying::<u8>(
+            Some(7),
+            || {
+                lists += 1;
+                None
+            },
+            |_| Some(1),
+            |_| None,
+            |_| panic!("no pause after a failed query"),
+        );
+        assert_eq!((got, lists), (None, 1));
+    }
+
+    /// `settle_retrying` (what `pipe_holders` runs) retries the unsettled rounds: holders that
+    /// bring a new holder on every list for the first two attempts (4 lists each) settle in the third.
+    #[test]
+    fn the_holders_read_retries_until_the_holders_stop_changing() {
+        let mut lists = 0u32;
+        let got = settle_retrying(
+            Some(7),
+            || {
+                lists += 1;
+                Some(if lists <= 8 {
+                    vec![7, 100 + lists]
+                } else {
+                    vec![7, 9]
+                })
+            },
+            |pid| Some(pid * 10),
+            |pid| Some(pid * 10),
+            |_| {},
+        );
+        let pids = got.map(|v| v.into_iter().map(|(p, _)| p).collect::<Vec<_>>());
+        assert_eq!(pids, Some(vec![7, 9]));
     }
     #[test]
     fn settle_holders_pins_before_it_trusts() {
@@ -745,9 +861,9 @@ mod tests {
         let (got, opened, _) = settle(&[Some(&[7, 9]), Some(&[7])], &[9]);
         assert_eq!((got, opened), (Some(vec![7]), vec![7, 9]));
 
-        // 9 stays listed but cannot be pinned: never settles.
+        // 9 stays listed but cannot be pinned: never settles, refused on the repeated list.
         let (got, _, calls) = settle(&[Some(&[7, 9])], &[9]);
-        assert_eq!((got, calls), (None, 4));
+        assert_eq!((got, calls), (None, 2));
 
         // Lists that grow every round: three rounds, then None.
         let growing: [Option<&[u32]>; 5] = [
@@ -781,7 +897,7 @@ mod tests {
 
         // A new holder that cannot be pinned never settles; a failed list is None.
         let (got, _, calls) = settle_from(Some(7), &[Some(&[7, 9])], &[9]);
-        assert_eq!((got, calls), (None, 4));
+        assert_eq!((got, calls), (None, 2));
         assert_eq!(settle_from(Some(7), &[None], &[]), (None, vec![], 1));
         assert_eq!(
             settle_from(Some(7), &[Some(&[7]), None], &[]).0,
@@ -819,7 +935,7 @@ mod windows {
     use super::{GUEST_PIPE_ACCESS, SelfKind, classify_self};
     use super::{
         HolderFacts, Peers, holders_ok, parse_holder_ids, restricted_from_group_count,
-        retry_unsettled, settle_holders,
+        settle_retrying,
     };
     use interprocess::local_socket::Stream;
     use interprocess::os::windows::named_pipe::local_socket::Stream as NamedPipeStream;
@@ -1298,14 +1414,11 @@ mod windows {
         // SAFETY: `token_info` checked the buffer holds a whole TOKEN_USER.
         let own_sid = unsafe { (*own.as_ptr().cast::<TOKEN_USER>()).User.Sid };
         let query = PROCESS_QUERY_LIMITED_INFORMATION;
-        // Ten sessions starting at once keep a round from settling; see `retry_unsettled`.
-        let pinned = retry_unsettled(
-            8,
-            || {
-                let first = server
-                    .and_then(|pid| Some((pid, pin_process(pid, query | PROCESS_SYNCHRONIZE)?)));
-                settle_holders(first, || list_holders(pipe), |pid| pin_process(pid, query))
-            },
+        let pinned = settle_retrying(
+            server,
+            || list_holders(pipe),
+            |pid| pin_process(pid, query | PROCESS_SYNCHRONIZE),
+            |pid| pin_process(pid, query),
             |n| std::thread::sleep(std::time::Duration::from_millis(25 * u64::from(n + 1))),
         )?;
         let facts = pinned
