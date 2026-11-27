@@ -106,8 +106,11 @@ Assert-SgIsolated -Bin (Join-Path $BinDir 'sync_gate.exe') -TestEnv $testEnv -Re
 foreach ($k in $B.Keys) { Set-Item -Path "env:$k" -Value $B[$k] }   # this process only, for Get-SyncGateLayout
 
 # What the installer or the binaries could write in the real user's area; only these are compared, so a second
-# harness or the real daemon doing its own work does not show up as a change, and nothing the test could touch
-# is left out. Each view takes its location, so scenario 3.23u can try them on a scratch copy.
+# harness or the real daemon doing its own work does not show up as a change. Covered: install folder (state,
+# launcher, bin\, rollback\), data folder minus the daemon's own files, shims folder and config.toml (each at the
+# place `sync_gate paths` reports), Path and SYNC_GATE_* of the user key, the real task, the profile blocks and
+# agent config lines naming sync_gate, the real daemon pids. NOT covered: any other file or task. Each view takes
+# its location, so scenario 3.23u can try them on a scratch copy.
 function Get-FileLine {
     param([string]$File)
     if (-not (Test-Path -LiteralPath $File -PathType Leaf)) { return "$File=absent" }
@@ -124,6 +127,12 @@ function Get-InstallView {
         } else { $l += "$dir=absent" }
     }
     $l -join "`n"
+}
+function Get-ShimsView {
+    # Every file of the shims folder (it lives outside data\ and bin\: Get-DataView and Get-InstallView never see it).
+    param([string]$Dir)
+    if (-not (Test-Path -LiteralPath $Dir)) { return 'absent' }
+    (@(Get-ChildItem -LiteralPath $Dir -File -Recurse -Force -ErrorAction SilentlyContinue | Sort-Object FullName | ForEach-Object { Get-FileLine $_.FullName })) -join "`n"
 }
 function Get-DataView {
     param([string]$Dir)
@@ -174,7 +183,8 @@ function Get-RealDaemonPids {
 }
 function Get-RealView {
     [ordered]@{
-        Install = Get-InstallView $realRoot; Data = Get-DataView $real.data; Key = Get-KeyView $real.key
+        Install = Get-InstallView $realRoot; Data = Get-DataView $real.data; Shims = Get-ShimsView $realPaths.shims
+        Config = Get-FileLine $realPaths.config; Key = Get-KeyView $real.key
         Task = Get-TaskView; Blocks = Get-BlockView $realProfiles @($realAgents.Claude, $realAgents.Codex)
         Pids = (Get-RealDaemonPids) -join ','
     }
@@ -620,12 +630,35 @@ Invoke-Scenario '3.22u' {
     Assert-That ((Get-TestVarKind 'SYNC_GATE_DATA_DIR') -eq 'ExpandString' -and $problems.Count -eq 1) "same text, other kind: $(Get-TestVarKind 'SYNC_GATE_DATA_DIR'), problems: $($problems -join '; ')"
 }
 
+Invoke-Scenario '3.24u' {
+    # The uninstall (and -ClearOverrides) gives back or deletes a variable only if it is still what the installer
+    # wrote: same text AND same kind. The user's switch to ExpandString with the same text is left as it is, with a warning.
+    foreach ($mode in 'uninstall', 'clear') {
+        Reset-Area
+        [void](New-Item -ItemType Directory -Force -Path $B.SYNC_GATE_INSTALL_DIR)
+        $L = Get-TestLayout
+        $vars = [pscustomobject](Set-SyncGateUserVars -Key $L.EnvKey -Vars $L.Overrides)   # as the state holds it
+        Assert-That ((Get-TestVarKind 'SYNC_GATE_DATA_DIR') -eq 'String') "$mode`: setup: the installer did not write a String"
+        # control: untouched, it is deleted
+        [void](Set-SyncGateUserVars -Key $L.EnvKey -Previous $vars -Remove)
+        Assert-That ($null -eq (Get-TestVarKind 'SYNC_GATE_DATA_DIR')) "$mode`: control: the untouched variable was not deleted"
+        $vars = [pscustomobject](Set-SyncGateUserVars -Key $L.EnvKey -Vars $L.Overrides)
+        Set-TestVar 'SYNC_GATE_DATA_DIR' $B.SYNC_GATE_DATA_DIR 'ExpandString'
+        $out = if ($mode -eq 'uninstall') { Set-SyncGateUserVars -Key $L.EnvKey -Previous $vars -Remove 6>&1 }
+               else { Set-SyncGateUserVars -Key $L.EnvKey -Vars @{ SYNC_GATE_SOCKET = $B.SYNC_GATE_SOCKET } -Previous $vars 6>&1 }
+        Assert-That ((Get-TestVarKind 'SYNC_GATE_DATA_DIR') -eq 'ExpandString' -and (Read-SgUserVar $L.EnvKey 'SYNC_GATE_DATA_DIR') -ceq $B.SYNC_GATE_DATA_DIR) "$mode`: the variable the user switched to ExpandString was deleted or rewritten ($(Get-TestVarKind 'SYNC_GATE_DATA_DIR'))"
+        Assert-That ((@($out) -join ' ') -like '*SYNC_GATE_DATA_DIR changed by someone else*') "$mode`: no warning: $(@($out) -join ' ')"
+    }
+}
+
 Invoke-Scenario '3.23u' {
     # The checks on the real user's area see what the installer could change and nothing else: tried on a scratch copy.
-    $root = Join-Path $tmp 'fake-real\inst'; $data = Join-Path $tmp 'fake-real\data'
-    foreach ($d in "$root\bin", "$root\rollback", "$data\shims", "$data\pending") { [void](New-Item -ItemType Directory -Force -Path $d) }
-    foreach ($f in "$root\install-state.json", "$root\launcher.cmd", "$root\bin\sync_gate.exe", "$root\rollback\meta.json", "$data\config.toml", "$data\shims\cargo.cmd") { Set-Content -LiteralPath $f -Value 'a' }
-    $iv = Get-InstallView $root; $dv = Get-DataView $data
+    # The topology of the real machine: shims under LOCALAPPDATA, data and config under APPDATA, config outside data.
+    $root = Join-Path $tmp 'fake-real\local\inst'; $shimDir = Join-Path $tmp 'fake-real\local\data\shims'
+    $data = Join-Path $tmp 'fake-real\roaming\data'; $cfgFile = Join-Path $tmp 'fake-real\roaming\config\config.toml'
+    foreach ($d in "$root\bin", "$root\rollback", $shimDir, "$data\pending", (Split-Path -Parent $cfgFile)) { [void](New-Item -ItemType Directory -Force -Path $d) }
+    foreach ($f in "$root\install-state.json", "$root\launcher.cmd", "$root\bin\sync_gate.exe", "$root\rollback\meta.json", "$data\mcp-adopted.json", "$shimDir\cargo.cmd", $cfgFile) { Set-Content -LiteralPath $f -Value 'a' }
+    $iv = Get-InstallView $root; $dv = Get-DataView $data; $sv = Get-ShimsView $shimDir; $cv = Get-FileLine $cfgFile
     # what the daemons write on their own is not a change
     Set-Content -LiteralPath "$root\daemon.log" -Value 'x'; Set-Content -LiteralPath "$root\daemon.log.1" -Value 'x'
     foreach ($f in 'cost.json', 'paused.json', 'services.json', 'update-check.json', 'daemon.log', 'pending\q.json') { Set-Content -LiteralPath "$data\$f" -Value 'x' }
@@ -640,12 +673,25 @@ Invoke-Scenario '3.23u' {
     Assert-That ((Get-InstallView $root) -ceq $iv) 'the restored install folder differs'
     Remove-Item -LiteralPath "$root\rollback\meta.json"; Assert-That ((Get-InstallView $root) -cne $iv) 'a removed journal file was not seen'
     Set-Content -LiteralPath "$root\bin\extra.exe" -Value 'a'; Assert-That ((Get-InstallView $root) -cne $iv) 'a new program was not seen'
-    foreach ($f in 'shims\cargo.cmd', 'config.toml', 'mcp-adopted.json', 'shims\new.cmd') {
+    foreach ($f in 'mcp-adopted.json', 'other.json') {
         $had = Test-Path -LiteralPath "$data\$f"
         if ($had) { Set-Content -LiteralPath "$data\$f" -Value 'changed' } else { Set-Content -LiteralPath "$data\$f" -Value 'a' }
         Assert-That ((Get-DataView $data) -cne $dv) "a change in data\$f was not seen"
         if ($had) { Set-Content -LiteralPath "$data\$f" -Value 'a' } else { Remove-Item -LiteralPath "$data\$f" }
     }
+    # the shims folder and config.toml, each at its own place
+    Assert-That ((Get-ShimsView $shimDir) -ceq $sv) 'the shims view changed with nothing touched'
+    foreach ($f in 'cargo.cmd', 'new.cmd') {
+        $had = Test-Path -LiteralPath "$shimDir\$f"
+        Set-Content -LiteralPath "$shimDir\$f" -Value $(if ($had) { 'changed' } else { 'a' })
+        Assert-That ((Get-ShimsView $shimDir) -cne $sv) "a change in shims\$f was not seen"
+        if ($had) { Set-Content -LiteralPath "$shimDir\$f" -Value 'a' } else { Remove-Item -LiteralPath "$shimDir\$f" }
+    }
+    Remove-Item -LiteralPath "$shimDir\cargo.cmd"; Assert-That ((Get-ShimsView $shimDir) -cne $sv) 'a removed shim was not seen'
+    Set-Content -LiteralPath "$shimDir\cargo.cmd" -Value 'a'
+    Assert-That ((Get-FileLine $cfgFile) -ceq $cv) 'the config view changed with nothing touched'
+    Set-Content -LiteralPath $cfgFile -Value 'changed'; Assert-That ((Get-FileLine $cfgFile) -cne $cv) 'a change in config.toml was not seen'
+    Remove-Item -LiteralPath $cfgFile; Assert-That ((Get-FileLine $cfgFile) -cne $cv) 'a removed config.toml was not seen'
     # user variables: kind and raw value, only Path and SYNC_GATE_*
     Set-TestVar 'SYNC_GATE_DATA_DIR' '42'; Set-TestVar 'OTHER_VAR' 'a'
     $kv = Get-KeyView $B.SYNC_GATE_ENV_KEY
@@ -1056,7 +1102,7 @@ Invoke-Scenario '3.9' {
     $orig = [Text.Encoding]::UTF8.GetBytes("# keep`r`n")
     [IO.File]::WriteAllBytes($pf, $orig)
     [void][IO.Directory]::CreateDirectory($B.SYNC_GATE_DATA_DIR)
-    Set-Content -LiteralPath $B.SYNC_GATE_CONFIG -Value '# test'
+    Set-Content -LiteralPath $B.SYNC_GATE_CONFIG -Value "# test`nupdate_check_days = 0" -Encoding ASCII
     [void](Install-Ok $FromNew)
     $dirs = Get-SyncGatePaths -Bin (Join-Path $L0.Bin 'sync_gate.exe') -Env (Get-InstEnv)
     $strange = Join-Path $dirs.shims 'strange.txt'; Set-Content -LiteralPath $strange -Value 'mine'
@@ -1231,7 +1277,7 @@ Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 $tmpGone = -not (Test-Path -LiteralPath $tmp)
 $keyGone = $null -eq (Open-SgEnvKey $B.SYNC_GATE_ENV_KEY)
 $after = Get-RealView
-$names = @{ Install = 'the real install folder'; Key = 'the real user variables (Path, SYNC_GATE_*)'; Task = 'the real scheduled task'; Blocks = 'the managed profile blocks or agent config entries'; Pids = 'the real daemon' }
+$names = @{ Install = 'the real install folder'; Shims = 'the real shims folder'; Config = 'the real config.toml'; Key = 'the real user variables (Path, SYNC_GATE_*)'; Task = 'the real scheduled task'; Blocks = 'the managed profile blocks or agent config entries'; Pids = 'the real daemon' }
 foreach ($n in $names.Keys) { if ($after[$n] -cne $before[$n]) { $script:Fails++; Write-Host "FAIL: $($names[$n]) changed" } }
 $dataSame = $after.Data -ceq $before.Data
 Write-Host ("test key $(if ($keyGone) { 'removed' } else { 'LEFT' }); temp root $(if ($tmpGone) { 'removed' } else { 'LEFT' }); " +

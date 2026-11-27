@@ -400,7 +400,8 @@ function Set-SyncGateUserVars {
         foreach ($n in $prev.Keys) {
             if ($Vars.Contains($n)) { continue }
             $cur = $k.GetValue($n, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
-            if ($null -ne $cur -and $cur -is [string] -and $cur -ceq $prev[$n]) {
+            # the installer writes String: same text of another kind (ExpandString) is the user's, not ours
+            if ($null -ne $cur -and $cur -is [string] -and $cur -ceq $prev[$n] -and $k.GetValueKind($n) -eq [Microsoft.Win32.RegistryValueKind]::String) {
                 $o = $orig[$n]
                 if ($null -ne $o) { $k.SetValue($n, [string]$o.value, [Microsoft.Win32.RegistryValueKind]$o.kind) } else { $k.DeleteValue($n) }
             }
