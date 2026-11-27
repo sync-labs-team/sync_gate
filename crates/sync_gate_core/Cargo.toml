@@ -35,3 +35,7 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Threading",
     "Win32_UI_Shell",
 ], optional = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+# The tests give their pipes an explicit descriptor (owner named, as the daemon does).
+windows-sys = { workspace = true, features = ["Win32_Security_Authorization"] }

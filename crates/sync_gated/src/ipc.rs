@@ -224,12 +224,16 @@ fn descriptor_for(sid: &str) -> io::Result<SecurityDescriptor> {
     sddl_descriptor(&format!("D:P(A;;GA;;;{sid})"))
 }
 
-/// A guest pipe: GENERIC_ALL for the owner, and for `ace_sid` exactly FILE_READ_DATA |
+/// A guest pipe owned by `owner` (named, so an elevated token's default owner, the Administrators
+/// group, does not become it: the client accepts only the user, #12). GENERIC_ALL for `full`, and
+/// for `ace_sid` exactly FILE_READ_DATA |
 /// FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE (0x120083): never
 /// FILE_CREATE_PIPE_INSTANCE (0x4), so a guest can connect but never serve this name.
 #[cfg(windows)]
-fn guest_descriptor(owner: &str, ace_sid: &str) -> io::Result<SecurityDescriptor> {
-    sddl_descriptor(&format!("D:P(A;;GA;;;{owner})(A;;0x120083;;;{ace_sid})"))
+fn guest_descriptor(owner: &str, full: &str, ace_sid: &str) -> io::Result<SecurityDescriptor> {
+    sddl_descriptor(&format!(
+        "O:{owner}D:P(A;;GA;;;{full})(A;;0x120083;;;{ace_sid})"
+    ))
 }
 
 #[cfg(windows)]
@@ -631,7 +635,8 @@ fn serve_guest_with(
             self.0.fetch_sub(1, Ordering::SeqCst);
         }
     }
-    let listener = bind(name, guest_descriptor(&user_sid()?, ace_sid)?)?;
+    let user = user_sid()?;
+    let listener = bind(name, guest_descriptor(&user, &user, ace_sid)?)?;
     let live = Arc::new(AtomicUsize::new(0));
     #[cfg(test)]
     let worker_name = name.to_owned();
@@ -1189,7 +1194,7 @@ mod tests {
         let cap = "S-1-15-3-1024-1065365936-1281604716-3511738428-1654721687-432734479-3232135806-4053264122-3456934681";
         for (i, x) in [own.as_str(), "S-1-5-5-0-7", cap].into_iter().enumerate() {
             let name = test_pipe(&format!("ace-{i}"));
-            let aces = live_dacl(&name, &guest_descriptor("S-1-5-18", x).unwrap());
+            let aces = live_dacl(&name, &guest_descriptor(&own, "S-1-5-18", x).unwrap());
             assert_eq!(aces.len(), 2, "{aces:?}");
             assert!(aces.iter().all(|a| a.0 == 0), "allow ACEs only: {aces:?}");
             let mask = aces.iter().find(|a| a.2 == x).expect("the guest's ACE").1;
@@ -1312,9 +1317,10 @@ mod tests {
         };
         let own = user_sid().unwrap();
         let a = test_pipe("instance-a");
-        let _la = raw_listener(&a, Some(guest_descriptor("S-1-5-18", &own).unwrap())).unwrap();
+        let _la =
+            raw_listener(&a, Some(guest_descriptor(&own, "S-1-5-18", &own).unwrap())).unwrap();
         let b = test_pipe("instance-b");
-        let mutant = format!("D:P(A;;GA;;;S-1-5-18)(A;;0x120087;;;{own})");
+        let mutant = format!("O:{own}D:P(A;;GA;;;S-1-5-18)(A;;0x120087;;;{own})");
         let _lb = raw_listener(&b, Some(sddl(&mutant))).unwrap();
         let denied = create_instance_status(&a);
         let control = create_instance_status(&b);
@@ -1339,6 +1345,43 @@ mod tests {
         assert_ne!(h, INVALID_HANDLE_VALUE, "{}", io::Error::last_os_error());
         // SAFETY: the handle just opened, closed once.
         unsafe { CloseHandle(h) };
+    }
+
+    /// #12: the descriptor names its owner (an elevated token's default owner is the Administrators
+    /// group, which the client refuses), and a live guest pipe is owned by the user for the
+    /// client that connects to it, as `connect_guest_at` reads it. Without a user in `O:`, the
+    /// first passes only where the default owner already is the user (not elevated).
+    #[cfg(windows)]
+    #[test]
+    fn a_guest_pipe_is_owned_by_the_user() {
+        use interprocess::os::windows::security_descriptor::AsSecurityDescriptor;
+        use sync_gate_probe::{IdentKind, ident_of};
+        use windows_sys::Win32::Security::GetSecurityDescriptorOwner;
+        let own = user_sid().unwrap();
+        let sd = guest_descriptor(&own, "S-1-5-18", &own).unwrap();
+        let (mut owner, mut defaulted) = (std::ptr::null_mut(), 0);
+        // SAFETY: `sd` is a valid descriptor that the call only reads; the out pointers are valid.
+        let ok = unsafe {
+            GetSecurityDescriptorOwner(sd.as_sd().cast_mut(), &mut owner, &mut defaulted)
+        };
+        assert!(ok != 0 && !owner.is_null(), "the descriptor has no owner");
+        // SAFETY: `owner` points into `sd`, alive here.
+        assert_eq!(unsafe { sid_string(owner) }.unwrap(), own);
+        // The production path: `serve_guest` binds, a client reads the owner off its own handle.
+        let name = test_pipe("guest-owner");
+        let kind = IdentKind::Account(own.clone());
+        let server = serve_guest(
+            &name,
+            "tester",
+            &own,
+            move |v| ident_of(&kind, v),
+            |_, _| Response::Ack,
+        )
+        .unwrap();
+        let s = raw_connect(&name).unwrap();
+        assert_eq!(owner_seen_by_client(&s), own);
+        drop(s);
+        server.shutdown();
     }
 
     /// Reads one reply line on its own thread; the result comes on the channel.

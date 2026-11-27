@@ -1578,10 +1578,49 @@ mod windows {
             proc
         }
 
-        /// A listening instance of `\\.\pipe\<name>` with the default descriptor (owner: us, F27).
+        /// A listening instance of `\\.\pipe\<name>` owned by us by name (as the daemon's guest
+        /// pipe is: an elevated token's default owner is Administrators, #12), with a DACL that
+        /// mirrors the default one: Everyone and Anonymous read; SYSTEM, Administrators and us all.
         fn create_pipe(name: &str) -> HANDLE {
+            use windows_sys::Win32::Foundation::LocalFree;
+            use windows_sys::Win32::Security::Authorization::{
+                ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+                SDDL_REVISION_1,
+            };
+            use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
             let full = wide(&format!(r"\\.\pipe\{name}"));
-            // SAFETY: `full` is NUL-terminated; no security attributes means the default descriptor.
+            let mine = own_sid().unwrap();
+            let mut text: *mut u16 = std::ptr::null_mut();
+            // SAFETY: `mine` holds a whole SID; `text` is an out pointer, freed below.
+            let ok = unsafe { ConvertSidToStringSidW(mine.as_ptr().cast_mut().cast(), &mut text) };
+            assert!(ok != 0, "{}", std::io::Error::last_os_error());
+            // SAFETY: `text` is the NUL-terminated string the call just made.
+            let me = unsafe {
+                let len = (0..).find(|&i| *text.add(i) == 0).unwrap();
+                let me = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+                LocalFree(text.cast());
+                me
+            };
+            let sddl = wide(&format!(
+                "O:{me}D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{me})(A;;GR;;;WD)(A;;GR;;;AN)"
+            ));
+            let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            // SAFETY: NUL-terminated SDDL; `sd` is an out pointer, freed below.
+            let ok = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut sd,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert!(ok != 0, "{}", std::io::Error::last_os_error());
+            let sa = SECURITY_ATTRIBUTES {
+                nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: sd,
+                bInheritHandle: 0,
+            };
+            // SAFETY: `full` is NUL-terminated; `sa` and `sd` outlive the call.
             let h = unsafe {
                 CreateNamedPipeW(
                     full.as_ptr(),
@@ -1591,7 +1630,7 @@ mod windows {
                     4096,
                     4096,
                     0,
-                    std::ptr::null(),
+                    &sa,
                 )
             };
             assert!(
@@ -1599,6 +1638,8 @@ mod windows {
                 "{}",
                 std::io::Error::last_os_error()
             );
+            // SAFETY: allocated by the conversion, freed once.
+            unsafe { LocalFree(sd) };
             h
         }
 
