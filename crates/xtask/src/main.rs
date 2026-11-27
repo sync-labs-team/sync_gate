@@ -226,8 +226,6 @@ fn free_own_exe() {
 }
 
 fn host_steps() -> Vec<Step> {
-    #[cfg(windows)]
-    free_own_exe();
     let clippy = |target: Option<&str>| {
         let mut args = vec!["clippy", "--workspace", "--all-targets", "--locked"];
         if let Some(target) = target {
@@ -409,6 +407,9 @@ fn ci(opts: Opts) -> Result<bool, String> {
     }
     let sha = opts.publish.then(|| publishable_head(&root)).transpose()?;
 
+    // Not in `host_steps`: its unit test runs inside the test binary, which must not move itself.
+    #[cfg(windows)]
+    free_own_exe();
     let mut outcomes = vec![run_job(
         format!("local/{}", env::consts::OS),
         "fmt, clippy for 3 systems, tests",
