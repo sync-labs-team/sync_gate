@@ -495,6 +495,68 @@ Invoke-Scenario '3.21u' {
     Assert-TestVar 'SYNC_GATE_CONFIG' '%TEMP%\sg-orig.toml' 'ExpandString' 'after the rollback'
 }
 
+Invoke-Scenario '3.22u' {
+    # A user variable that is not text is never rewritten as text: not by the rollback (a name that left the
+    # overrides, a type the journal could not read back) and not by a reinstall of a name that stays.
+    $cases = @(
+        @{ Kind = 'DWord'; Value = 42 }, @{ Kind = 'QWord'; Value = [int64]7 }, @{ Kind = 'Binary'; Value = [byte[]](1, 2, 3) },
+        @{ Kind = 'MultiString'; Value = [string[]]@() }, @{ Kind = 'MultiString'; Value = [string[]]@('one') },
+        @{ Kind = 'MultiString'; Value = [string[]]@('one', 'two') }
+    )
+    $shims = Join-Path $tmp 'shims'
+    $setRaw = { param($v, $kind) $k = Open-SgEnvKey $B.SYNC_GATE_ENV_KEY -Write; try { $k.SetValue('SYNC_GATE_DATA_DIR', $v, [Microsoft.Win32.RegistryValueKind]$kind) } finally { $k.Dispose() } }
+    $getRaw = { $k = Open-SgEnvKey $B.SYNC_GATE_ENV_KEY; try { (@($k.GetValue('SYNC_GATE_DATA_DIR', $null, 'DoNotExpandEnvironmentNames')) -join ',') } finally { $k.Dispose() } }
+    foreach ($c in $cases) {
+        $name = "$($c.Kind)/$(@($c.Value).Count)"
+        Reset-Area
+        [void](New-Item -ItemType Directory -Force -Path $B.SYNC_GATE_INSTALL_DIR)
+        $L = Get-TestLayout
+        Save-SyncGateRollback -Layout $L -Fresh $true -Stamp 's1' -FirstStep 'S1'
+        Set-SgStep $L 'S5'
+        [void](Invoke-SgConfigure -Layout $L -Shims $shims -Version '0.0.0' -Old $null)
+        Complete-SyncGateJournal $L
+        $st = Read-SgState $L.StatePath
+        # (a) the name leaves the overrides while the user holds a value that is not text
+        & $setRaw $c.Value $c.Kind
+        $want = & $getRaw
+        $L2 = Get-SyncGateLayout -ClearOverrides
+        Save-SyncGateRollback -Layout $L2 -Fresh $false -Stamp 's2' -FirstStep 'S1'
+        Set-SgStep $L2 'S5'
+        [void](Invoke-SgConfigure -Layout $L2 -Shims $shims -Version '0.0.0' -Old $st)
+        Set-SgStep $L2 'S6'
+        $problems = @(Restore-SyncGateRollback -Layout $L2)
+        Assert-That ((Get-TestVarKind 'SYNC_GATE_DATA_DIR') -eq $c.Kind -and (& $getRaw) -ceq $want) "$name`: the rollback changed it to $(Get-TestVarKind 'SYNC_GATE_DATA_DIR') '$(& $getRaw)' (problems: $($problems -join '; '))"
+        Complete-SyncGateJournal $L2
+        # (b) the name stays in the overrides: a reinstall refuses before any change
+        Reset-Area
+        [void](New-Item -ItemType Directory -Force -Path $B.SYNC_GATE_INSTALL_DIR)
+        $L = Get-TestLayout
+        Save-SyncGateRollback -Layout $L -Fresh $true -Stamp 's1' -FirstStep 'S1'
+        Set-SgStep $L 'S5'
+        [void](Invoke-SgConfigure -Layout $L -Shims $shims -Version '0.0.0' -Old $null)
+        Complete-SyncGateJournal $L
+        $st = Read-SgState $L.StatePath
+        & $setRaw $c.Value $c.Kind
+        $L = Get-TestLayout
+        Save-SyncGateRollback -Layout $L -Fresh $false -Stamp 's2' -FirstStep 'S1'
+        Set-SgStep $L 'S5'
+        $msg = ''; try { [void](Invoke-SgConfigure -Layout $L -Shims $shims -Version '0.0.0' -Old $st) } catch { $msg = $_.Exception.Message }
+        Assert-That ($msg -like "*SYNC_GATE_DATA_DIR*$($c.Kind)*") "$name`: a reinstall of a name that is not text was not refused: '$msg'"
+        Assert-That ((Get-TestVarKind 'SYNC_GATE_DATA_DIR') -eq $c.Kind -and (& $getRaw) -ceq $want) "$name`: the refused reinstall changed it"
+    }
+    # a journal of 0.1.2 (no kind of a non-text value) and a text value now equal to ours but of another kind
+    Reset-Area
+    [void](New-Item -ItemType Directory -Force -Path $B.SYNC_GATE_INSTALL_DIR)
+    $L = Get-TestLayout
+    Save-SyncGateRollback -Layout $L -Fresh $true -Stamp 's1' -FirstStep 'S1'
+    Set-SgStep $L 'S5'
+    [void](Invoke-SgConfigure -Layout $L -Shims $shims -Version '0.0.0' -Old $null)
+    & $setRaw $B.SYNC_GATE_DATA_DIR 'ExpandString'   # same text as ours, other kind: not ours
+    Set-SgStep $L 'S6'
+    $problems = @(Restore-SyncGateRollback -Layout $L)
+    Assert-That ((Get-TestVarKind 'SYNC_GATE_DATA_DIR') -eq 'ExpandString' -and $problems.Count -eq 1) "same text, other kind: $(Get-TestVarKind 'SYNC_GATE_DATA_DIR'), problems: $($problems -join '; ')"
+}
+
 Invoke-Scenario '3.0g' {
     # I-4: a binary that ignores the test variables (here a stand-in that always prints the real values) is refused.
     $leaky = Join-Path $tmp 'leaky.cmd'

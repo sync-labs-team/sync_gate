@@ -745,9 +745,13 @@ function Save-SyncGateRollback {
     $vars = [ordered]@{}
     foreach ($n in ($names | Select-Object -Unique)) { $vars[$n] = Read-SgUserVar $Layout.EnvKey $n }
     Write-SgTextFile (Join-Path $rb 'vars.json') ($vars | ConvertTo-Json)
-    # The kind of a value that expands (a journal of 0.1.1 has no such file: everything was written as text).
+    # The registry kind of every value present, read from the registry (the value alone cannot tell a one-item
+    # MultiString from text). A journal of 0.1.1 has no such file: everything was written as text.
     $kinds = [ordered]@{}
-    foreach ($n in $vars.Keys) { if ($vars[$n] -is [string]) { if ((Read-SgUserVarOriginal $Layout.EnvKey $n).kind -eq 'ExpandString') { $kinds[$n] = 'ExpandString' } } }
+    $kk = Open-SgEnvKey $Layout.EnvKey
+    if ($kk) {
+        try { $have = @($kk.GetValueNames()); foreach ($n in $vars.Keys) { if ($have -icontains $n) { $kinds[$n] = $kk.GetValueKind($n).ToString() } } } finally { $kk.Dispose() }
+    }
     Write-SgTextFile (Join-Path $rb 'vars-kinds.json') ($kinds | ConvertTo-Json)
     $paths = @($Layout.Profiles | ForEach-Object { $_.Path })
     if ($Layout.State -and $Layout.State.profiles) { $paths += @($Layout.State.profiles | ForEach-Object { $_.path }) }
@@ -834,17 +838,26 @@ function Restore-SyncGateRollback {
         $wv = @{}; if ($wrote.PSObject.Properties['vars']) { $wv = ConvertTo-SgHashtable $wrote.vars }
         $kf = Join-Path $rb 'vars-kinds.json'
         $origKinds = @{}; if (Test-Path -LiteralPath $kf) { $origKinds = ConvertTo-SgHashtable (Get-Content -LiteralPath $kf -Raw | ConvertFrom-Json) }
+        $wkinds = @{}; if ($wrote.PSObject.Properties['varkinds']) { $wkinds = ConvertTo-SgHashtable $wrote.varkinds }
+        $text = @('String', 'ExpandString')
         $k = Open-SgEnvKey $Layout.EnvKey -Write
         try {
             foreach ($n in $origVars.Keys) {
                 if (-not $wv.Contains($n)) { continue }
-                $c = $k.GetValue($n, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
                 $o = $origVars[$n]; $wn = $wv[$n]
-                if (($c -ceq $wn) -or ($c -ceq $o) -or ($null -eq $c -and $null -eq $wn) -or ($null -eq $c -and $null -eq $o)) {
-                    if ($null -eq $o) { if ($null -ne $c) { $k.DeleteValue($n) } } else {
-                        $kind = 'String'; if ($origKinds.Contains($n)) { $kind = $origKinds[$n] }
-                        $k.SetValue($n, [string]$o, [Microsoft.Win32.RegistryValueKind]$kind)
-                    }
+                $okind = 'String'; if ($origKinds.Contains($n)) { $okind = $origKinds[$n] }
+                # The installer never writes a value that is not text, so there is nothing of ours to undo there.
+                if ($okind -notin $text -or ($null -ne $o -and $o -isnot [string])) { continue }
+                $wkind = 'String'; if ($wkinds.Contains($n)) { $wkind = $wkinds[$n] }
+                $ck = $null; if (@($k.GetValueNames()) -icontains $n) { $ck = $k.GetValueKind($n).ToString() }
+                $c = $k.GetValue($n, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                # Ours: absent (and nothing to lose), or text of the same kind and value as what we wrote or what was there.
+                $ours = ($null -eq $ck -and ($null -eq $wn -or $null -eq $o)) -or
+                    ($ck -eq $wkind -and $c -is [string] -and $c -ceq $wn) -or
+                    ($ck -eq $okind -and $c -is [string] -and $null -ne $o -and $c -ceq $o)
+                if ($ours) {
+                    if ($null -eq $o) { if ($null -ne $ck) { $k.DeleteValue($n) } }
+                    else { $k.SetValue($n, [string]$o, [Microsoft.Win32.RegistryValueKind]$okind) }
                 } else { $problems += "user variable $n (changed by someone else; left as it is)" }
             }
         } finally { $k.Dispose() }
@@ -1099,8 +1112,10 @@ function Invoke-SgConfigure {
     $oldVarsH = ConvertTo-SgHashtable $oldVars
     $orig = [ordered]@{}
     foreach ($n in $L.Overrides.Keys) {
+        # Also for a name that is already ours: the user may have replaced it with a value that is not text.
+        $o = Read-SgUserVarOriginal $L.EnvKey $n
         if ($oldVarsH.Contains($n)) { if ($oldOrigH.Contains($n)) { $orig[$n] = $oldOrigH[$n] } }
-        else { $o = Read-SgUserVarOriginal $L.EnvKey $n; if ($null -ne $o) { $orig[$n] = $o } }
+        elseif ($null -ne $o) { $orig[$n] = $o }
     }
     # Write-ahead: what a mutation will leave is recorded in wrote.json BEFORE it happens, so a failure or a
     # crash inside the step is still undone (a name to be deleted is recorded with a null value).
@@ -1112,8 +1127,9 @@ function Invoke-SgConfigure {
         if ($L.Overrides.Contains($n)) { continue }
         $w = $null; if ($oldOrigH.Contains($n)) { $w = [string]$oldOrigH[$n].value }   # a removed name goes back to its original
         Set-SgWrote $L 'vars' $w $n
+        if ($null -ne $w) { Set-SgWrote $L 'varkinds' $oldOrigH[$n].kind $n }
     }
-    foreach ($n in $L.Overrides.Keys) { Set-SgWrote $L 'vars' ([string]$L.Overrides[$n]) $n }
+    foreach ($n in $L.Overrides.Keys) { Set-SgWrote $L 'vars' ([string]$L.Overrides[$n]) $n; Set-SgWrote $L 'varkinds' 'String' $n }
     $vars = Set-SyncGateUserVars -Key $L.EnvKey -Vars $L.Overrides -Previous $oldVars -Original $oldOrig
     $profiles = @(Set-SyncGateProfileBlock -Profiles $L.Profiles -Shims $Shims -Previous $oldProfiles -Ahead { param($ap, $ah) Set-SgWrote $L 'profiles' $ah $ap })
     Write-SyncGateLauncher -Layout $L
