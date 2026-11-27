@@ -135,7 +135,7 @@ fn heavy_words(prog: &str, argv: &[OsString]) -> Vec<String> {
         }
         if opts.contains(&a.as_ref()) {
             skip = true;
-        } else if !a.starts_with('-') && !(prog == "cargo" && a.starts_with('+')) {
+        } else if !(a.starts_with('-') || prog == "cargo" && a.starts_with('+')) {
             out.push(a.to_lowercase());
         }
     }

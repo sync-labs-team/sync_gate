@@ -49,7 +49,7 @@ No administrator rights. It only writes to your own folders. Update, uninstall a
 <!-- s:highlights -->
 ## Highlights
 
-- Builds, tests, installs and `docker build` wait in a queue until memory allows. Light commands never wait. Exit code 75 means "still queued": `sync_gate wait N` runs it later, with the environment of the shell that calls it, not the original one.
+- Builds, tests, installs and `docker build` wait in a queue until memory allows. Light commands never wait. Exit code 75 means "still queued": `sync_gate wait N` runs it in your shell.
 - A shared MCP server you adopted runs up to 3 instances (the default) for all your sessions, not one per session.
 - Each command of a declared project can get its own PostgreSQL database, dropped when the command ends: [docs/postgres.md](docs/postgres.md).
 - Codex's sandbox uses your queue only if you list it in `guests`: [docs/sandbox.md](docs/sandbox.md).
