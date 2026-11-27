@@ -89,6 +89,7 @@ $script:Base = [ordered]@{
     SYNC_GATE_CLAUDE_CONFIG  = Join-Path $tmp 'claude.json'
     SYNC_GATE_CODEX_CONFIG   = Join-Path $tmp 'codex.toml'
     SYNC_GATE_TEST_POLICY    = 'RemoteSigned'
+    SYNC_GATE_UPDATE_CHECK   = '0'   # 0.1.3: the daemon would ask GitHub and write update-check.json; a test never does
 }
 $B = $script:Base
 $real = @{
@@ -263,6 +264,9 @@ function Reset-Area {
     foreach ($d in 'inst', 'data', 'prof', 'stranger') { $p = Join-Path $tmp $d; if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue } }
     foreach ($f in 'config.toml', 'claude.json', 'codex.toml', 'mark.txt') { $p = Join-Path $tmp $f; if (Test-Path -LiteralPath $p) { Set-ItemProperty -LiteralPath $p -Name IsReadOnly -Value $false; Remove-Item -LiteralPath $p -Force } }
     foreach ($k in $B.Keys) { Set-Item -Path "env:$k" -Value $B[$k] }
+    # A daemon the task starts gets only the launcher's variables, so the config is what turns its update check off
+    # (a version that does not know the key ignores it).
+    Set-Content -LiteralPath $B.SYNC_GATE_CONFIG -Value 'update_check_days = 0' -Encoding ASCII
 }
 
 function Set-TestPath {
@@ -528,7 +532,9 @@ Invoke-Scenario '3.20' {
     $s = Get-Snap
     $r = Invoke-Inst -Uninstall -Extra @{ SYNC_GATE_INSTALL_FAIL_AT = 'U7' }
     Assert-That ($r.Code -eq 1) "U7: exit $($r.Code): $($r.Text)"
-    Assert-That ((Get-Snap) -ceq $s) 'U7: the installation changed after the rollback'
+    $s2 = Get-Snap
+    $diff = @(($s | ConvertFrom-Json).PSObject.Properties | Where-Object { (ConvertTo-Json -Compress -Depth 5 $_.Value) -cne (ConvertTo-Json -Compress -Depth 5 (($s2 | ConvertFrom-Json).($_.Name))) } | ForEach-Object Name)
+    Assert-That ($s2 -ceq $s) "U7: the installation changed after the rollback (differs in: $($diff -join ', '))"
     $r = Invoke-Inst -Uninstall
     Assert-That ($r.Code -eq 0) "uninstall exited $($r.Code): $($r.Text)"
     Assert-That ($r.Text -notmatch 'changed by someone else') "uninstall warned: $($r.Text)"
@@ -864,7 +870,7 @@ Invoke-Scenario '3.2' {
 }
 
 Invoke-Scenario '3.3' {
-    Set-Content -LiteralPath $B.SYNC_GATE_CONFIG -Value "reserve_fraction = 0.99`naging_secs = 86400"
+    Set-Content -LiteralPath $B.SYNC_GATE_CONFIG -Value "reserve_fraction = 0.99`naging_secs = 86400`nupdate_check_days = 0"
     [void](Install-Ok $FromOld)
     $L = Get-TestLayout
     $bin = Join-Path $L.Bin 'sync_gate.exe'
@@ -1206,14 +1212,14 @@ Invoke-Scenario '3.14' {
 # N9: SYNC_GATE_DATA_DIR as a user variable reaches the elevated sandbox guest; say so at the end when guests are configured.
 $script:SgGuestWarn = 'warning: you set SYNC_GATE_DATA_DIR and your config lists guests. An elevated sandbox guest would try to keep its pending commands in that folder, where it can only read. If you use guests, do not set your own SYNC_GATE_DATA_DIR.'
 Invoke-Scenario '3.16' {
-    Set-Content -LiteralPath $B.SYNC_GATE_CONFIG -Value 'guests = ["CodexSandboxOffline", "@restricted"]' -Encoding ASCII
+    Set-Content -LiteralPath $B.SYNC_GATE_CONFIG -Value "guests = [`"CodexSandboxOffline`", `"@restricted`"]`nupdate_check_days = 0" -Encoding ASCII
     $r = Install-Ok $FromNew
     $lines = @($r.Text -split "\r?\n" | Where-Object { $_ })
     Assert-That ($lines -contains $script:SgGuestWarn) "guest warning missing: $($r.Text)"
     Assert-That ($lines[-1] -like 'Uninstall:*') "warning is not before the closing commands: $($lines[-1])"
 }
 Invoke-Scenario '3.16n' {
-    Set-Content -LiteralPath $B.SYNC_GATE_CONFIG -Value 'guests = []' -Encoding ASCII
+    Set-Content -LiteralPath $B.SYNC_GATE_CONFIG -Value "guests = []`nupdate_check_days = 0" -Encoding ASCII
     $r = Install-Ok $FromNew
     Assert-That (-not $r.Text.Contains('your config lists guests')) "warning with no guests: $($r.Text)"
 }
