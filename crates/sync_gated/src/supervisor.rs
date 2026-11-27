@@ -1205,9 +1205,10 @@ impl Suspended {
 
 /// `CreateProcessW` with `CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`,
 /// plus `CREATE_BREAKAWAY_FROM_JOB` when `breakaway`: nothing of the program runs before
-/// `ResumeThread`. Its stdio is NUL, and NUL is the only handle it inherits. Program,
-/// arguments, added or removed variables and the working directory come from `cmd`; its
-/// stdio settings are ignored. The OS error of a refused creation is kept (`raw_os_error`).
+/// `ResumeThread`. Its stdin is NUL, its stdout and stderr are `out` (or NUL), each through a
+/// handle of its own, and those three are the only handles it inherits. Program, arguments,
+/// added or removed variables and the working directory come from `cmd`; its stdio settings
+/// are ignored. The OS error of a refused creation is kept (`raw_os_error`).
 #[cfg(windows)]
 fn create_suspended(cmd: &Command, breakaway: bool, out: Option<&Path>) -> io::Result<Suspended> {
     use std::os::windows::ffi::OsStrExt;
@@ -1225,23 +1226,24 @@ fn create_suspended(cmd: &Command, breakaway: bool, out: Option<&Path>) -> io::R
     let cwd: Option<Vec<u16>> = cmd
         .get_current_dir()
         .map(|d| d.as_os_str().encode_wide().chain([0]).collect());
-    let nul = match out {
+    let output = match out {
         Some(path) => std::fs::OpenOptions::new()
-            .read(true)
             .write(true)
             .create(true)
             .truncate(true)
             .open(path)?,
-        None => std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("NUL")?,
+        None => std::fs::OpenOptions::new().write(true).open("NUL")?,
     };
-    let handles: [HANDLE; 1] = [nul.as_raw_handle() as HANDLE];
-    // SAFETY: `handles[0]` is the live NUL handle owned by `nul`. Inheritable only matters for
-    // a process created with inheritance on; a NUL handle leaking that way is harmless.
-    if unsafe { SetHandleInformation(handles[0], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
-        return Err(io::Error::last_os_error());
+    // Issue 13: one handle for all three made cmd.exe (pg_ctl hands its stdio down to it) now
+    // and then exit 1 before opening the server log. The stderr copy shares the file position.
+    let files = [std::fs::File::open("NUL")?, output.try_clone()?, output];
+    let handles: [HANDLE; 3] = files.each_ref().map(|f| f.as_raw_handle() as HANDLE);
+    for &h in &handles {
+        // SAFETY: `h` is a live handle owned by `files`. Inheritable only matters for a process
+        // created with inheritance on, and the handle list below limits the starter to these.
+        if unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     let mut size = 0usize;
     // SAFETY: a null list only asks for the size (this call "fails" by design).
@@ -1280,8 +1282,8 @@ fn create_suspended(cmd: &Command, breakaway: bool, out: Option<&Path>) -> io::R
     si.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
     si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     si.StartupInfo.hStdInput = handles[0];
-    si.StartupInfo.hStdOutput = handles[0];
-    si.StartupInfo.hStdError = handles[0];
+    si.StartupInfo.hStdOutput = handles[1];
+    si.StartupInfo.hStdError = handles[2];
     si.lpAttributeList = attrs.0;
     let mut flags = CREATE_SUSPENDED
         | CREATE_NO_WINDOW
@@ -1315,7 +1317,7 @@ fn create_suspended(cmd: &Command, breakaway: bool, out: Option<&Path>) -> io::R
         return Err(io::Error::last_os_error());
     }
     drop(attrs);
-    drop(nul);
+    drop(files);
     Ok(Suspended {
         process: pi.hProcess,
         thread: pi.hThread,
@@ -2052,6 +2054,19 @@ mod tests {
             "write-args" => {
                 let args: Vec<String> = std::env::args().skip(1 + child_args().len()).collect();
                 std::fs::write(path, args.join("\n")).unwrap();
+                std::process::exit(0);
+            }
+            // Writes the values of its stdin, stdout and stderr handles, one per line.
+            #[cfg(windows)]
+            "std-handles" => {
+                use std::os::windows::io::AsRawHandle;
+                let values = [
+                    std::io::stdin().as_raw_handle(),
+                    std::io::stdout().as_raw_handle(),
+                    std::io::stderr().as_raw_handle(),
+                ]
+                .map(|h| format!("{h:?}"));
+                std::fs::write(path, values.join("\n")).unwrap();
                 std::process::exit(0);
             }
             // Waits for "go <owned job handles>" (the test puts it in its jobs first and
@@ -2859,6 +2874,29 @@ mod tests {
         assert_eq!(r.unwrap(), Some(0));
         let got = std::fs::read_to_string(&out).unwrap();
         assert_eq!(got.split('\n').collect::<Vec<_>>(), tricky);
+    }
+
+    /// Issue 13: cmd.exe, run the way pg_ctl runs it (`cmd /C "postgres < nul >> log 2>&1"`),
+    /// now and then exits 1 before it opens the log when its stdin, stdout and stderr are one
+    /// handle. pg_ctl hands its own down, so the starter gets three distinct handles.
+    #[cfg(windows)]
+    #[test]
+    fn run_starter_gives_the_starter_three_distinct_std_handles() {
+        let dir = pid_dir("starter-handles");
+        let report = dir.join("handles.txt");
+        let mode = format!("std-handles:{}", report.display());
+        for out in [None, Some(dir.join("out"))] {
+            let r = run_starter_out(
+                child_command(&mode),
+                Duration::from_secs(60),
+                out.as_deref(),
+            );
+            report_ambient(&r);
+            assert_eq!(r.unwrap(), Some(0));
+            let got = std::fs::read_to_string(&report).unwrap();
+            let values: std::collections::HashSet<&str> = got.lines().collect();
+            assert_eq!(values.len(), 3, "{got:?}");
+        }
     }
 
     /// Stops the real cluster a test started (`pg_ctl stop -m immediate`), pass or fail.
