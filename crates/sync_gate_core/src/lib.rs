@@ -20,7 +20,8 @@ pub mod update;
 mod win_sec;
 pub use config::{
     APPCONTAINER_GUEST, Config, ConfigLoadError, MAX_GUESTS, MAX_WAIT_SECS, McpMode, McpServer,
-    PgConfig, PgProject, RESTRICTED_GUEST, data_dir, is_extension_name, shims_dir, shims_dir_from,
+    PgConfig, PgProject, RESTRICTED_GUEST, data_dir, is_extension_name, read_config, shims_dir,
+    shims_dir_from,
 };
 pub use cost::{CostModel, Estimate, MIB, PRIOR_HEAVY, PRIOR_LIGHT};
 pub use jsonrpc::{Kind, classify, error_response, result_response};

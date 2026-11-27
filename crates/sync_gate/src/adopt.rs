@@ -1050,7 +1050,7 @@ fn conflict(name: &str, cfg_path: &Path) -> String {
 }
 
 fn load_sync_gate_config(path: &Path) -> Result<(String, Config), String> {
-    let text = match fs::read_to_string(path) {
+    let text = match sync_gate_core::read_config(path) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),

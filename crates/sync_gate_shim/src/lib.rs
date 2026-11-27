@@ -144,7 +144,7 @@ pub fn load_config() -> Result<Config, String> {
     let Some(path) = config_path() else {
         return Ok(Config::default());
     };
-    match std::fs::read_to_string(&path) {
+    match sync_gate_core::read_config(&path) {
         // The parser's text can quote the file (an `env` value): a category and a position only.
         Ok(text) => Config::from_toml(&text).map_err(|e| {
             format!(
