@@ -103,7 +103,10 @@ foreach ($k in $B.Keys) { Set-Item -Path "env:$k" -Value $B[$k] }   # this proce
 
 function Get-RealDataListing {
     if (-not (Test-Path -LiteralPath $real.data)) { return 'absent' }
-    $s = Get-ChildItem -LiteralPath $real.data -Recurse -Force -ErrorAction SilentlyContinue |
+    # Files only (a folder's mtime moves with its contents). Another session's queue (pending\) and the daemon's
+    # own bookkeeping (cost, paused, services) change while the test runs; a new or missing file still shows.
+    $s = Get-ChildItem -LiteralPath $real.data -File -Recurse -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notlike '*\pending\*' -and $_.Name -cnotin @('cost.json', 'paused.json', 'services.json') } |
         ForEach-Object { "$($_.FullName)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" }
     ($s -join "`n")
 }
@@ -210,9 +213,6 @@ function Set-TestPath {
     try { $k.SetValue('Path', $Raw, [Microsoft.Win32.RegistryValueKind]$Kind) } finally { $k.Dispose() }
 }
 
-function Get-Snap {
-    $L = Get-TestLayout
-    $task = ''
 function Set-TestVar {
     param([string]$Name, [string]$Value, [string]$Kind = 'String')
     $k = Open-SgEnvKey $B.SYNC_GATE_ENV_KEY -Write
@@ -232,6 +232,9 @@ function Assert-TestVar {
     Assert-That ((Get-TestVarKind $Name) -eq $Kind) "$Msg`: $Name kind is $(Get-TestVarKind $Name), expected $Kind"
 }
 
+function Get-Snap {
+    $L = Get-TestLayout
+    $task = ''
     if (Get-ScheduledTask -TaskName $L.Task -ErrorAction SilentlyContinue) { $task = ([string](Export-ScheduledTask -TaskName $L.Task)) -replace '<Date>[^<]*</Date>', '' }
     $vars = [ordered]@{}; foreach ($n in $script:SgOwnNames) { $vars[$n] = Read-SgUserVar $L.EnvKey $n }
     $prof = @($L.Profiles | ForEach-Object { Get-SgHash $(if (Test-Path -LiteralPath $_.Path) { [IO.File]::ReadAllBytes($_.Path) } else { $null }) })
@@ -388,9 +391,6 @@ Invoke-Scenario '3.17u' {
     Assert-That ($lines.Count -eq 1 -and $lines[0] -like '*SG_T_X3*') "expected one warning, only for X3: [$($lines -join ' | ')]"
 }
 
-Invoke-Scenario '3.0g' {
-    # I-4: a binary that ignores the test variables (here a stand-in that always prints the real values) is refused.
-    $leaky = Join-Path $tmp 'leaky.cmd'
 Invoke-Scenario '3.18u' {
     # #6 follow-up: a user variable that existed before sync_gate took it over comes back on uninstall,
     # with its value and kind, also when the override equals it; names that did not exist are deleted.
@@ -494,6 +494,9 @@ Invoke-Scenario '3.21u' {
     Assert-TestVar 'SYNC_GATE_CONFIG' '%TEMP%\sg-orig.toml' 'ExpandString' 'after the rollback'
 }
 
+Invoke-Scenario '3.0g' {
+    # I-4: a binary that ignores the test variables (here a stand-in that always prints the real values) is refused.
+    $leaky = Join-Path $tmp 'leaky.cmd'
     $lines = @('@echo off', "echo config=$($real.config)", "echo data=$($real.data)", 'echo shims=x', 'echo adopted=x', "echo socket=$($real.socket)", 'echo hub=x')
     Set-Content -LiteralPath $leaky -Value $lines -Encoding ASCII
     $msg = ''
@@ -1062,7 +1065,7 @@ $after = @{
     Tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue).Count
     Key = Get-RealKeyDump; Pids = (Get-RealDaemonPids) -join ','; Data = Get-RealDataListing
 }
-if ($after.Key -ne $before.Key) { $script:Fails++; Write-Host 'FAIL: the real user variables key changed' }
+if ($after.Key -cne $before.Key) { $script:Fails++; Write-Host 'FAIL: the real user variables key changed' }
 $dataSame = $after.Data -ceq $before.Data
 Write-Host ("tasks before=$($before.Tasks) after=$($after.Tasks); test key $(if ($keyGone) { 'removed' } else { 'LEFT' }); " +
     "temp root $(if ($tmpGone) { 'removed' } else { 'LEFT' }); real daemon pid before=$($before.Pids) after=$($after.Pids); " +
