@@ -1822,6 +1822,34 @@ fn no_leftover_retry_while_this_daemon_holds_a_paused_job_and_the_record_keeps_t
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A data folder others can change: the daemon does not start, and nothing is created in it.
+#[test]
+fn the_instance_lock_refuses_a_data_folder_others_can_write() {
+    let dir = temp_dir("unsafe-data");
+    std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("icacls")
+            .arg(&dir)
+            .args(["/grant", "*S-1-5-11:(OI)(CI)(M)"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "icacls: {out:?}");
+    }
+    let r = store::lock_instance_within(&dir, Duration::from_millis(100));
+    let left = std::fs::read_dir(&dir).unwrap().count();
+    let _ = std::fs::remove_dir_all(&dir);
+    let e = r.err().expect("the daemon took a folder others can change");
+    assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+    assert!(e.to_string().contains("writable by other users"), "{e}");
+    assert_eq!(left, 0, "something was created in the folder");
+}
+
 #[test]
 fn a_start_waits_out_a_brief_recovery_pass_but_not_a_live_daemon() {
     let dir = temp_dir("lock-wait");

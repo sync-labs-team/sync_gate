@@ -8,7 +8,6 @@ pub mod cost;
 pub mod ipc_name;
 pub mod jsonrpc;
 pub mod pressure;
-#[cfg(unix)]
 pub mod private_dir;
 pub mod program;
 pub mod protocol;
@@ -17,6 +16,8 @@ pub mod signature;
 pub mod snapshot;
 pub mod template;
 pub mod update;
+#[cfg(windows)]
+mod win_sec;
 pub use config::{
     APPCONTAINER_GUEST, Config, ConfigLoadError, MAX_GUESTS, MAX_WAIT_SECS, McpMode, McpServer,
     PgConfig, PgProject, RESTRICTED_GUEST, data_dir, is_extension_name, shims_dir, shims_dir_from,
@@ -24,8 +25,9 @@ pub use config::{
 pub use cost::{CostModel, Estimate, MIB, PRIOR_HEAVY, PRIOR_LIGHT};
 pub use jsonrpc::{Kind, classify, error_response, result_response};
 pub use pressure::{JobSample, Verdict, analyze, under_pressure};
+pub use private_dir::{DirState, check_private_dir};
 #[cfg(unix)]
-pub use private_dir::{DirState, check_private_dir, check_private_file, open_private_file};
+pub use private_dir::{check_private_file, open_private_file};
 pub use program::{SHIMS_MANIFEST, find_program, find_ps1, resolve_in_env, resolve_program};
 pub use protocol::{
     DaemonInfo, ERR_ADMITTED, ERR_BUSY, ERR_CLAIMED, ERR_UNKNOWN_TICKET, Holder, HubHello,

@@ -2254,13 +2254,30 @@ mod adopted {
         assert!(!w.marker.exists());
     }
 
-    #[cfg(unix)]
+    /// Lets every user change the folder `p`: mode 0777 on Unix, an inheritable Modify entry for
+    /// Everyone on Windows.
+    fn let_others_write(p: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let out = Command::new("icacls")
+                .arg(p)
+                .args(["/grant", "*S-1-1-0:(OI)(CI)(M)"])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "icacls: {out:?}");
+        }
+    }
+
     #[test]
     fn relay_adopted_record_in_an_unsafe_folder_is_not_used() {
-        use std::os::unix::fs::PermissionsExt;
         let w = World::new("a6");
         w.record_fake();
-        std::fs::set_permissions(w.data(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let_others_write(&w.data());
         let mut r = w.relay("docs", None, &[]);
         assert_eq!(r.finish(), 2);
         assert!(

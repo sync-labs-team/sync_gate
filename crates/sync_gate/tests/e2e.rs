@@ -678,7 +678,6 @@ fn max_wait_0_still_leaves_the_ticket_dormant() {
 }
 
 /// `queued: ticket {id}` from a `run --max-wait 0` stderr.
-#[cfg(unix)]
 fn ticket_id(stderr: &str) -> String {
     stderr
         .split("queued: ticket ")
@@ -693,6 +692,23 @@ fn ticket_id(stderr: &str) -> String {
 fn chmod(p: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Lets every user change the folder `p` (`on`), or takes that back: mode 0777/0700 on Unix, an
+/// inheritable Modify entry for Everyone on Windows.
+fn others_write(p: &Path, on: bool) {
+    #[cfg(unix)]
+    chmod(p, if on { 0o777 } else { 0o700 });
+    #[cfg(windows)]
+    {
+        let args = if on {
+            ["/grant", "*S-1-1-0:(OI)(CI)(M)"]
+        } else {
+            ["/remove:g", "*S-1-1-0"]
+        };
+        let out = Command::new("icacls").arg(p).args(args).output().unwrap();
+        assert!(out.status.success(), "icacls: {out:?}");
+    }
 }
 
 #[cfg(unix)]
@@ -723,7 +739,6 @@ fn an_unusable_pending_folder_runs_the_command_directly() {
     assert!(s.queued.is_empty(), "{s:?}");
 }
 
-#[cfg(unix)]
 #[test]
 fn wait_refuses_a_pending_folder_others_can_write() {
     let env = Env::new();
@@ -736,14 +751,14 @@ fn wait_refuses_a_pending_folder_others_can_write() {
     assert_eq!(b.code, 75, "{}", b.stderr);
     let id = ticket_id(&b.stderr);
     let pending = env.data_dir().join("pending");
-    chmod(&pending, 0o777);
+    others_write(&pending, true);
     let w = Proc::spawn(env.cli(&["wait", &id], Some(&env.ticker("b", 3)))).finish();
     assert_eq!(w.code, 2, "{}", w.stderr);
     assert!(w.stderr.contains("writable by other users"), "{}", w.stderr);
     assert!(w.stderr.contains("nothing was run"), "{}", w.stderr);
     assert!(!env.file("b").exists(), "the command ran");
     // Control: once the folder is ours again, the same wait runs it.
-    chmod(&pending, 0o700);
+    others_write(&pending, false);
     std::fs::write(env.file("a.stop"), "").unwrap();
     assert_eq!(a.finish().code, 0);
     let w = Proc::spawn(env.cli(&["wait", &id], Some(&env.ticker("b", 3)))).finish();
@@ -1990,18 +2005,34 @@ fn shims_install_replaces_a_running_shim() {
     assert_eq!(s.published("npm.exe"), Shims::expected(&b));
 }
 
-#[cfg(unix)]
 #[test]
 fn shims_install_refuses_a_folder_others_can_write() {
-    use std::os::unix::fs::PermissionsExt;
     let s = Shims::new();
     std::fs::create_dir_all(s.dir()).unwrap();
-    std::fs::set_permissions(s.dir(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    others_write(&s.dir(), true);
     let (code, _, err) = s.run("install");
     assert_ne!(code, 0);
     assert!(err.contains("writable by other users"), "{err}");
     assert!(!s.exists("sync_gate_shims.json"));
-    assert!(!s.exists("npm"));
+    assert!(!s.exists(&shim_name("npm")));
+}
+
+/// `remove` deletes what the manifest names: a manifest in a folder others can change is not
+/// trusted, and nothing is deleted. Control: once the folder is ours again, it removes.
+#[test]
+fn shims_remove_refuses_a_folder_others_can_write() {
+    let s = Shims::new();
+    s.ok("install");
+    let npm = shim_name("npm");
+    others_write(&s.dir(), true);
+    let (code, out, err) = s.run("remove");
+    assert_ne!(code, 0, "{out}{err}");
+    assert!(err.contains("writable by other users"), "{err}");
+    assert!(s.exists(&npm));
+    assert!(s.exists("sync_gate_shims.json"));
+    others_write(&s.dir(), false);
+    s.ok("remove");
+    assert!(!s.exists(&npm));
 }
 
 #[cfg(windows)]
@@ -3414,13 +3445,11 @@ fn hook_session_with_the_shims_already_on_path_writes_no_path_line() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn hook_session_skips_an_unsafe_shims_folder() {
-    use std::os::unix::fs::PermissionsExt;
     let h = Hook::new();
     h.s.ok("install");
-    std::fs::set_permissions(h.s.dir(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    others_write(&h.s.dir(), true);
     std::fs::write(&h.file, "").unwrap();
     let (ctx, after) = h.start(HOOK_STDIN, Hook::base_path());
     assert!(!has_path_line(&after), "{after}");

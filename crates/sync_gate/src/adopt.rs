@@ -331,10 +331,9 @@ fn is_link(m: &fs::Metadata) -> bool {
 }
 
 #[cfg(any(windows, test))]
-/// `IsReparseTagNameSurrogate`: the tag's bit 0x20000000 (symlink, mount point/junction...).
-fn is_name_surrogate(tag: u32) -> bool {
-    tag & 0x2000_0000 != 0
-}
+use sync_gate_core::private_dir::is_name_surrogate;
+#[cfg(windows)]
+use sync_gate_core::private_dir::tag_info;
 
 #[cfg(any(windows, test))]
 #[derive(Debug, PartialEq)]
@@ -372,29 +371,6 @@ fn surrogate_at(p: &Path) -> bool {
         windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
     );
     o.open(p).map_or(true, |f| surrogate_of(&f))
-}
-
-/// Windows: (attributes, reparse tag) of an open handle.
-#[cfg(windows)]
-fn tag_info(f: &fs::File) -> Option<(u32, u32)> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_TAG_INFO, FileAttributeTagInfo, GetFileInformationByHandleEx,
-    };
-    let mut i = FILE_ATTRIBUTE_TAG_INFO {
-        FileAttributes: 0,
-        ReparseTag: 0,
-    };
-    // SAFETY: a valid handle and a buffer of the size passed.
-    let ok = unsafe {
-        GetFileInformationByHandleEx(
-            f.as_raw_handle() as _,
-            FileAttributeTagInfo,
-            (&raw mut i).cast(),
-            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
-        )
-    };
-    (ok != 0).then_some((i.FileAttributes, i.ReparseTag))
 }
 
 /// Windows: (volume serial number, 128-bit file id) of an open handle.

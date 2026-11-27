@@ -52,6 +52,8 @@ impl Cache {
 }
 
 /// The cache in `dir`, or `None` when it is missing, too big or not what the daemon writes.
+/// Read without a folder or file check on purpose: it holds only integers (a version and a
+/// time), so a planted one can show a wrong "new version" notice and nothing else.
 pub fn read_cache(dir: &Path) -> Option<Cache> {
     #[derive(serde::Deserialize)]
     struct Raw {

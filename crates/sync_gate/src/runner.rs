@@ -1181,7 +1181,6 @@ fn gone_message(id: TicketId) -> String {
 pub fn wait(id: TicketId, max_wait: Option<u64>) -> i32 {
     // First, the folder: the file read below is the one that passed the check only if nobody
     // else could have swapped it.
-    #[cfg(unix)]
     if let Some(dir) = pending_path(id).and_then(|p| p.parent().map(Path::to_path_buf)) {
         use sync_gate_core::{DirState, check_private_dir};
         match check_private_dir(&dir) {
@@ -1190,9 +1189,13 @@ pub fn wait(id: TicketId, max_wait: Option<u64>) -> i32 {
                 return 2;
             }
             Err(e) => {
-                eprintln!(
-                    "sync_gate: refusing ticket {id}: {e}; nothing was run (check the folder, then chmod 700 it)"
-                );
+                // Windows: the error already names the folder and the command that fixes it.
+                let fix = if cfg!(unix) {
+                    " (check the folder, then chmod 700 it)"
+                } else {
+                    ""
+                };
+                eprintln!("sync_gate: refusing ticket {id}: {e}; nothing was run{fix}");
                 return 2;
             }
             Ok(DirState::OthersCanRead) => {
