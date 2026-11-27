@@ -990,3 +990,43 @@ fn template_check_accepts_only_what_the_candidate_owns() {
         assert_eq!(check(), "t\n", "{undo}");
     }
 }
+
+#[test]
+fn a_start_that_died_before_its_log_reports_what_pg_ctl_printed() {
+    let s = Scratch::new("start-failure");
+    let (log, out) = (s.join("server.log"), s.join("pg_ctl.out"));
+    fs::write(&out, "pg_ctl: boom\n").unwrap();
+    let e = start_failure(Some(1), &log, &out);
+    assert!(e.contains("boom"), "{e}");
+    // With a server log, the log wins and the printed text stays out.
+    fs::write(&log, "LOG: the log line\n").unwrap();
+    let e = start_failure(Some(1), &log, &out);
+    assert!(e.contains("the log line") && !e.contains("boom"), "{e}");
+}
+
+fn twice(first: Option<i32>, second: Option<i32>, nothing: bool) -> (Option<i32>, u32, u32) {
+    let (mut calls, mut noted) = (0, 0);
+    let r = start_twice(
+        &mut || {
+            calls += 1;
+            Ok(if calls == 1 { first } else { second })
+        },
+        &|| nothing,
+        &mut |_| noted += 1,
+    )
+    .unwrap();
+    (r, calls, noted)
+}
+
+#[test]
+fn a_failed_start_that_left_nothing_is_repeated_once() {
+    assert_eq!(twice(Some(1), Some(0), true), (Some(0), 2, 1));
+    // Still failing: one repeat only, and the last result is reported.
+    assert_eq!(twice(Some(1), Some(1), true), (Some(1), 2, 1));
+}
+
+#[test]
+fn a_start_is_not_repeated_when_it_worked_or_left_a_log_or_a_server() {
+    assert_eq!(twice(Some(0), Some(1), true), (Some(0), 1, 0));
+    assert_eq!(twice(Some(1), Some(0), false), (Some(1), 1, 0));
+}

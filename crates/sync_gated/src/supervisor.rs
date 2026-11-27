@@ -938,6 +938,10 @@ fn starter_timed_out() -> io::Error {
 /// terminal's, a CI runner's) is not a reason to refuse: see [`own_job_kills_on_close`].
 /// Unix: own process group (`pg_ctl` itself calls `setsid`).
 pub fn run_starter(cmd: Command, timeout: Duration) -> io::Result<Option<i32>> {
+    run_starter_out(cmd, timeout, None)
+}
+
+fn run_starter_out(cmd: Command, timeout: Duration, out: Option<&Path>) -> io::Result<Option<i32>> {
     let deadline = Instant::now() + timeout;
     let mut expired = || Instant::now() >= deadline;
     #[cfg(windows)]
@@ -946,9 +950,16 @@ pub fn run_starter(cmd: Command, timeout: Duration) -> io::Result<Option<i32>> {
         &mut expired,
         &|s| s.in_jobs(&own_jobs().lock().unwrap_or_else(|e| e.into_inner())),
         &Suspended::end,
+        out,
     );
     #[cfg(unix)]
-    return start_detached(cmd, &mut expired);
+    return start_detached(cmd, &mut expired, out);
+}
+
+/// Like [`run_starter`], but the starter's stdout and stderr go to the file `out` (created,
+/// truncated), so what `pg_ctl` says before it opens its own log is not lost.
+pub fn run_starter_to(cmd: Command, timeout: Duration, out: &Path) -> io::Result<Option<i32>> {
+    run_starter_out(cmd, timeout, Some(out))
 }
 
 /// Whether the job object this daemon itself runs in (its immediate one) ends its processes
@@ -992,10 +1003,21 @@ pub fn own_job_kills_on_close() -> Option<bool> {
 }
 
 #[cfg(unix)]
-fn start_detached(mut cmd: Command, expired: &mut dyn FnMut() -> bool) -> io::Result<Option<i32>> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+fn start_detached(
+    mut cmd: Command,
+    expired: &mut dyn FnMut() -> bool,
+    out: Option<&Path>,
+) -> io::Result<Option<i32>> {
+    cmd.stdin(Stdio::null());
+    match out {
+        Some(path) => {
+            let file = std::fs::File::create(path)?;
+            cmd.stdout(file.try_clone()?).stderr(file);
+        }
+        None => {
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+    }
     isolate(&mut cmd);
     let mut child = cmd.spawn()?;
     let mut wait = || -> io::Result<Option<std::process::ExitStatus>> {
@@ -1028,16 +1050,17 @@ fn start_detached(
     expired: &mut dyn FnMut() -> bool,
     in_owned: &dyn Fn(&Suspended) -> Option<bool>,
     end_unrun: &dyn Fn(&Suspended) -> io::Result<()>,
+    out: Option<&Path>,
 ) -> io::Result<Option<i32>> {
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, ResumeThread, WaitForSingleObject,
     };
-    let s = match create_suspended(&cmd, true) {
+    let s = match create_suspended(&cmd, true, out) {
         // A job in the chain forbids breakaway: the starter stays in the jobs this daemon is
         // in, which the check below accepts unless one of them is sync_gate's own.
         Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
-            create_suspended(&cmd, false)?
+            create_suspended(&cmd, false, out)?
         }
         r => r?,
     };
@@ -1179,7 +1202,7 @@ impl Suspended {
 /// arguments, added or removed variables and the working directory come from `cmd`; its
 /// stdio settings are ignored. The OS error of a refused creation is kept (`raw_os_error`).
 #[cfg(windows)]
-fn create_suspended(cmd: &Command, breakaway: bool) -> io::Result<Suspended> {
+fn create_suspended(cmd: &Command, breakaway: bool, out: Option<&Path>) -> io::Result<Suspended> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
@@ -1195,10 +1218,18 @@ fn create_suspended(cmd: &Command, breakaway: bool) -> io::Result<Suspended> {
     let cwd: Option<Vec<u16>> = cmd
         .get_current_dir()
         .map(|d| d.as_os_str().encode_wide().chain([0]).collect());
-    let nul = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("NUL")?;
+    let nul = match out {
+        Some(path) => std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?,
+        None => std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("NUL")?,
+    };
     let handles: [HANDLE; 1] = [nul.as_raw_handle() as HANDLE];
     // SAFETY: `handles[0]` is the live NUL handle owned by `nul`. Inheritable only matters for
     // a process created with inheritance on; a NUL handle leaking that way is harmless.
@@ -1977,6 +2008,12 @@ mod tests {
                 std::fs::rename(dir.join("read.tmp"), dir.join("read.txt")).unwrap();
                 std::process::exit(0);
             }
+            // Says "boom" on stdout and on stderr, then fails (a `pg_ctl` that dies early).
+            "say-boom" => {
+                println!("out-boom");
+                eprintln!("err-boom");
+                std::process::exit(1);
+            }
             // Writes the arguments after the harness's own, one per line.
             "write-args" => {
                 let args: Vec<String> = std::env::args().skip(1 + child_args().len()).collect();
@@ -2009,6 +2046,7 @@ mod tests {
                     &mut || Instant::now() >= end,
                     &|s| s.in_jobs(&owned),
                     end_unrun,
+                    None,
                 );
                 print_starter_result(r);
             }
@@ -2164,7 +2202,7 @@ mod tests {
     /// What creating a suspended breakaway process from here does, without running anything.
     #[cfg(windows)]
     fn probe_breakaway() -> String {
-        match create_suspended(&child_command("sleep"), true) {
+        match create_suspended(&child_command("sleep"), true, None) {
             Err(e) => format!("create-failed:{:?}", e.raw_os_error()),
             Ok(s) => {
                 let in_job = s.in_any_job();
@@ -2208,9 +2246,10 @@ mod tests {
             expired,
             &|s| s.in_jobs(&own_jobs().lock().unwrap_or_else(|e| e.into_inner())),
             &Suspended::end,
+            None,
         );
         #[cfg(unix)]
-        return start_detached(cmd, expired);
+        return start_detached(cmd, expired, None);
     }
 
     /// The fixture's verdict line, then exit (its own exit ends whatever job it sits in).
@@ -2748,6 +2787,22 @@ mod tests {
         let [(_, born), _] = parse_pidfile(&std::fs::read_to_string(&pidfile).unwrap()).unwrap();
         assert_gone(starter, Some(born).filter(|&b| b > 0), "the starter");
         assert_eq!(sync_gate_probe::process_alive(grandchild), Some(true));
+    }
+
+    #[test]
+    fn run_starter_to_keeps_what_the_starter_printed() {
+        let dir = pid_dir("starter-out");
+        let out = dir.join("pg_ctl.out");
+        std::fs::write(&out, "stale line from an earlier start\n").unwrap();
+        let r = run_starter_to(child_command("say-boom:x"), Duration::from_secs(60), &out);
+        report_ambient(&r);
+        assert_eq!(r.unwrap(), Some(1));
+        let got = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            got.contains("out-boom") && got.contains("err-boom"),
+            "{got:?}"
+        );
+        assert!(!got.contains("stale"), "truncated at each start: {got:?}");
     }
 
     #[test]

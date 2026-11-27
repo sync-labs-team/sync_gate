@@ -7,7 +7,7 @@ use super::pg_sql::{
     ADMIN_PREAMBLE, ADMIN_ROLE, cluster_identity_sql, hba_conf, identity_guard_sql, redact,
     server_conf,
 };
-use crate::supervisor::{process_exe, run_starter, run_tool};
+use crate::supervisor::{process_exe, run_starter_to, run_tool};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -327,6 +327,32 @@ fn log_tail(path: &Path) -> String {
     last_lines(&read().unwrap_or_default(), 5)
 }
 
+/// What a failed `pg_ctl start` says: the tail of `server.log`, or, when pg_ctl died before it
+/// opened that log, the tail of what it printed itself (`out`).
+fn start_failure(code: Option<i32>, log: &Path, out: &Path) -> String {
+    let mut said = log_tail(log);
+    if said.is_empty() {
+        said = log_tail(out);
+    }
+    format!("pg_ctl start failed ({code:?}): {}", redact(&said, &[]))
+}
+
+/// Runs `attempt` (a `pg_ctl start`); once more when it failed and `left_nothing()` says it
+/// left neither a log nor a server, so repeating cannot start a second one. `first_failed`
+/// gets the first result before the repeat.
+fn start_twice(
+    attempt: &mut dyn FnMut() -> io::Result<Option<i32>>,
+    left_nothing: &dyn Fn() -> bool,
+    first_failed: &mut dyn FnMut(Option<i32>),
+) -> io::Result<Option<i32>> {
+    let first = attempt()?;
+    if first == Some(0) || !left_nothing() {
+        return Ok(first);
+    }
+    first_failed(first);
+    attempt()
+}
+
 fn controldata(c: &ClusterPaths) -> io::Result<u64> {
     let mut cmd = tool_command(&c.bin, "pg_controldata");
     cmd.arg("-D").arg(&c.data);
@@ -528,24 +554,34 @@ impl PgTools for OsPgTools {
             Ok(Some(_)) => return Err(fail("the server is already running")),
             Err(e) => return Err(fail(e)),
         }
-        let mut cmd = tool_command(&c.bin, "pg_ctl");
-        cmd.arg("start")
-            .arg("-D")
-            .arg(&c.data)
-            .arg("-l")
-            .arg(&c.log);
-        cmd.args(["-w", "-t", "60"]);
+        // What pg_ctl itself prints (it dies before opening `server.log` in some failures).
+        let out = c.log.with_file_name("pg_ctl.out");
+        let mut attempt = || {
+            let mut cmd = tool_command(&c.bin, "pg_ctl");
+            cmd.arg("start")
+                .arg("-D")
+                .arg(&c.data)
+                .arg("-l")
+                .arg(&c.log);
+            cmd.args(["-w", "-t", "60"]);
+            run_starter_to(cmd, START_TIMEOUT, &out)
+        };
+        // A stale log from an earlier run also blocks the repeat: the safe side.
+        let left_nothing = || log_tail(&c.log).is_empty() && matches!(self.server(c), Ok(None));
+        let note = &mut |code: Option<i32>| {
+            eprintln!(
+                "sync_gated: pg_ctl start failed ({code:?}) leaving no log and no server, trying once more: {}",
+                redact(&log_tail(&out), &[])
+            );
+        };
         // `JOB_LOCKED` and every other starter error go up unchanged.
-        match run_starter(cmd, START_TIMEOUT)? {
+        match start_twice(&mut attempt, &left_nothing, note)? {
             Some(0) => match self.server(c) {
                 Ok(Some(id)) => Ok(id),
                 Ok(None) => Err(fail("the server started but left no live postmaster.pid")),
                 Err(e) => Err(fail(format!("the started server is not proven ours: {e}"))),
             },
-            code => Err(fail(format!(
-                "pg_ctl start failed ({code:?}): {}",
-                redact(&log_tail(&c.log), &[])
-            ))),
+            code => Err(fail(start_failure(code, &c.log, &out))),
         }
     }
 
