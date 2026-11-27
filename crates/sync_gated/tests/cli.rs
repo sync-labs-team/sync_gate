@@ -71,6 +71,7 @@ impl Sandbox {
             .env("SYNC_GATE_SOCKET", &self.sock)
             .env("SYNC_GATE_DATA_DIR", self.dir.join("data"))
             .env("SYNC_GATE_CONFIG", self.dir.join("config.toml"))
+            .env("SYNC_GATE_UPDATE_CHECK", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

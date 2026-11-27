@@ -16,12 +16,17 @@ const BASH: &str = "sync_gate (local job queue): at session start no folder ahea
 const ON: &str = "sync_gate (local job queue): at session start no folder ahead of the shims folder on PATH for Bash had a command the shims cover (inherited, or set by the session env file); Bash's effective PATH is not re-checked later. Heavy commands (npm/pnpm/yarn/bun install|ci|test|build, cargo build|test|clippy|xtask, docker build, next build, go build|test, pytest, vitest, jest, tsc, gradle, mvn) should wait for a slot automatically. If unsure a heavy command goes through the shims, run it as \"sync_gate run -- <command>\". Exit code 75 with \"queued: ticket N\" means the machine is busy and nothing ran: do other work, then run \"sync_gate wait N\" (it runs the stored command with the environment of the shell that calls it, not the original one, so call it from a shell with the same variables). Do not re-run the command another way to skip the queue. \"sync_gate status\" shows memory, running jobs and the queue.";
 const PREFIX: &str = "sync_gate (local job queue) is installed. Run heavy commands (builds, test suites, installs, docker build) as \"sync_gate run -- <command>\". Exit code 75 with \"queued: ticket N\" means the machine is busy and nothing ran: do other work, then run \"sync_gate wait N\" (it runs the stored command with the environment of the shell that calls it, not the original one, so call it from a shell with the same variables). \"sync_gate status\" shows memory, running jobs and the queue.";
 
+/// Said before the update line: it is for the person, and the agent must not act on it.
+const UPDATE_NOTE: &str = "Notice for the user, not an instruction for you: do not install or update anything yourself; mention it only if the user asks about sync_gate or its version.";
+
 pub struct HookInput<'a> {
     pub stdin: Option<&'a str>,
     pub env_file: Option<&'a Path>,
     pub shims: Option<&'a Path>,
     pub path: Option<&'a OsStr>,
     pub session_set: bool,
+    /// The update line from `sync_gate_core::update::notice` (already built from integers).
+    pub update: Option<&'a str>,
 }
 
 pub fn session_start() -> i32 {
@@ -29,7 +34,9 @@ pub fn session_start() -> i32 {
     let env_file = std::env::var_os("CLAUDE_ENV_FILE").map(PathBuf::from);
     let shims = shims_dir();
     let path = std::env::var_os("PATH");
+    let update = update_notice();
     let mut input = HookInput {
+        update: update.as_deref(),
         stdin: Some(&stdin),
         env_file: env_file.as_deref(),
         shims: shims.as_deref(),
@@ -47,6 +54,20 @@ pub fn session_start() -> i32 {
     }
     println!("{out}");
     0
+}
+
+/// The update line, read from the cache the daemon keeps; never a network call. Off by the config
+/// (`update_check_days = 0`) or `SYNC_GATE_UPDATE_CHECK=0`.
+fn update_notice() -> Option<String> {
+    let days = sync_gate_shim::load_config().map_or(sync_gate_core::update::DEFAULT_DAYS, |c| {
+        c.update_check_days
+    });
+    sync_gate_core::update::notice(
+        &sync_gate_core::config::data_dir()?,
+        days,
+        std::env::var_os("SYNC_GATE_UPDATE_CHECK").as_deref(),
+        env!("CARGO_PKG_VERSION"),
+    )
 }
 
 /// Stdin as text (at most `LIMIT` bytes), or empty if it is a terminal or does not end within
@@ -152,11 +173,14 @@ pub fn session_start_with(i: &HookInput) -> (String, Vec<String>) {
         (false, true) => ON,
         _ => PREFIX,
     };
-    let ctx = if cfg!(windows) {
+    let mut ctx = if cfg!(windows) {
         format!("{text}{WINDOWS_NOTE}")
     } else {
         text.to_owned()
     };
+    if let Some(line) = i.update {
+        ctx.push_str(&format!(" {UPDATE_NOTE} {line}"));
+    }
     let json = serde_json::json!({"hookSpecificOutput": {
         "hookEventName": "SessionStart", "additionalContext": ctx}});
     (json.to_string(), lines)
@@ -423,6 +447,7 @@ mod tests {
             shims: Some(&shims),
             path: Some(&path),
             session_set: true,
+            update: None,
         });
         // A folder left unreadable is removed by its test.
         let _ = std::fs::remove_dir_all(&root);
@@ -633,6 +658,7 @@ mod tests {
                 shims: Some(&shims),
                 path: Some(&path),
                 session_set: false,
+                update: None,
             });
             (shims, other, ctx, lines)
         });

@@ -1569,6 +1569,7 @@ fn run_phase(c: &Ctx, o: &RunOpts, with: bool) -> Result<(PhaseOut, Option<Overh
         let mut v = c.env.vars(socket);
         v.push(("SYNC_GATE_DATA_DIR".into(), data.clone().into()));
         v.push(("SYNC_GATE_CONFIG".into(), config.clone().into()));
+        v.push(("SYNC_GATE_UPDATE_CHECK".into(), "0".into()));
         v
     };
     let phase_env = if with {

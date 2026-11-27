@@ -64,6 +64,13 @@ Run the install command again. Your own values (below) are kept. The installer s
 swaps the programs, refreshes the shortcuts, starts the daemon and waits for `sync_gate status` to
 answer in a new environment. Only then it discards the saved previous state.
 
+`sync_gate status` and the session hook of Claude Code and Codex print one line when a newer
+release exists, with the command above. The daemon looks once every `update_check_days` days
+(default 7): one anonymous request to the GitHub releases API through `curl`, never from a command
+you type, silent when offline. To turn it off, put `update_check_days = 0` in `config.toml`, or set
+`SYNC_GATE_UPDATE_CHECK=0` in the daemon's environment (the config is the sure way: a variable in
+your shell does not reach a daemon that the installer started). Off means no call at all.
+
 ## Downgrade
 
 Installing an older version works the same way as an update: pin it with `-Version` (Windows) or

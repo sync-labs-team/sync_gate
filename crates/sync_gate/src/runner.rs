@@ -1308,10 +1308,23 @@ pub(crate) fn render(s: &StatusReport) -> String {
     o
 }
 
+/// The update line from the cache the daemon keeps (never a network call); `None` when off.
+fn update_notice() -> Option<String> {
+    sync_gate_core::update::notice(
+        &data_dir()?,
+        load_config().update_check_days,
+        std::env::var_os("SYNC_GATE_UPDATE_CHECK").as_deref(),
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
 pub fn status() -> i32 {
     match call_at(&socket(), &Request::Status) {
         Ok(Response::Status(s)) => {
             print!("{}", render(&s));
+            if let Some(line) = update_notice() {
+                println!("{line}");
+            }
             0
         }
         Ok(other) => {

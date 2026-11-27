@@ -81,9 +81,9 @@ sync_gate mcp adopt
 
 - En Windows, los archivos de los comandos pendientes pueden ser leídos por las cuentas del grupo del sandbox de Codex. Un comando pendiente queda en el disco hasta que corre, o hasta 25 horas. Un invitado en modo `elevated` que no encola queda sin plazo, y un marcador huérfano también. No pongas un secreto en la línea de comandos. Más en [SECURITY.md](SECURITY.md).
 - La clave de costo (programa, hasta dos palabras cortas, nombre de la carpeta) aparece en `sync_gate status`; por eso entra en el contexto del agente y llega al proveedor del modelo del agente.
-- Los comandos del sandbox entran en la cola solo después de que la cuenta esté en `guests`; antes corren directo.
 - En Windows, el atajo no oculta un programa que existe solo como `.ps1` al ejecutar `sync_gate shims install`. Si aparece uno después, sale con 127 y una instrucción hasta la próxima instalación.
 - El benchmark es un proxy: los procesos de los agentes no entran.
+- Cada semana el daemon busca en GitHub una versión nueva; `status` la muestra. Se desactiva con `update_check_days = 0` ([detalles](docs/install.md#update)).
 
 <!-- s:docs -->
 ## Documentación

@@ -26,6 +26,12 @@ and what happened.
 
 ## Declared limits
 
+- **The update check calls GitHub.** Once every `update_check_days` (default 7), the daemon runs
+  `curl` for `releases/latest` of this repository: one anonymous GET over HTTPS, with no
+  token, cookie or data of yours. GitHub sees your IP address, the time and the `curl` version. The
+  answer is kept only as a plain `X.Y.Z` in `update-check.json` in the data folder. Off with
+  `update_check_days = 0` in `config.toml` or `SYNC_GATE_UPDATE_CHECK=0` in the daemon's environment;
+  off means no call and the file is removed.
 - **Pending command files are readable by other accounts on Windows.** The folder
   `<data>\pending` inherits the permissions of the user profile, and the setup of Codex's sandbox
   gives the group `CodexSandboxUsers` read access to the profile. Those accounts can read the files

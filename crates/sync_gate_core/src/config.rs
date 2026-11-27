@@ -51,6 +51,8 @@ pub struct Config {
     /// "@restricted" (your own account with a write-restricted token: Codex `unelevated`).
     /// Empty: nobody but you. Ignored elsewhere.
     pub guests: Vec<String>,
+    /// Days between looks at the latest release on GitHub (one anonymous GET); 0 = never.
+    pub update_check_days: u64,
 }
 
 /// The shared PostgreSQL server the daemon owns: one database and role per `sync_gate run` lease.
@@ -440,6 +442,7 @@ impl Default for Config {
             mcp: BTreeMap::new(),
             postgres: None,
             guests: Vec::new(),
+            update_check_days: crate::update::DEFAULT_DAYS,
         }
     }
 }
@@ -536,6 +539,18 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_check_days_defaults_to_a_week_and_zero_turns_it_off() {
+        assert_eq!(Config::default().update_check_days, 7);
+        assert_eq!(Config::from_toml("").unwrap().update_check_days, 7);
+        assert_eq!(
+            Config::from_toml("update_check_days = 0")
+                .unwrap()
+                .update_check_days,
+            0
+        );
+    }
     use std::path::PathBuf;
 
     fn guests_toml(list: &[&str]) -> String {

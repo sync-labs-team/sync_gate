@@ -38,7 +38,8 @@ const USAGE: &str = "usage: sync_gated [--help | --version]
 The sync_gate daemon. The installer starts it with your session (Task Scheduler, launchd or
 systemd --user); you do not need to run it by hand.
 
-Environment: SYNC_GATE_CONFIG, SYNC_GATE_DATA_DIR, SYNC_GATE_SOCKET.";
+Environment: SYNC_GATE_CONFIG, SYNC_GATE_DATA_DIR, SYNC_GATE_SOCKET, SYNC_GATE_UPDATE_CHECK=0
+(no weekly look at the latest release).";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
@@ -110,6 +111,14 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // The weekly look at the latest release; reads `update_check_days` again at every wake-up.
+    if let Some(dir) = sync_gated::store::default_dir() {
+        sync_gated::update_check::spawn(dir, || {
+            load_config().map_or(sync_gate_core::update::DEFAULT_DAYS, |c| {
+                c.update_check_days
+            })
+        });
+    }
     let _ = rx.recv();
     handle.shutdown();
     ExitCode::SUCCESS

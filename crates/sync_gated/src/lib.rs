@@ -10,6 +10,7 @@ pub mod services;
 pub mod state;
 pub mod store;
 pub mod supervisor;
+pub mod update_check;
 
 pub use control_loop::{Control, Core, Measure, OsControl};
 pub use hub::{Hub, McpReload};

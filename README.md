@@ -78,10 +78,10 @@ sync_gate mcp adopt
 <!-- s:limits -->
 ## Limits
 
-- On Windows, the files of pending commands can be read by the accounts of Codex's sandbox group. A pending command stays on disk until it runs, or for up to 25 hours. A guest in `elevated` mode that does not enqueue stays with no time limit, and so does an orphan marker. Do not put a secret on a command line. More in [SECURITY.md](SECURITY.md).
+- On Windows, the files of pending commands can be read by the accounts of Codex's sandbox group. A pending command stays on disk until it runs, or for up to 25 hours. An `elevated` guest that does not enqueue, and an orphan marker, have no time limit. Do not put a secret on a command line. More in [SECURITY.md](SECURITY.md).
 - The cost key (program, up to two short words, folder name) appears in `sync_gate status`, so it enters the agent's context and reaches the provider of the agent's model.
-- Sandbox commands join the queue only after the account is in `guests`; before that they run directly.
 - On Windows, the shortcut does not hide a program that exists only as a `.ps1` when you run `sync_gate shims install`. If one appears later, it exits 127 with an instruction until the next install.
+- Weekly, the daemon checks GitHub for a newer release; `status` shows it. Off: `update_check_days = 0` ([details](docs/install.md#update)).
 
 <!-- s:docs -->
 ## Documentation

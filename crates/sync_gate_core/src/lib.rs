@@ -16,6 +16,7 @@ pub mod scheduler;
 pub mod signature;
 pub mod snapshot;
 pub mod template;
+pub mod update;
 pub use config::{
     APPCONTAINER_GUEST, Config, ConfigLoadError, MAX_GUESTS, MAX_WAIT_SECS, McpMode, McpServer,
     PgConfig, PgProject, RESTRICTED_GUEST, data_dir, is_extension_name, shims_dir, shims_dir_from,
