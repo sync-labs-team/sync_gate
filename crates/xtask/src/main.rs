@@ -238,7 +238,7 @@ fn host_steps() -> Vec<Step> {
     for (_, target) in TARGETS.iter().filter(|(os, _)| *os != env::consts::OS) {
         steps.push(clippy(Some(target)));
     }
-    let mut test = cargo(&["test", "--workspace", "--locked"]);
+    let mut test = cargo(&["test", "--workspace", "--locked", "--no-fail-fast"]);
     // Under `CI` the tests that need a real PostgreSQL fail instead of skipping, and the heavy
     // end-to-end tests run.
     test.1.env("CI", "1");
@@ -305,9 +305,9 @@ fn linux_steps(root: &Path) -> Vec<Step> {
         .args(["-v", &format!("{}:/src:ro", root.display())])
         .args(VOLUMES)
         .args(["-w", "/src", &image])
-        .args(["cargo", "test", "--workspace", "--locked"]);
+        .args(["cargo", "test", "--workspace", "--locked", "--no-fail-fast"]);
     steps.push((
-        "cargo test --workspace --locked, in the container".into(),
+        "cargo test --workspace --locked --no-fail-fast, in the container".into(),
         test,
     ));
 
@@ -564,6 +564,6 @@ mod tests {
         assert_eq!(names[0], "cargo fmt --all --check");
         let cross = names.iter().filter(|n| n.contains("--target")).count();
         assert_eq!(cross, 2);
-        assert_eq!(names[4], "cargo test --workspace --locked");
+        assert_eq!(names[4], "cargo test --workspace --locked --no-fail-fast");
     }
 }

@@ -40,7 +40,7 @@ jobs:
         run: echo "SYNC_GATE_TEST_PG_BIN=$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)" >> "$GITHUB_ENV"
       - if: runner.os == 'Windows'
         run: echo "SYNC_GATE_TEST_PG_BIN=$env:PGBIN" >> $env:GITHUB_ENV
-      - run: cargo test --workspace
+      - run: cargo test --workspace --no-fail-fast
 
   test-macos:
     if: inputs.macos
@@ -52,4 +52,4 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: brew install postgresql@17 && echo "SYNC_GATE_TEST_PG_BIN=$(brew --prefix postgresql@17)/bin" >> "$GITHUB_ENV"
-      - run: cargo test --workspace
+      - run: cargo test --workspace --no-fail-fast
