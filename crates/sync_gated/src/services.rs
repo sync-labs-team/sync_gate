@@ -793,13 +793,13 @@ impl State {
     }
 
     fn idle(&self) -> bool {
-        !self.busy
-            && !(self.adopt
-                || self.stop
-                || self.restart
-                || self.start
-                || self.retire
-                || self.idle_stop)
+        !(self.busy
+            || self.adopt
+            || self.stop
+            || self.restart
+            || self.start
+            || self.retire
+            || self.idle_stop)
             && self.promotes.is_empty()
             && self.grants.is_empty()
             && self.releases.is_empty()
@@ -1080,10 +1080,10 @@ impl Services {
         for o in st.open.iter_mut().filter(|o| o.request == request) {
             o.given_up = true;
         }
-        if let Some(i) = st.grants.iter().position(|g| g.request == request) {
-            if let Some(g) = st.grants.remove(i) {
-                let _ = g.reply.send(err(ABANDONED));
-            }
+        if let Some(i) = st.grants.iter().position(|g| g.request == request)
+            && let Some(g) = st.grants.remove(i)
+        {
+            let _ = g.reply.send(err(ABANDONED));
         }
         let granted = st
             .rows
@@ -1291,20 +1291,23 @@ impl Services {
         // File writes, no tool: what memory holds reaches the disk, the leases first, then the
         // prune they held back, then the templates.
         let writable = st.disabled.is_none();
-        if writable && st.lease_retry_at.is_some_and(|t| now >= t) {
-            if let Err(e) = st.save() {
-                st.note(format!("postgres lease registry write failed: {e}"));
-            }
+        if writable
+            && st.lease_retry_at.is_some_and(|t| now >= t)
+            && let Err(e) = st.save()
+        {
+            st.note(format!("postgres lease registry write failed: {e}"));
         }
-        if st.prune_owed && st.prune_failed() {
-            if let Err(e) = st.save_templates() {
-                st.note(format!("postgres template registry write failed: {e}"));
-            }
+        if st.prune_owed
+            && st.prune_failed()
+            && let Err(e) = st.save_templates()
+        {
+            st.note(format!("postgres template registry write failed: {e}"));
         }
-        if writable && st.tpl_retry_at.is_some_and(|t| now >= t) {
-            if let Err(e) = st.save_templates() {
-                st.note(format!("postgres template registry write failed: {e}"));
-            }
+        if writable
+            && st.tpl_retry_at.is_some_and(|t| now >= t)
+            && let Err(e) = st.save_templates()
+        {
+            st.note(format!("postgres template registry write failed: {e}"));
         }
         if !st.rows.is_empty() || !st.open.is_empty() || st.retire_pending {
             st.idle_since = None;
@@ -2328,10 +2331,8 @@ impl Inner {
                 }
             }
             changed |= st.prune_failed();
-            if changed {
-                if let Err(e) = st.save_templates() {
-                    st.note(format!("postgres template registry write failed: {e}"));
-                }
+            if changed && let Err(e) = st.save_templates() {
+                st.note(format!("postgres template registry write failed: {e}"));
             }
             let ready = |t: &&TplRow| t.state == TplState::Ready;
             let promoted: HashSet<String> = st
@@ -2342,10 +2343,10 @@ impl Inner {
                 .collect();
             let before = st.rows.len();
             st.rows.retain(|r| !promoted.contains(&r.disk.lease));
-            if st.rows.len() < before {
-                if let Err(e) = st.save() {
-                    st.note(format!("postgres lease registry write failed: {e}"));
-                }
+            if st.rows.len() < before
+                && let Err(e) = st.save()
+            {
+                st.note(format!("postgres lease registry write failed: {e}"));
             }
             !st.inherited.is_empty()
         };
@@ -2484,10 +2485,11 @@ impl Inner {
                     st.note(format!("postgres lease registry write failed: {e}"));
                 }
                 // C6: a failed row's candidate left (the prune waits until that is on disk).
-                if tpl.is_some() && st.prune_failed() {
-                    if let Err(e) = st.save_templates() {
-                        st.note(format!("postgres template registry write failed: {e}"));
-                    }
+                if tpl.is_some()
+                    && st.prune_failed()
+                    && let Err(e) = st.save_templates()
+                {
+                    st.note(format!("postgres template registry write failed: {e}"));
                 }
                 if st.releasing() < MAX_PENDING_RELEASES {
                     st.bound_noted = false;

@@ -1476,12 +1476,11 @@ mod tests {
         let end = Instant::now() + Duration::from_secs(10);
         loop {
             let mut next = raw_connect(&name).unwrap();
-            if next.write_all(b"\"Status\"\n").is_ok() {
-                if let Ok(Ok(l)) = read_reply(next).recv_timeout(Duration::from_secs(2)) {
-                    if l.contains("Ack") {
-                        break;
-                    }
-                }
+            if next.write_all(b"\"Status\"\n").is_ok()
+                && let Ok(Ok(l)) = read_reply(next).recv_timeout(Duration::from_secs(2))
+                && l.contains("Ack")
+            {
+                break;
             }
             assert!(
                 Instant::now() < end,
@@ -1548,13 +1547,12 @@ mod tests {
             let mut next = raw_connect(name).unwrap();
             // A failed write or an empty line is a connection dropped at the door (no slot
             // yet; the accept thread drops it at once): try again.
-            if next.write_all(b"\"Status\"\n").is_ok() {
-                if let Ok(Ok(l)) = read_reply(next).recv_timeout(Duration::from_secs(2)) {
-                    if !l.is_empty() {
-                        assert!(l.contains("Ack"), "{l}");
-                        return;
-                    }
-                }
+            if next.write_all(b"\"Status\"\n").is_ok()
+                && let Ok(Ok(l)) = read_reply(next).recv_timeout(Duration::from_secs(2))
+                && !l.is_empty()
+            {
+                assert!(l.contains("Ack"), "{l}");
+                return;
             }
             thread::sleep(Duration::from_millis(100));
             assert!(Instant::now() < end, "no slot was freed after the deadline");

@@ -626,13 +626,13 @@ impl FakePg {
                     .0;
             }
         }
-        if let Some((left, msg)) = st.fails.get_mut(&step) {
-            if *left > 0 {
-                if *left != ALWAYS {
-                    *left -= 1;
-                }
-                return Err(msg.replace("{password}", password));
+        if let Some((left, msg)) = st.fails.get_mut(&step)
+            && *left > 0
+        {
+            if *left != ALWAYS {
+                *left -= 1;
             }
+            return Err(msg.replace("{password}", password));
         }
         Ok(st)
     }

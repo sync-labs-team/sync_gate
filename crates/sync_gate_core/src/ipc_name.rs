@@ -285,9 +285,11 @@ fn parse_holder_ids(buf: &[u8], written: usize) -> Option<Vec<u32>> {
         return None;
     }
     bytes[first..]
-        .chunks_exact(size_of::<usize>())
+        .as_chunks::<{ size_of::<usize>() }>()
+        .0
+        .iter()
         .take(count)
-        .map(|c| u32::try_from(usize::from_ne_bytes(c.try_into().ok()?)).ok())
+        .map(|c| u32::try_from(usize::from_ne_bytes(*c)).ok())
         .collect()
 }
 

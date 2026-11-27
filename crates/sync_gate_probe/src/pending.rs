@@ -21,7 +21,7 @@ fn create_marker(marker: &Path) -> bool {
 /// [`reclaim_stale`]) and the claim retried once. An empty or unreadable marker counts as live.
 pub fn claim_at(path: &Path, alive: impl Fn(u32) -> Option<bool>) -> bool {
     let marker = path.with_extension("claim");
-    if !create_marker(&marker) && !(reclaim_stale(&marker, alive) && create_marker(&marker)) {
+    if !(create_marker(&marker) || reclaim_stale(&marker, alive) && create_marker(&marker)) {
         return false;
     }
     let won = path.exists() && std::fs::remove_file(path).is_ok();

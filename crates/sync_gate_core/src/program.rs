@@ -121,10 +121,10 @@ pub fn resolve_program(name: &str, path: Option<&OsStr>, pathext: Option<&OsStr>
             .extension()
             .and_then(OsStr::to_str)
             .is_some_and(|x| exts.iter().any(|e| e[1..].eq_ignore_ascii_case(x)));
-        if !(has_ext || name.contains(['/', '\\', ':'])) {
-            if let Some(file) = find_program(OsStr::new(name), path, pathext, Path::new("")) {
-                return file;
-            }
+        if !(has_ext || name.contains(['/', '\\', ':']))
+            && let Some(file) = find_program(OsStr::new(name), path, pathext, Path::new(""))
+        {
+            return file;
         }
     }
     #[cfg(not(windows))]

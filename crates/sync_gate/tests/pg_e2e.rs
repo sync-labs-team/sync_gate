@@ -666,10 +666,10 @@ impl Fx {
     }
 
     fn stop_daemon(&mut self) {
-        if let Some(d) = self.daemon.take() {
-            if let Err(e) = shutdown(d) {
-                panic!("pg_e2e: {e}");
-            }
+        if let Some(d) = self.daemon.take()
+            && let Err(e) = shutdown(d)
+        {
+            panic!("pg_e2e: {e}");
         }
     }
 
@@ -925,10 +925,10 @@ impl Fx {
 
 impl Drop for Fx {
     fn drop(&mut self) {
-        if let Some(d) = self.daemon.take() {
-            if let Err(e) = shutdown(d) {
-                cleanup_failed(format!("pg_e2e: {e}"));
-            }
+        if let Some(d) = self.daemon.take()
+            && let Err(e) = shutdown(d)
+        {
+            cleanup_failed(format!("pg_e2e: {e}"));
         }
     }
 }

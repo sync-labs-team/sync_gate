@@ -654,10 +654,10 @@ impl Mux {
             .map(|(u, _)| u.as_str())
             .collect();
         for p in self.pending.values() {
-            if let (Some(o), Role::Subscribe(u)) = (&p.client, &p.role) {
-                if *o == c {
-                    held.insert(u.as_str());
-                }
+            if let (Some(o), Role::Subscribe(u)) = (&p.client, &p.role)
+                && *o == c
+            {
+                held.insert(u.as_str());
             }
         }
         held
@@ -680,10 +680,8 @@ impl Mux {
             .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
             .and_then(Value::as_str)
             .is_some_and(|ver| !LEGACY_VERSIONS.contains(&ver));
-        if modern {
-            if let Some(cl) = self.clients.get_mut(&c) {
-                cl.handshaken = true;
-            }
+        if modern && let Some(cl) = self.clients.get_mut(&c) {
+            cl.handshaken = true;
         }
         let strict = stateless && !modern;
         let local = |out: &mut Vec<Out>, r: Value| push_client(out, c, result_response(&rid, r));
@@ -819,11 +817,11 @@ impl Mux {
             inject_meta(&mut msg);
         }
         let mut token = None;
-        if let Some(t) = msg.pointer_mut("/params/_meta/progressToken") {
-            if t.is_string() || t.is_i64() || t.is_u64() {
-                let mine = format!("fg-{hub}");
-                token = Some((mine.clone(), std::mem::replace(t, json!(mine))));
-            }
+        if let Some(t) = msg.pointer_mut("/params/_meta/progressToken")
+            && (t.is_string() || t.is_i64() || t.is_u64())
+        {
+            let mine = format!("fg-{hub}");
+            token = Some((mine.clone(), std::mem::replace(t, json!(mine))));
         }
         if let Some((mine, _)) = &token {
             self.tokens.insert(mine.clone(), hub);
@@ -870,11 +868,11 @@ impl Mux {
                         .map(|i| waiters.remove(i)),
                     Sub::Active(_) => None,
                 });
-                if waiting.is_none() {
-                    if let Some(cl) = self.clients.get_mut(&c) {
-                        cl.queue.retain(|q| q.msg["id"] != *target);
-                        cl.queued_bytes = cl.queue.iter().map(|q| q.bytes).sum();
-                    }
+                if waiting.is_none()
+                    && let Some(cl) = self.clients.get_mut(&c)
+                {
+                    cl.queue.retain(|q| q.msg["id"] != *target);
+                    cl.queued_bytes = cl.queue.iter().map(|q| q.bytes).sum();
                 }
             }
         }

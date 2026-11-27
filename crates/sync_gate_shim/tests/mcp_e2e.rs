@@ -321,10 +321,10 @@ impl Relay {
             for line in BufReader::new(out).lines() {
                 let Ok(line) = line else { break };
                 // A directly started server is this test binary: its harness lines are not JSON.
-                if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                    if tx.send(v).is_err() {
-                        break;
-                    }
+                if let Ok(v) = serde_json::from_str::<Value>(&line)
+                    && tx.send(v).is_err()
+                {
+                    break;
                 }
             }
         });

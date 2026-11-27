@@ -125,13 +125,13 @@ impl Output {
         self.queue.push_back((bytes, ack));
     }
     fn flush(&mut self) -> bool {
-        if !self.busy {
-            if let Some(line) = self.queue.pop_front() {
-                if !self.send.as_ref().is_some_and(|s| s.try_send(line).is_ok()) {
-                    return false;
-                }
-                self.busy = true;
+        if !self.busy
+            && let Some(line) = self.queue.pop_front()
+        {
+            if self.send.as_ref().is_none_or(|s| s.try_send(line).is_err()) {
+                return false;
             }
+            self.busy = true;
         }
         true
     }
@@ -540,12 +540,11 @@ impl Session<'_> {
                 }
             }
         }
-        if let Some(piece) = self.held.take() {
-            if piece.first {
-                if let Some(id) = request_id(&piece.bytes) {
-                    self.flight.insert(id);
-                }
-            }
+        if let Some(piece) = self.held.take()
+            && piece.first
+            && let Some(id) = request_id(&piece.bytes)
+        {
+            self.flight.insert(id);
         }
         self.errors(UNAVAILABLE);
         self.log.line(&format!(
@@ -614,10 +613,9 @@ impl Session<'_> {
                 && self
                     .hub_write_deadline()
                     .is_some_and(|t| Instant::now() >= t)
+                && let Err(code) = self.fallback()
             {
-                if let Err(code) = self.fallback() {
-                    return self.fail_replay(rx, code);
-                }
+                return self.fail_replay(rx, code);
             }
             let full = self.source == Source::Hub && self.flight.len() >= MAX_TRACKED;
             if full && !self.noted {
@@ -664,10 +662,10 @@ impl Session<'_> {
                         self.log.line("sync_gate_mcp: client output closed");
                         return 1;
                     }
-                    if source == Some(self.source) {
-                        if let Some(e) = &self.endpoint {
-                            let _ = e.ack.send(());
-                        }
+                    if source == Some(self.source)
+                        && let Some(e) = &self.endpoint
+                    {
+                        let _ = e.ack.send(());
                     }
                 }
                 Event::Input(piece) => {
@@ -763,10 +761,10 @@ impl Session<'_> {
                     if piece.first {
                         self.output_id = response_id(&piece.bytes);
                     }
-                    if piece.end {
-                        if let Some(id) = self.output_id.take() {
-                            self.flight.remove(&id);
-                        }
+                    if piece.end
+                        && let Some(id) = self.output_id.take()
+                    {
+                        self.flight.remove(&id);
                     }
                     self.output_open = !piece.end;
                     let end = piece.end;
@@ -799,13 +797,13 @@ impl Session<'_> {
                 }
                 _ => {}
             }
-            if self.replay.is_none() && self.writing.is_none() {
-                if let Some(piece) = self.held.take() {
-                    if !self.forward(piece) {
-                        self.log.line("sync_gate_mcp: direct server input closed");
-                        return 1;
-                    }
-                }
+            if self.replay.is_none()
+                && self.writing.is_none()
+                && let Some(piece) = self.held.take()
+                && !self.forward(piece)
+            {
+                self.log.line("sync_gate_mcp: direct server input closed");
+                return 1;
             }
         }
     }
@@ -821,20 +819,20 @@ impl Session<'_> {
         if piece.first {
             self.line_source = self.source;
             self.unknown_large = piece.streamed && request_id(&piece.bytes).is_none();
-            if self.source == Source::Hub {
-                if let Some(id) = request_id(&piece.bytes) {
-                    self.flight.insert(id.clone());
-                    if self.initialize.is_none()
-                        && !self.initialize_too_large
-                        && prefix_value(&piece.bytes, "method").is_some_and(|v| v == "initialize")
-                    {
-                        // The first piece is at most MAX_STORED_INITIALIZE: a line that does not
-                        // end inside it is too large and is forwarded without being stored.
-                        if piece.end && piece.bytes.len() <= MAX_STORED_INITIALIZE {
-                            self.initialize = Some((id, piece.bytes.clone()));
-                        } else {
-                            self.initialize_too_large = true;
-                        }
+            if self.source == Source::Hub
+                && let Some(id) = request_id(&piece.bytes)
+            {
+                self.flight.insert(id.clone());
+                if self.initialize.is_none()
+                    && !self.initialize_too_large
+                    && prefix_value(&piece.bytes, "method").is_some_and(|v| v == "initialize")
+                {
+                    // The first piece is at most MAX_STORED_INITIALIZE: a line that does not
+                    // end inside it is too large and is forwarded without being stored.
+                    if piece.end && piece.bytes.len() <= MAX_STORED_INITIALIZE {
+                        self.initialize = Some((id, piece.bytes.clone()));
+                    } else {
+                        self.initialize_too_large = true;
                     }
                 }
             }

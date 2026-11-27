@@ -359,13 +359,13 @@ impl Live {
 
 impl Drop for Live {
     fn drop(&mut self) {
-        if let Some(mut c) = self.child.take() {
-            if let Err(e) = kill_confirmed(&mut c, Duration::from_secs(10)) {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "WARNING: a test process may still be running: {e}"
-                );
-            }
+        if let Some(mut c) = self.child.take()
+            && let Err(e) = kill_confirmed(&mut c, Duration::from_secs(10))
+        {
+            let _ = writeln!(
+                std::io::stderr(),
+                "WARNING: a test process may still be running: {e}"
+            );
         }
     }
 }

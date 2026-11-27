@@ -311,10 +311,10 @@ fn spawn_or_inline(f: impl FnOnce() + Send + 'static) {
             f()
         }
     });
-    if started.is_err() {
-        if let Some(f) = lock(&slot).take() {
-            f()
-        }
+    if started.is_err()
+        && let Some(f) = lock(&slot).take()
+    {
+        f()
     }
 }
 
@@ -1087,13 +1087,14 @@ impl Inner {
         while let Some((i, out)) = work.pop_front() {
             match out {
                 Out::ToChild(line) => {
-                    if let Some(Child::Running(run)) = g.units.get_mut(i).map(|u| &mut u.child) {
-                        if !run.stdin.push(line.into_bytes()) && !run.full_noted {
-                            run.full_noted = true;
-                            self.note(format!(
-                                "mcp {server}: child input queue full; messages dropped"
-                            ));
-                        }
+                    if let Some(Child::Running(run)) = g.units.get_mut(i).map(|u| &mut u.child)
+                        && !run.stdin.push(line.into_bytes())
+                        && !run.full_noted
+                    {
+                        run.full_noted = true;
+                        self.note(format!(
+                            "mcp {server}: child input queue full; messages dropped"
+                        ));
                     }
                 }
                 Out::ToClient(c, line) => {

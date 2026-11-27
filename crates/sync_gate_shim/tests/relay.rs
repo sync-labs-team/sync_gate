@@ -1650,10 +1650,10 @@ mod adopted {
                 for l in BufReader::new(out).lines().map_while(Result::ok) {
                     seen.lock().unwrap().push(l.clone());
                     // The fake server is a test binary: its harness lines are not JSON.
-                    if let Ok(v) = serde_json::from_str::<Value>(&l) {
-                        if tx.send(v).is_err() {
-                            break;
-                        }
+                    if let Ok(v) = serde_json::from_str::<Value>(&l)
+                        && tx.send(v).is_err()
+                    {
+                        break;
                     }
                 }
             });
