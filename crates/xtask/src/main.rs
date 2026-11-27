@@ -206,7 +206,28 @@ fn cargo(args: &[&str]) -> Step {
     (format!("cargo {}", args.join(" ")), command)
 }
 
+/// Windows cannot overwrite a running .exe, and `cargo test --workspace` relinks `xtask.exe` (the
+/// test profile unifies other features). A running .exe can be renamed, so move it aside first.
+/// shortcut: leftovers of a crashed run stay until the next run; errors are ignored, drop this
+/// when the oldest supported cargo removes a running .exe itself.
+#[cfg(windows)]
+fn free_own_exe() {
+    let Ok(exe) = env::current_exe() else { return };
+    let (Some(dir), Some(name)) = (exe.parent(), exe.file_name()) else {
+        return;
+    };
+    let prefix = format!("{}.old-", name.to_string_lossy());
+    for old in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if old.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = std::fs::remove_file(old.path());
+        }
+    }
+    let _ = std::fs::rename(&exe, dir.join(format!("{prefix}{}", std::process::id())));
+}
+
 fn host_steps() -> Vec<Step> {
+    #[cfg(windows)]
+    free_own_exe();
     let clippy = |target: Option<&str>| {
         let mut args = vec!["clippy", "--workspace", "--all-targets", "--locked"];
         if let Some(target) = target {
