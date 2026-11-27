@@ -94,7 +94,8 @@ pub const HEAVY_PROGRAMS: &[&str] = &[
 /// Global options that take their value as the next argument, per program (checked against
 /// each tool's `--help` or docs: docker `--help`, npm `--prefix`/`-C` (config definitions),
 /// bun `--cwd` (install/run docs), pnpm `--filter`/`-F` (filtering docs). `docker compose`'s
-/// `-f`, `-p` and `--project-directory` ride on docker's list, so `compose -f x up --build` is seen.
+/// `--file`, `--project-name`, `--profile`, `--env-file`, `--ansi`, `--parallel` and `--progress`
+/// (`docker compose --help`) ride on docker's list, so `compose --profile p up --build` is seen.
 /// shortcut: only the `--opt value` form is skipped; `--opt=value` already starts with `-`.
 /// Add a program here when a new one is confirmed.
 fn value_options(prog: &str) -> &'static [&'static str] {
@@ -113,8 +114,15 @@ fn value_options(prog: &str) -> &'static [&'static str] {
             "--tlscert",
             "--tlskey",
             "-f",
+            "--file",
             "-p",
+            "--project-name",
             "--project-directory",
+            "--profile",
+            "--env-file",
+            "--ansi",
+            "--parallel",
+            "--progress",
         ],
         "yarn" | "bun" => &["--cwd"],
         "npm" => &["--prefix", "-C"],
@@ -383,6 +391,13 @@ mod tests {
             &["docker", "--tlsverify", "build", "."],
             &["docker", "compose", "-f", "x.yml", "up", "--build"],
             &["docker", "compose", "-p", "x", "up", "--build"],
+            &["docker", "compose", "--profile", "p", "up", "--build"],
+            &["docker", "compose", "--file", "x.yml", "up", "--build"],
+            &["docker", "compose", "--project-name", "x", "up", "--build"],
+            &["docker", "compose", "--env-file", ".env", "up", "--build"],
+            &["docker", "compose", "--progress", "plain", "up", "--build"],
+            &["docker", "compose", "--ansi", "never", "up", "--build"],
+            &["docker", "compose", "--parallel", "2", "up", "--build"],
             &[
                 "docker",
                 "compose",
@@ -406,6 +421,7 @@ mod tests {
             &["docker", "-c", "ctx", "ps"],
             &["docker", "-l", "debug", "ps"],
             &["docker", "compose", "-f", "x.yml", "up"],
+            &["docker", "compose", "--profile", "p", "up"],
             &["npm", "--prefix", "x", "--version"],
             &["pnpm", "--filter", "x", "outdated"],
         ] {
