@@ -600,7 +600,7 @@ fn server_the_daemon_cannot_find_runs_per_session() {
 
 #[test]
 fn daemon_down_from_the_start_runs_directly() {
-    let mut sb = Sandbox::new(&[("docs", "mcp-legacy", "shared", "")]);
+    let sb = Sandbox::new(&[("docs", "mcp-legacy", "shared", "")]);
     let mut r = sb.relay("docs", &[]);
     r.open();
     assert_eq!(r.call(1)["pid"], sb.pids("docs")[0]);
