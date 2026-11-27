@@ -215,7 +215,10 @@ fn bind(name: &str, sd: SecurityDescriptor) -> io::Result<Listener> {
 
 #[cfg(windows)]
 fn owner_only_descriptor() -> io::Result<SecurityDescriptor> {
-    descriptor_for(&user_sid()?)
+    // `O:` names the user as owner, so a token whose default owner is the Administrators group
+    // (an elevated one) does not make that group the owner, which the client refuses (#12).
+    let sid = user_sid()?;
+    sddl_descriptor(&format!("O:{sid}D:P(A;;GA;;;{sid})"))
 }
 
 /// D:P = protected DACL with one allow-ACE, GENERIC_ALL, for `sid`; nothing for Everyone or Anonymous.
@@ -1345,6 +1348,40 @@ mod tests {
         assert_ne!(h, INVALID_HANDLE_VALUE, "{}", io::Error::last_os_error());
         // SAFETY: the handle just opened, closed once.
         unsafe { CloseHandle(h) };
+    }
+
+    /// The control pipe and the hub pipe name their owner like the guest pipe does: the
+    /// descriptor carries `O:` and the live pipes, read from the client end as `connect` reads
+    /// them, are owned by the user. Under an elevated token the default owner would be the
+    /// Administrators group, which the client refuses. This does not exercise a client at a
+    /// different integrity level than the daemon.
+    #[cfg(windows)]
+    #[test]
+    fn an_owner_only_pipe_is_owned_by_the_user() {
+        use interprocess::os::windows::security_descriptor::AsSecurityDescriptor;
+        use windows_sys::Win32::Security::GetSecurityDescriptorOwner;
+        let own = user_sid().unwrap();
+        let sd = owner_only_descriptor().unwrap();
+        let (mut owner, mut defaulted) = (std::ptr::null_mut(), 0);
+        // SAFETY: `sd` is a valid descriptor that the call only reads; the out pointers are valid.
+        let ok = unsafe {
+            GetSecurityDescriptorOwner(sd.as_sd().cast_mut(), &mut owner, &mut defaulted)
+        };
+        assert!(ok != 0 && !owner.is_null(), "the descriptor has no owner");
+        // SAFETY: `owner` points into `sd`, alive here.
+        assert_eq!(unsafe { sid_string(owner) }.unwrap(), own);
+        let control = test_pipe("owner-control");
+        let server = serve(&control, |_| Response::Ack).unwrap();
+        let s = raw_connect(&control).unwrap();
+        assert_eq!(owner_seen_by_client(&s), own, "control pipe");
+        drop(s);
+        server.shutdown();
+        let hub = test_pipe("owner-hub");
+        let server = serve_stream(&hub, |_, _, _| {}).unwrap();
+        let s = raw_connect(&hub).unwrap();
+        assert_eq!(owner_seen_by_client(&s), own, "hub pipe");
+        drop(s);
+        server.shutdown();
     }
 
     /// #12: the descriptor names its owner (an elevated token's default owner is the Administrators
