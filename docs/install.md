@@ -64,6 +64,17 @@ Run the install command again. Your own values (below) are kept. The installer s
 swaps the programs, refreshes the shortcuts, starts the daemon and waits for `sync_gate status` to
 answer in a new environment. Only then it discards the saved previous state.
 
+## Downgrade
+
+Installing an older version works the same way as an update: pin it with `-Version` (Windows) or
+`--version` (Linux and macOS). Going from 0.1.2 back to 0.1.1 works.
+
+On Windows, one thing is lost if you then uninstall with 0.1.1 or an older version. Since 0.1.2 the
+installer records the value a `SYNC_GATE_*` user variable had before it first wrote it (`vars_original` in
+`install-state.json`) and gives it back on uninstall. 0.1.1 and older ignore that record: they **delete** the
+variable instead of restoring it. To keep the variable, install 0.1.2 or newer again before you uninstall, or
+write down its value and set it again afterwards.
+
 ## Uninstall
 
 Run the uninstall command. It begins with `sync_gate mcp restore --strict`, which gives back every
