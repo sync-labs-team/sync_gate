@@ -275,4 +275,18 @@ mod tests {
         s.release(10);
         assert!(s.admit(&snap(8 * GIB), GIB, now).is_empty());
     }
+
+    #[test]
+    fn estimate_equal_to_the_budget_is_admitted() {
+        let t0 = Instant::now();
+        // backfill path: need == budget
+        let mut s = Scheduler::new(cfg(0.0, 1.0));
+        s.enqueue(ticket(1, 2 * GIB, "s1", t0));
+        assert_eq!(s.admit(&snap(2 * GIB), 0, t0), vec![1]);
+        // reserved (starving) path: need == budget while another job runs
+        let now = t0 + Duration::from_secs(4 * Config::default().aging_secs);
+        let mut s = Scheduler::new(cfg(0.0, 1.0));
+        s.enqueue(ticket(2, 2 * GIB, "s1", t0));
+        assert_eq!(s.admit(&snap(3 * GIB), GIB, now), vec![2]);
+    }
 }
