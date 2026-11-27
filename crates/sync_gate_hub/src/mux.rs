@@ -259,7 +259,7 @@ impl Mux {
 
     /// The child answered `server/discover`: no `initialize`. Legacy clients get
     /// an `initialize` result built from the `DiscoverResult`.
-    fn set_stateless(&mut self, discover: Value, now: Instant, out: &mut Vec<Out>) {
+    fn set_stateless(&mut self, discover: Value, out: &mut Vec<Out>) {
         self.reset_subscriptions();
         let mut discover = discover;
         // Advertise only what the hub serves: it refuses subscriptions and sends no list_changed here.
@@ -291,7 +291,7 @@ impl Mux {
         self.discover = Some(discover);
         self.era = Some(Era::Stateless);
         self.phase = Phase::Stateless;
-        self.serve_queued(now, out);
+        self.serve_queued(out);
     }
 
     /// Entries from an earlier legacy child can never be restored or undone now.
@@ -356,11 +356,11 @@ impl Mux {
             );
             out.push(Out::ToChild(msg.to_string()));
         }
-        self.serve_queued(now, out);
+        self.serve_queued(out);
     }
 
     /// Serves, in order, what clients queued while the child was not ready.
-    fn serve_queued(&mut self, now: Instant, out: &mut Vec<Out>) {
+    fn serve_queued(&mut self, out: &mut Vec<Out>) {
         let ids: Vec<ClientId> = self.clients.keys().copied().collect();
         for c in ids {
             let queued = match self.clients.get_mut(&c) {
@@ -372,7 +372,7 @@ impl Mux {
             };
             for q in queued {
                 if let Kind::Request { id, method } = classify(&q.msg) {
-                    self.serve(c, id, &method, q.msg, now, out);
+                    self.serve(c, id, &method, q.msg, q.deadline, out);
                 }
             }
         }
@@ -541,6 +541,12 @@ impl Mux {
     }
 
     pub fn client_line(&mut self, id: ClientId, line: &str, now: Instant) -> Vec<Out> {
+        self.client_line_until(id, line, now + self.request_timeout)
+    }
+
+    /// Like `client_line`, for a request that already waited elsewhere (the hub queue):
+    /// it answers by `deadline`, the one set when the client sent it.
+    pub fn client_line_until(&mut self, id: ClientId, line: &str, deadline: Instant) -> Vec<Out> {
         let mut out = vec![];
         if !self.clients.contains_key(&id) {
             out.push(Out::Note(format!(
@@ -561,7 +567,7 @@ impl Mux {
         };
         match classify(&v) {
             Kind::Request { id: rid, method } => {
-                self.client_request(id, rid, &method, v, line.len(), now, &mut out)
+                self.client_request(id, rid, &method, v, line.len(), deadline, &mut out)
             }
             Kind::Notification { method } => self.client_notification(id, &method, &v, &mut out),
             Kind::Response { .. } => {} // the hub never forwards server requests to clients
@@ -587,11 +593,11 @@ impl Mux {
         method: &str,
         v: Value,
         bytes: usize,
-        now: Instant,
+        deadline: Instant,
         out: &mut Vec<Out>,
     ) {
         match self.phase {
-            Phase::Ready | Phase::Stateless => self.serve(c, rid, method, v, now, out),
+            Phase::Ready | Phase::Stateless => self.serve(c, rid, method, v, deadline, out),
             Phase::Unsupported => push_client(out, c, error_response(&rid, -32000, NO_VERSION)),
             Phase::Failed => push_client(
                 out,
@@ -599,7 +605,6 @@ impl Mux {
                 error_response(&rid, -32000, "mcp server failed to initialize"),
             ),
             Phase::Stopped | Phase::Probing { .. } | Phase::Initializing { .. } => {
-                let deadline = now + self.request_timeout;
                 let Some(cl) = self.clients.get_mut(&c) else {
                     return;
                 };
@@ -670,7 +675,7 @@ impl Mux {
         rid: Value,
         method: &str,
         v: Value,
-        now: Instant,
+        deadline: Instant,
         out: &mut Vec<Out>,
     ) {
         let over = self.over_cap(c);
@@ -769,7 +774,7 @@ impl Mux {
                                 left: BTreeSet::new(),
                             },
                         );
-                        self.forward(c, rid, v, now, Role::Subscribe(uri), false, out);
+                        self.forward(c, rid, v, deadline, Role::Subscribe(uri), false, out);
                     }
                 }
             }
@@ -780,7 +785,7 @@ impl Mux {
                     } else {
                         self.subs.remove(&uri);
                         self.forget_restore(&uri);
-                        self.forward(c, rid, v, now, Role::Plain, false, out);
+                        self.forward(c, rid, v, deadline, Role::Plain, false, out);
                     }
                 }
                 Some(Sub::Active(set)) => {
@@ -794,7 +799,7 @@ impl Mux {
                 None => local(out, json!({})),
             },
             _ if over => too_many(out),
-            _ => self.forward(c, rid, v, now, Role::Plain, strict, out),
+            _ => self.forward(c, rid, v, deadline, Role::Plain, strict, out),
         }
     }
 
@@ -806,7 +811,7 @@ impl Mux {
         c: ClientId,
         rid: Value,
         mut msg: Value,
-        now: Instant,
+        deadline: Instant,
         role: Role,
         strict: bool,
         out: &mut Vec<Out>,
@@ -831,7 +836,7 @@ impl Mux {
             Pending {
                 client: Some(c),
                 orig_id: rid,
-                deadline: now + self.request_timeout,
+                deadline,
                 strict,
                 token,
                 role,
@@ -928,7 +933,7 @@ impl Mux {
                     .and_then(Value::as_array);
                 if let Some(vs) = versions {
                     if vs.iter().any(|x| x == MODERN_VERSION) {
-                        self.set_stateless(v["result"].take(), now, out);
+                        self.set_stateless(v["result"].take(), out);
                     } else {
                         self.set_unsupported(out);
                     }

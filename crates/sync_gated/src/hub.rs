@@ -1452,12 +1452,33 @@ impl Inner {
     }
 
     fn to_unit(&self, server: &str, g: &mut Inst, i: usize, c: ClientId, line: &str, now: Instant) {
+        self.to_unit_until(
+            server,
+            g,
+            i,
+            (c, line),
+            now,
+            now + self.request_timeout(server),
+        );
+    }
+
+    /// `to_unit` for a request that waited in the hub queue: the mux answers by the `deadline`
+    /// set when the client sent it, not a new one.
+    fn to_unit_until(
+        &self,
+        server: &str,
+        g: &mut Inst,
+        i: usize,
+        (c, line): (ClientId, &str),
+        now: Instant,
+        deadline: Instant,
+    ) {
         let u = &mut g.units[i];
         // An extra unit in its crash-loop pause (a subscriber pinned to it): the hub answers.
         let outs = if crash_looping(&u.child) {
             keeps_crashing(c, line)
         } else {
-            u.mux.client_line(c, line, now)
+            u.mux.client_line_until(c, line, deadline)
         };
         self.dispatch(server, g, i, outs, now);
     }
@@ -1511,7 +1532,7 @@ impl Inner {
             match target(g, g.queue[i].client, max_in_flight) {
                 Some(u) => {
                     if let Some(w) = g.queue.remove(i) {
-                        self.to_unit(server, g, u, w.client, &w.line, now);
+                        self.to_unit_until(server, g, u, (w.client, &w.line), now, w.deadline);
                     }
                 }
                 None => i += 1,

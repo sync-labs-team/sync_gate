@@ -1399,6 +1399,32 @@ fn a_queued_request_times_out() {
 }
 
 #[test]
+fn a_hub_queued_request_keeps_its_first_deadline() {
+    let l = Arc::new(FakeLauncher::default());
+    let mut cfg = config();
+    if let Some(d) = cfg.mcp.get_mut("docs") {
+        d.max_instances = 3;
+        d.max_in_flight = 1;
+        d.request_timeout_secs = 2;
+    }
+    let hub = Hub::new(&cfg, l.clone(), None, None);
+    let (mut c, mut child) = pool_client(&hub, &l, false);
+    let t0 = Instant::now();
+    let seen = overflow(&hub, &mut c, &child, 1..=2, 1);
+    // A slot opens about half way through the timeout: the queued request goes out then,
+    // but its clock started when the client sent it.
+    std::thread::sleep(Duration::from_secs(1));
+    reply_to(&mut child, &seen[0]);
+    assert_eq!(c.recv()["id"], 1);
+    child.next();
+    hub.tick(t0 + Duration::from_millis(2050));
+    let e = c.recv();
+    assert_eq!(e["id"], 2);
+    assert_eq!(e["error"]["code"], -32001);
+    hub.shutdown();
+}
+
+#[test]
 fn the_hub_queue_is_bounded_per_client() {
     let l = Arc::new(FakeLauncher::default());
     let hub = pool_hub(&l, 3, 1);

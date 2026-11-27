@@ -621,6 +621,23 @@ fn queued_request_times_out_when_child_never_starts() {
 }
 
 #[test]
+fn a_queued_request_keeps_its_first_deadline() {
+    let mut m = Mux::new("docs", T);
+    let now = Instant::now();
+    m.client_attached(1);
+    assert!(req(&mut m, 1, json!(3), "tools/list", now).is_empty());
+    // the child is ready after 0.9 T: the request goes out, but its clock started at `now`
+    let ready_at = now + T * 9 / 10;
+    let out = start_legacy(&mut m, ready_at, "s");
+    assert_eq!(methods(&out), ["notifications/initialized", "tools/list"]);
+    assert!(m.tick(now + T - Duration::from_millis(1)).is_empty());
+    let out = m.tick(now + T);
+    let e = &to_client(&out, 1)[0];
+    assert_eq!(e["id"], 3);
+    assert_eq!(e["error"]["code"], -32001);
+}
+
+#[test]
 fn queued_request_times_out_when_child_keeps_crashing() {
     let mut m = Mux::new("docs", T);
     let now = Instant::now();
