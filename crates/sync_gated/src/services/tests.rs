@@ -2800,7 +2800,11 @@ fn call_at(fx: &Fx, call: &str) -> usize {
 /// The next grant of `rx` stops in the blocked `step`: no reply yet, the row still `creating`.
 /// The lease it is creating.
 fn held_in(fx: &Fx, rx: &mpsc::Receiver<Response>, step: &str) -> String {
-    assert!(fx.fake.wait_entered(step, LIMIT), "{step}");
+    assert!(
+        fx.fake.wait_entered(step, LIMIT),
+        "{step}: calls so far {:?}",
+        fx.fake.calls()
+    );
     assert!(rx.try_recv().is_err(), "a reply before {step}");
     let last = fx.fake.calls().pop().unwrap();
     let lease = last.split(' ').nth(2).unwrap().to_string();

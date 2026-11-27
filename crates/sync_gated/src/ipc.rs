@@ -1535,6 +1535,26 @@ mod tests {
         assert!(server.stop_within(Duration::from_secs(10)));
     }
 
+    /// A watchdog spawner whose deadlines only start once `$gate` opens. A deadline counted from
+    /// accept also runs while a test is still connecting its 16 clients, and load stretches that
+    /// past 1.5 s (measured 1.6-2.1 s): the server then closes the first clients before the test
+    /// has written to them. A spawner per test, since a spawner is a plain `fn` with no state.
+    #[cfg(windows)]
+    macro_rules! gated_watchdog {
+        ($spawn:ident, $gate:ident) => {
+            static $gate: AtomicBool = AtomicBool::new(false);
+            fn $spawn(job: Box<dyn FnOnce() + Send>) -> io::Result<()> {
+                spawn_watchdog(Box::new(move || {
+                    let give_up = Instant::now() + Duration::from_secs(60);
+                    while !$gate.load(Ordering::SeqCst) && Instant::now() < give_up {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    job();
+                }))
+            }
+        };
+    }
+
     /// A guest pipe with a short I/O deadline for the tests below; `calls` counts handler runs and
     /// the handler answers `big` (4 MiB, never fits the pipe) while the flag is set, else Ack.
     #[cfg(windows)]
@@ -1572,7 +1592,11 @@ mod tests {
     /// With the 16 slots held, the 17th is dropped unread (the slots are really
     /// taken); then, within 10 s, a new connection is served again (the deadline freed a slot).
     #[cfg(windows)]
-    fn assert_slot_freed_after_deadline(name: &str, calls: &std::sync::atomic::AtomicUsize) {
+    fn assert_slot_freed_after_deadline(
+        name: &str,
+        calls: &std::sync::atomic::AtomicUsize,
+        gate: &AtomicBool,
+    ) {
         let before = calls.load(Ordering::SeqCst);
         let mut over = raw_connect(name).unwrap();
         let _ = over.write_all(b"\"Status\"\n");
@@ -1585,6 +1609,8 @@ mod tests {
             "the 17th connection was not dropped while the 16 were held"
         );
         assert_eq!(calls.load(Ordering::SeqCst), before, "handler ran for it");
+        // The deadlines start now, not while the test was still connecting.
+        gate.store(true, Ordering::SeqCst);
         let end = Instant::now() + Duration::from_secs(10);
         loop {
             let mut next = raw_connect(name).unwrap();
@@ -1608,12 +1634,13 @@ mod tests {
     #[test]
     fn guest_connections_that_never_finish_a_request_are_dropped() {
         use std::sync::atomic::AtomicUsize;
+        gated_watchdog!(gated, GATE);
         let name = test_pipe("guest-slow-read");
         let calls = Arc::new(AtomicUsize::new(0));
         let server = deadline_server(
             &name,
             Duration::from_millis(1500),
-            spawn_watchdog,
+            gated,
             Arc::new(AtomicBool::new(false)),
             calls.clone(),
         );
@@ -1621,7 +1648,7 @@ mod tests {
         for s in &mut held {
             s.write_all(b"\"Status\"").unwrap(); // no newline
         }
-        assert_slot_freed_after_deadline(&name, &calls);
+        assert_slot_freed_after_deadline(&name, &calls, &GATE);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -1637,6 +1664,7 @@ mod tests {
     #[test]
     fn guest_connections_that_never_read_their_reply_are_dropped() {
         use std::sync::atomic::AtomicUsize;
+        gated_watchdog!(gated, GATE);
         let name = test_pipe("guest-slow-reply");
         let (big, calls) = (
             Arc::new(AtomicBool::new(true)),
@@ -1645,7 +1673,7 @@ mod tests {
         let server = deadline_server(
             &name,
             Duration::from_millis(1500),
-            spawn_watchdog,
+            gated,
             big.clone(),
             calls.clone(),
         );
@@ -1659,7 +1687,7 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         big.store(false, Ordering::SeqCst);
-        assert_slot_freed_after_deadline(&name, &calls);
+        assert_slot_freed_after_deadline(&name, &calls, &GATE);
         drop(held);
         assert!(server.stop_within(Duration::from_secs(10)));
     }
