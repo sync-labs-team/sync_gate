@@ -49,7 +49,7 @@ Sem direitos de administrador. Só escreve nas suas pastas. Atualizar, desinstal
 <!-- s:highlights -->
 ## Destaques
 
-- Builds, testes, instalações e `docker build` esperam numa fila até a memória permitir. Comando leve nunca espera. O código de saída 75 quer dizer "ainda na fila": `sync_gate wait N` o executa depois, com o ambiente do shell que o chama, não o original.
+- Builds, testes, instalações e `docker build` esperam numa fila até a memória permitir. Comando leve nunca espera, exceto atrás de `sync_gate run`. O código de saída 75 quer dizer "ainda na fila": `sync_gate wait N` o executa depois, com o ambiente do shell que o chama, não o original.
 - Um servidor MCP compartilhado que você adotou roda até 3 instâncias (o padrão) para todas as suas sessões, não uma por sessão.
 - Cada comando de um projeto declarado pode ter o próprio banco PostgreSQL, apagado quando o comando termina: [docs/postgres.md](docs/postgres.md).
 - O sandbox do Codex só usa a sua fila se você o listar em `guests`: [docs/sandbox.md](docs/sandbox.md).

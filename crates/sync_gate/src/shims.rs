@@ -916,7 +916,7 @@ pub fn run_as(name: &str) -> i32 {
     match argv_as_strings(argv.clone()) {
         Some(v) => {
             let session = std::env::var("SYNC_GATE_SESSION").unwrap_or_else(|_| "default".into());
-            crate::runner::run(session, None, v)
+            crate::runner::run(session, None, v, false)
         }
         None => {
             eprintln!(

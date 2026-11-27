@@ -103,8 +103,8 @@ The cost key keeps only words shaped like a subcommand (1 to 24 characters of `a
 `_`, `-`, starting with a letter) from the start of the arguments, and stops at the first other
 word, so an option, a `KEY=value`, a URL, a path or a long or upper-case token never enters it.
 Up to two short lower-case words right after the program still do (`vitest hunter2`,
-`cargo test hunter2`), and with `SYNC_GATE_FORCE_HEAVY=1` any command gets a key: a key exists only
-for a command sync_gate queued. The key also holds two names that can be personal: the program
+`cargo test hunter2`), and any command typed after `sync_gate run` (or run with `SYNC_GATE_FORCE_HEAVY=1`) gets a
+key: a key exists only for a command sync_gate queued. The key also holds two names that can be personal: the program
 name (the file name of the command's first word, whatever it is) and a folder name (the
 repository's root folder, or the current folder outside a repository: a command run in your home
 folder gives `... @ <your user name>`). Backups of these files (roaming profile, Time Machine, other

@@ -1106,7 +1106,9 @@ pub fn run_os_direct(argv: Vec<OsString>) -> i32 {
     }
 }
 
-pub fn run(session: String, max_wait: Option<u64>, argv: Vec<String>) -> i32 {
+/// `queue_always`: the command was typed after `sync_gate run`, so it queues whatever it is; a shim
+/// passes `false` and the signature decides.
+pub fn run(session: String, max_wait: Option<u64>, argv: Vec<String>, queue_always: bool) -> i32 {
     // Inside an admitted job (a nested command, or a lease's `migrate`): the job already holds the
     // slot and its database, which the command inherits; it asks for neither again.
     if std::env::var_os("SYNC_GATE_JOB").is_some_and(|v| !v.is_empty()) {
@@ -1116,7 +1118,7 @@ pub fn run(session: String, max_wait: Option<u64>, argv: Vec<String>) -> i32 {
         };
     }
     let os: Vec<OsString> = argv.iter().map(OsString::from).collect();
-    if !is_heavy(&os) && !force_heavy() {
+    if !queue_always && !is_heavy(&os) && !force_heavy() {
         return run_direct(&argv, None);
     }
     let cwd = std::env::current_dir().unwrap_or_default();

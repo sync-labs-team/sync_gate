@@ -17,7 +17,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run a command, waiting for the daemon's admission first when it is heavy.
+    /// Run a command, waiting for the daemon's admission first. Whatever follows `--` queues, heavy or not.
     Run {
         /// Session name; default `$SYNC_GATE_SESSION`, else "default".
         #[arg(long)]
@@ -162,7 +162,7 @@ fn main() {
             let session = session
                 .or_else(|| std::env::var("SYNC_GATE_SESSION").ok())
                 .unwrap_or_else(|| "default".into());
-            runner::run(session, max_wait, cmd)
+            runner::run(session, max_wait, cmd, true)
         }
         Cmd::Wait { id, max_wait } => runner::wait(id, max_wait),
         Cmd::Status => runner::status(),

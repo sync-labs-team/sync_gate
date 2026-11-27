@@ -169,7 +169,8 @@ The daemon log: on Windows, `daemon.log` in the install folder; on macOS,
   for all users (Node.js and Go, for example) is found before the shortcuts, so it goes through
   the queue only in PowerShell with the profile block, which puts the shortcuts first. Elsewhere,
   wrap the command: `sync_gate run -- <command>`.
-- **`cmd.exe` has no shortcuts.** Use `sync_gate run -- <command>`.
+- **`cmd.exe` has no shortcuts.** Use `sync_gate run -- <command>` for builds, tests and long
+  scripts: whatever it wraps queues, heavy or not.
 - **No profile with a restrictive policy.** If the execution policy does not run profile scripts,
   the installer does not create the profile block.
 - **`.ps1` programs.** The shortcut folder does not hide what exists only as a `.ps1` at the time

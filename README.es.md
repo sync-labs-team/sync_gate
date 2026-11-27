@@ -49,7 +49,7 @@ Sin permisos de administrador. Solo escribe en tus carpetas. Actualizar, desinst
 <!-- s:highlights -->
 ## Destacados
 
-- Builds, pruebas, instalaciones y `docker build` esperan en una cola hasta que la memoria lo permita. Un comando liviano nunca espera. El código de salida 75 significa "todavía en la cola": `sync_gate wait N` lo ejecuta después, con el entorno del shell que lo llama, no el original.
+- Builds, pruebas, instalaciones y `docker build` esperan en una cola hasta que la memoria lo permita. Un comando liviano nunca espera, salvo detrás de `sync_gate run`. El código de salida 75 significa "todavía en la cola": `sync_gate wait N` lo ejecuta después, con el entorno del shell que lo llama, no el original.
 - Un servidor MCP compartido que adoptaste corre hasta 3 instancias (el valor por defecto) para todas tus sesiones, no una por sesión.
 - Cada comando de un proyecto declarado puede tener su propia base PostgreSQL, que se borra cuando el comando termina: [docs/postgres.md](docs/postgres.md).
 - El sandbox de Codex solo usa tu cola si lo listas en `guests`: [docs/sandbox.md](docs/sandbox.md).

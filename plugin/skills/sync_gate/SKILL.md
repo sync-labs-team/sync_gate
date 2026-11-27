@@ -34,7 +34,8 @@ automatically, through shims on the `PATH`. Light commands (`ls`, `git status`) 
 - Never work around the queue: no absolute path to the real binary, no editing `PATH`,
   no killing the processes of other agents, no running the same build twice.
 - Where the shims are not on the `PATH` (the Claude `PowerShell` tool, a shell without
-  the session hook), wrap the command: `sync_gate run -- <cmd>`. PowerShell limits: the wrapper does not
+  the session hook), wrap builds, tests and long scripts: `sync_gate run -- <cmd>` (whatever it wraps
+  queues, so leave `git status` out). PowerShell limits: the wrapper does not
   forward a program that exists only as a `.ps1` (exit 127), and a `.cmd`/`.bat` cannot take
   an argument with a line break (exit 126).
 - When the daemon is unreachable or refuses, the command runs directly and prints a warning.

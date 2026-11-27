@@ -423,18 +423,20 @@ fn missing_command_is_127() {
     assert_eq!(Proc::spawn(c).finish().code, 127);
 }
 
+/// `sync_gate run` is the wrapper for what no shim covers: whatever is typed after it queues.
+/// (A shim still classifies by signature: `shimrun_a_light_command_never_asks_the_daemon`.)
 #[test]
-fn force_heavy_only_accepts_1_or_true() {
+fn run_queues_even_a_light_command() {
     let env = Env::new();
     let (cfg, m) = one_job();
     let d = env.start(cfg, m, OsControl);
-    // "0" must not force the heavy path: the daemon never sees the (light) command.
+    // The test binary is no heavy program, and nothing forces it through the environment.
     let mut c = env.run(&[], "exit:0");
-    c.env("SYNC_GATE_FORCE_HEAVY", "0");
+    c.env_remove("SYNC_GATE_FORCE_HEAVY");
     assert_eq!(Proc::spawn(c).finish().code, 0);
-    let seen = env.status().decisions;
+    let admitted = admissions(&env);
     d.shutdown();
-    assert!(seen.iter().all(|s| !s.contains("admitted")), "{seen:?}");
+    assert_eq!(admitted, 1);
 }
 
 #[test]
