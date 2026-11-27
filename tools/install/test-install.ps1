@@ -73,7 +73,10 @@ $assets = Join-Path $work 'assets'
 
 # Real values, from the binary itself with a clean SYNC_GATE_* environment (the test never touches them).
 $realPaths = Get-SyncGatePaths -Bin (Join-Path $BinDir 'sync_gate.exe') -Env @{}
-$realRoot = Join-Path $env:LOCALAPPDATA 'sync_labs\sync_gate'
+$realRoot = Get-SgInstallRoot   # the effective root of the user (SYNC_GATE_INSTALL_DIR or the default), before the test names are set
+$realDocs = [Environment]::GetFolderPath('MyDocuments')
+$realProfiles = @((Join-Path $realDocs 'WindowsPowerShell\profile.ps1'), (Join-Path $realDocs 'PowerShell\profile.ps1'))
+$realAgents = Get-SgAgentConfigs @{ ClaudeConfig = $null; CodexConfig = $null }
 
 $script:Base = [ordered]@{
     SYNC_GATE_INSTALL_DIR    = Join-Path $tmp 'inst'
@@ -101,27 +104,81 @@ $testEnv = @{}; foreach ($k in $B.Keys) { $testEnv[$k] = $B[$k] }
 Assert-SgIsolated -Bin (Join-Path $BinDir 'sync_gate.exe') -TestEnv $testEnv -Real $real
 foreach ($k in $B.Keys) { Set-Item -Path "env:$k" -Value $B[$k] }   # this process only, for Get-SyncGateLayout
 
-function Get-RealDataListing {
-    if (-not (Test-Path -LiteralPath $real.data)) { return 'absent' }
-    # Files only (a folder's mtime moves with its contents). Another session's queue (pending\) and the daemon's
-    # own bookkeeping change while the test runs, so cost.json, paused.json, services.json and pending\* are left
-    # out of the comparison; any other new or missing file still shows.
-    $s = Get-ChildItem -LiteralPath $real.data -File -Recurse -Force -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -notlike '*\pending\*' -and $_.Name -cnotin @('cost.json', 'paused.json', 'services.json') } |
+# What the installer or the binaries could write in the real user's area; only these are compared, so a second
+# harness or the real daemon doing its own work does not show up as a change, and nothing the test could touch
+# is left out. Each view takes its location, so scenario 3.23u can try them on a scratch copy.
+function Get-FileLine {
+    param([string]$File)
+    if (-not (Test-Path -LiteralPath $File -PathType Leaf)) { return "$File=absent" }
+    try { "$File=$((Get-FileHash -LiteralPath $File -Algorithm SHA256 -ErrorAction Stop).Hash)" } catch { "$File=unreadable" }
+}
+function Get-InstallView {
+    # install-state.json, launcher.cmd, every file of bin\ and rollback\ (the daemon's own log is not listed).
+    param([string]$Root)
+    $l = @((Get-FileLine (Join-Path $Root 'install-state.json')), (Get-FileLine (Join-Path $Root 'launcher.cmd')))
+    foreach ($d in 'bin', 'rollback') {
+        $dir = Join-Path $Root $d
+        if (Test-Path -LiteralPath $dir) {
+            $l += @(Get-ChildItem -LiteralPath $dir -File -Recurse -Force -ErrorAction SilentlyContinue | Sort-Object FullName | ForEach-Object { Get-FileLine $_.FullName })
+        } else { $l += "$dir=absent" }
+    }
+    $l -join "`n"
+}
+function Get-DataView {
+    param([string]$Dir)
+    if (-not (Test-Path -LiteralPath $Dir)) { return 'absent' }
+    # Files only (a folder's mtime moves with its contents). The queue (pending\), the daemon's own bookkeeping and
+    # log and the version check cache change while the test runs; any other new or missing file (shims\, config.toml,
+    # mcp-adopted.json) still shows.
+    $s = Get-ChildItem -LiteralPath $Dir -File -Recurse -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notlike '*\pending\*' -and $_.Name -cnotin @('cost.json', 'paused.json', 'services.json', 'update-check.json') -and $_.Name -notlike 'daemon.log*' } |
         ForEach-Object { "$($_.FullName)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" }
     ($s -join "`n")
 }
-function Get-RealKeyDump {
-    $k = Open-SgEnvKey $real.key
-    try { ($k.GetValueNames() | Sort-Object | ForEach-Object { "$_=$($k.GetValue($_, $null, 'DoNotExpandEnvironmentNames'))" }) -join "`n" } finally { $k.Dispose() }
+function Get-KeyView {
+    # Path and SYNC_GATE_*: name, registry kind and raw value (DWord 42 and the text "42" differ).
+    param([string]$Key)
+    $k = Open-SgEnvKey $Key
+    if ($null -eq $k) { return 'absent' }
+    try {
+        ($k.GetValueNames() | Where-Object { $_ -ieq 'Path' -or $_ -like 'SYNC_GATE_*' } | Sort-Object | ForEach-Object {
+            "$_|$($k.GetValueKind($_))|$(@($k.GetValue($_, $null, 'DoNotExpandEnvironmentNames')) -join ',')" }) -join "`n"
+    } finally { $k.Dispose() }
+}
+function Get-BlockView {
+    # The managed block of each profile (what the installer writes there) and, in the agent configs, every line
+    # that names sync_gate. The files change on their own; these parts do not.
+    param([string[]]$Profiles, [string[]]$Agents)
+    $re = '(?s)' + [regex]::Escape($script:SgBlockStart) + '.*?' + [regex]::Escape($script:SgBlockEnd)
+    $l = @(foreach ($f in $Profiles) {
+        if (-not (Test-Path -LiteralPath $f)) { "$f=absent"; continue }
+        $m = [regex]::Match([IO.File]::ReadAllText($f), $re)
+        "$f=$(if ($m.Success) { $m.Value } else { 'no block' })"
+    })
+    $l += @(foreach ($f in $Agents) {
+        if (-not (Test-Path -LiteralPath $f)) { "$f=absent"; continue }
+        "$f=" + ((@(Get-Content -LiteralPath $f -ErrorAction SilentlyContinue | Where-Object { $_ -match 'sync_gate' })) -join "`n")
+    })
+    $l -join "`n"
+}
+function Get-TaskView {
+    # The real task (exported, without its creation date) and this run's task only: another harness's task is not ours.
+    $r = 'absent'
+    if (Get-ScheduledTask -TaskName $real.task -ErrorAction SilentlyContinue) { $r = ([string](Export-ScheduledTask -TaskName $real.task)) -replace '<Date>[^<]*</Date>', '' }
+    "real=$r`nmine=$(@(Get-ScheduledTask -TaskName $B.SYNC_GATE_TASK_NAME -ErrorAction SilentlyContinue).Count)"
 }
 function Get-RealDaemonPids {
-    @(Get-SgDaemonProcesses | Where-Object { $_.Path -and -not $_.Path.StartsWith($tmp, [StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { $_.Pid } | Sort-Object)
+    # Daemons of the real installation only; another harness's daemon (under its own temp root) is not one.
+    @(Get-SgDaemonProcesses | Where-Object { $_.Path -and $_.Path.StartsWith($realRoot, [StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { $_.Pid } | Sort-Object)
 }
-$before = @{
-    Tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue).Count
-    Key = Get-RealKeyDump; Pids = (Get-RealDaemonPids) -join ','; Data = Get-RealDataListing
+function Get-RealView {
+    [ordered]@{
+        Install = Get-InstallView $realRoot; Data = Get-DataView $real.data; Key = Get-KeyView $real.key
+        Task = Get-TaskView; Blocks = Get-BlockView $realProfiles @($realAgents.Claude, $realAgents.Codex)
+        Pids = (Get-RealDaemonPids) -join ','
+    }
 }
+$before = Get-RealView
 
 # ---------------------------------------------------------------- assets: "new" zip, "old" zip (+16 bytes, P59)
 
@@ -557,6 +614,49 @@ Invoke-Scenario '3.22u' {
     Assert-That ((Get-TestVarKind 'SYNC_GATE_DATA_DIR') -eq 'ExpandString' -and $problems.Count -eq 1) "same text, other kind: $(Get-TestVarKind 'SYNC_GATE_DATA_DIR'), problems: $($problems -join '; ')"
 }
 
+Invoke-Scenario '3.23u' {
+    # The checks on the real user's area see what the installer could change and nothing else: tried on a scratch copy.
+    $root = Join-Path $tmp 'fake-real\inst'; $data = Join-Path $tmp 'fake-real\data'
+    foreach ($d in "$root\bin", "$root\rollback", "$data\shims", "$data\pending") { [void](New-Item -ItemType Directory -Force -Path $d) }
+    foreach ($f in "$root\install-state.json", "$root\launcher.cmd", "$root\bin\sync_gate.exe", "$root\rollback\meta.json", "$data\config.toml", "$data\shims\cargo.cmd") { Set-Content -LiteralPath $f -Value 'a' }
+    $iv = Get-InstallView $root; $dv = Get-DataView $data
+    # what the daemons write on their own is not a change
+    Set-Content -LiteralPath "$root\daemon.log" -Value 'x'; Set-Content -LiteralPath "$root\daemon.log.1" -Value 'x'
+    foreach ($f in 'cost.json', 'paused.json', 'services.json', 'update-check.json', 'daemon.log', 'pending\q.json') { Set-Content -LiteralPath "$data\$f" -Value 'x' }
+    Assert-That ((Get-InstallView $root) -ceq $iv) 'the daemon log counted as an install change'
+    Assert-That ((Get-DataView $data) -ceq $dv) 'bookkeeping, the log or the update check cache counted as a data change'
+    # what the installer or the binaries write is
+    foreach ($f in 'install-state.json', 'launcher.cmd', 'bin\sync_gate.exe', 'rollback\meta.json') {
+        Set-Content -LiteralPath "$root\$f" -Value 'changed'
+        Assert-That ((Get-InstallView $root) -cne $iv) "a change in $f was not seen"
+        Set-Content -LiteralPath "$root\$f" -Value 'a'
+    }
+    Assert-That ((Get-InstallView $root) -ceq $iv) 'the restored install folder differs'
+    Remove-Item -LiteralPath "$root\rollback\meta.json"; Assert-That ((Get-InstallView $root) -cne $iv) 'a removed journal file was not seen'
+    Set-Content -LiteralPath "$root\bin\extra.exe" -Value 'a'; Assert-That ((Get-InstallView $root) -cne $iv) 'a new program was not seen'
+    foreach ($f in 'shims\cargo.cmd', 'config.toml', 'mcp-adopted.json', 'shims\new.cmd') {
+        $had = Test-Path -LiteralPath "$data\$f"
+        if ($had) { Set-Content -LiteralPath "$data\$f" -Value 'changed' } else { Set-Content -LiteralPath "$data\$f" -Value 'a' }
+        Assert-That ((Get-DataView $data) -cne $dv) "a change in data\$f was not seen"
+        if ($had) { Set-Content -LiteralPath "$data\$f" -Value 'a' } else { Remove-Item -LiteralPath "$data\$f" }
+    }
+    # user variables: kind and raw value, only Path and SYNC_GATE_*
+    Set-TestVar 'SYNC_GATE_DATA_DIR' '42'; Set-TestVar 'OTHER_VAR' 'a'
+    $kv = Get-KeyView $B.SYNC_GATE_ENV_KEY
+    Set-TestVar 'OTHER_VAR' 'b'; Assert-That ((Get-KeyView $B.SYNC_GATE_ENV_KEY) -ceq $kv) 'a variable that is not ours counted'
+    $k = Open-SgEnvKey $B.SYNC_GATE_ENV_KEY -Write; try { $k.SetValue('SYNC_GATE_DATA_DIR', 42, [Microsoft.Win32.RegistryValueKind]::DWord) } finally { $k.Dispose() }
+    Assert-That ((Get-KeyView $B.SYNC_GATE_ENV_KEY) -cne $kv) 'DWord 42 and the text "42" were taken for the same'
+    # profile block and agent entries
+    $pf = Join-Path $tmp 'fake-real\profile.ps1'; $ag = Join-Path $tmp 'fake-real\agent.json'
+    Set-Content -LiteralPath $pf -Value "own line`r`n$script:SgBlockStart`r`nx`r`n$script:SgBlockEnd"; Set-Content -LiteralPath $ag -Value '{"a":1,"sync_gate":{"command":"x"}}'
+    $bv = Get-BlockView @($pf) @($ag)
+    Set-Content -LiteralPath $pf -Value "other own line`r`n$script:SgBlockStart`r`nx`r`n$script:SgBlockEnd"
+    Assert-That ((Get-BlockView @($pf) @($ag)) -ceq $bv) 'a line outside the managed block counted'
+    Set-Content -LiteralPath $pf -Value 'own line'; Assert-That ((Get-BlockView @($pf) @($ag)) -cne $bv) 'a removed managed block was not seen'
+    Set-Content -LiteralPath $pf -Value "own line`r`n$script:SgBlockStart`r`nx`r`n$script:SgBlockEnd"; Set-Content -LiteralPath $ag -Value '{"a":1}'
+    Assert-That ((Get-BlockView @($pf) @($ag)) -cne $bv) 'a removed agent entry was not seen'
+}
+
 Invoke-Scenario '3.0g' {
     # I-4: a binary that ignores the test variables (here a stand-in that always prints the real values) is refused.
     $leaky = Join-Path $tmp 'leaky.cmd'
@@ -823,12 +923,12 @@ Invoke-Scenario '3.5' {
     $stranger = Start-Bg -File (Join-Path $sd 'sync_gated.exe') -Arguments @() -Env (Get-InstEnv)
     try {
         Assert-That (Wait-Until { (Invoke-SgNative -File (Join-Path $BinDir 'sync_gate.exe') -Arguments @('status') -Env (Get-InstEnv)).ExitCode -eq 0 } 20) 'the stranger daemon did not come up'
-        $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue).Count
+        $tasks = Get-TaskView
         $r = Invoke-Inst -From $FromNew
         Assert-That ($r.Code -eq 1) "exit $($r.Code), want 1"
         Assert-That ($r.Text -match [regex]::Escape("another sync_gated is serving $($B.SYNC_GATE_SOCKET)")) "message: $($r.Text)"
         Assert-That (-not (Test-Path -LiteralPath $B.SYNC_GATE_INSTALL_DIR)) 'the install folder was created'
-        Assert-That (@(Get-ScheduledTask -ErrorAction SilentlyContinue).Count -eq $tasks) 'the task count changed'
+        Assert-That ((Get-TaskView) -ceq $tasks) 'a task changed'
         Assert-That (-not (Get-Process -Id $stranger.Id -ErrorAction SilentlyContinue).HasExited) 'the stranger was killed'
     } finally { if (-not $stranger.HasExited) { Stop-Process -Id $stranger.Id -Force } }
     # With a real daemon up on the default name, scenarios 3.1 and the final pid check show it is untouched.
@@ -1019,10 +1119,10 @@ Invoke-Scenario '3.11' {
     if (Test-Path -LiteralPath $bad) { Remove-Item -LiteralPath $bad -Recurse -Force }
     Copy-Item -LiteralPath $FromNew -Destination $bad -Recurse
     $z = Join-Path $bad $zipName; $bytes = [IO.File]::ReadAllBytes($z); $bytes[$bytes.Length - 30] = $bytes[$bytes.Length - 30] -bxor 1; [IO.File]::WriteAllBytes($z, $bytes)
-    $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue).Count
+    $tasks = Get-TaskView
     $r = Invoke-Inst -From $bad
     Assert-That ($r.Code -eq 1 -and $r.Text -match 'checksum mismatch') "tampered zip: exit $($r.Code): $($r.Text)"
-    Assert-That (-not (Test-Path -LiteralPath $B.SYNC_GATE_INSTALL_DIR) -and @(Get-ScheduledTask -ErrorAction SilentlyContinue).Count -eq $tasks) 'the tampered run changed something'
+    Assert-That (-not (Test-Path -LiteralPath $B.SYNC_GATE_INSTALL_DIR) -and (Get-TaskView) -ceq $tasks) 'the tampered run changed something'
 }
 
 Invoke-Scenario '3.12' {
@@ -1070,11 +1170,11 @@ Invoke-Scenario '3.14' {
         if (-not $short -or $short.Contains('%')) {
             Write-Host '  3.14: 8.3 not generated here (a root with % must be refused before any change)'
             Set-TestPath 'C:\keep' 'String'
-            $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue).Count
+            $tasks = Get-TaskView
             $r = Invoke-Inst -From $FromNew -Extra $x
             Assert-That ($r.Code -eq 1 -and $r.Text.Contains('has no 8.3 name')) "root with % and no 8.3 name: exit $($r.Code): $($r.Text)"
             Assert-That (-not (Test-Path -LiteralPath $odd)) 'the refused run left the folder'
-            Assert-That (@(Get-ScheduledTask -ErrorAction SilentlyContinue).Count -eq $tasks -and (Read-SgPathRaw $B.SYNC_GATE_ENV_KEY).Raw -ceq 'C:\keep') 'the refused run changed something'
+            Assert-That ((Get-TaskView) -ceq $tasks -and (Read-SgPathRaw $B.SYNC_GATE_ENV_KEY).Raw -ceq 'C:\keep') 'the refused run changed something'
             return
         }
         Set-TestPath 'C:\keep' 'String'
@@ -1124,15 +1224,12 @@ Reset-Area
 Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 $tmpGone = -not (Test-Path -LiteralPath $tmp)
 $keyGone = $null -eq (Open-SgEnvKey $B.SYNC_GATE_ENV_KEY)
-$after = @{
-    Tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue).Count
-    Key = Get-RealKeyDump; Pids = (Get-RealDaemonPids) -join ','; Data = Get-RealDataListing
-}
-if ($after.Key -cne $before.Key) { $script:Fails++; Write-Host 'FAIL: the real user variables key changed' }
+$after = Get-RealView
+$names = @{ Install = 'the real install folder'; Key = 'the real user variables (Path, SYNC_GATE_*)'; Task = 'the real scheduled task'; Blocks = 'the managed profile blocks or agent config entries'; Pids = 'the real daemon' }
+foreach ($n in $names.Keys) { if ($after[$n] -cne $before[$n]) { $script:Fails++; Write-Host "FAIL: $($names[$n]) changed" } }
 $dataSame = $after.Data -ceq $before.Data
-Write-Host ("tasks before=$($before.Tasks) after=$($after.Tasks); test key $(if ($keyGone) { 'removed' } else { 'LEFT' }); " +
-    "temp root $(if ($tmpGone) { 'removed' } else { 'LEFT' }); real daemon pid before=$($before.Pids) after=$($after.Pids); " +
-    "real data listing $(if ($dataSame) { 'unchanged' } else { 'CHANGED' })")
-if ($before.Tasks -ne $after.Tasks -or -not $keyGone -or -not $tmpGone -or $before.Pids -ne $after.Pids -or -not $dataSame) { $script:Fails++ }
+Write-Host ("test key $(if ($keyGone) { 'removed' } else { 'LEFT' }); temp root $(if ($tmpGone) { 'removed' } else { 'LEFT' }); " +
+    "real daemon pid before=$($before.Pids) after=$($after.Pids); real data listing $(if ($dataSame) { 'unchanged' } else { 'CHANGED' })")
+if (-not $keyGone -or -not $tmpGone -or -not $dataSame) { $script:Fails++ }
 Write-Host "$($script:Ran) scenario(s) run, $($script:Fails) failure(s)"
 if ($script:Fails -gt 0) { exit 1 }
