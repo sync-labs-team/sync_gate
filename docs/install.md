@@ -75,6 +75,12 @@ your shell does not reach a daemon that the installer started). Off means no cal
 
 Installing an older version works the same way as an update: pin it with `-Version` (Windows) or
 `--version` (Linux and macOS). Going from 0.1.2 back to 0.1.1 works.
+Going from 0.1.3 back to 0.1.2 works too (`-Version 0.1.2`): the daemon restarts on the old version and the
+queue answers. Nothing is lost on this step: the 0.1.2 installer keeps the `vars_original` record, so an
+uninstall afterwards still puts back a `SYNC_GATE_*` variable that existed before sync_gate, with its value and
+type. 0.1.2 does not know the update check: it ignores `update_check_days` in your config (the file is left as it
+is) and leaves `update-check.json` in the data folder untouched, even on uninstall (the data folder is kept).
+Delete that file if you want it gone.
 
 On Windows, one thing is lost when you go back to 0.1.1 or older. Since 0.1.2 the installer records the value
 a `SYNC_GATE_*` user variable had before it first wrote it (`vars_original` in `install-state.json`) and gives it
@@ -83,6 +89,10 @@ back on uninstall. 0.1.1 and older do not know that record: installing 0.1.1 ove
 variable had before sync_gate is gone from that moment, and an uninstall then **deletes** the variable instead of
 restoring it. Write down the value of each `SYNC_GATE_*` variable you set yourself before you go back to 0.1.1,
 and set it again afterwards. Nothing recovers it for you.
+
+Known limit (Windows): if the 0.1.2 installer crashed in the middle of a reinstall and 0.1.3 or newer recovered
+its journal, an empty `SYNC_GATE_*` variable of type MultiString that you had set yourself is removed instead of
+restored, because the 0.1.2 journal records an empty MultiString and a missing variable the same way.
 
 ## Uninstall
 
