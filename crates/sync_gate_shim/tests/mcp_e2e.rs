@@ -290,6 +290,8 @@ fn assert_no_canary_under(root: &Path) {
             let p = e.path();
             if p.is_dir() {
                 dirs.push(p);
+            } else if !p.is_file() {
+                // a socket (Unix) holds no data and cannot be read
             } else if p.file_name().is_some_and(|n| n == "sync_gated.lock") {
                 // the daemon holds a byte-range lock on it while it runs; it stores no data
             } else {
