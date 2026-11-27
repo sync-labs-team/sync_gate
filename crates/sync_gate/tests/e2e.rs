@@ -2909,14 +2909,16 @@ fn shimwin_powershell_finds_the_ps1_after_install() {
         .env("PATH", s.path(&dirs))
         .output()
         .unwrap();
-    let got = String::from_utf8_lossy(&out.stdout).trim().to_lowercase();
-    let want = s
-        .real()
-        .join("yarn.ps1")
-        .display()
-        .to_string()
-        .to_lowercase();
-    assert_eq!(got, want, "{}", String::from_utf8_lossy(&out.stderr));
+    // The runner's temp folder has a short and a long spelling (`runner~1`): compare real paths.
+    let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let same = |p: &str| std::fs::canonicalize(p).map(|p| p.display().to_string().to_lowercase());
+    let want = s.real().join("yarn.ps1").display().to_string();
+    assert_eq!(
+        same(&got).unwrap_or_default(),
+        same(&want).unwrap(),
+        "{got} {want} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[cfg(windows)]
@@ -4840,6 +4842,8 @@ fn dacls(paths: &[&Path]) -> Vec<String> {
             "$env:FG_ACL_PATHS -split '\\|' | ForEach-Object { (Get-Acl -LiteralPath $_).GetSecurityDescriptorSddlForm('Access') }",
         ])
         .env("FG_ACL_PATHS", list.join("|"))
+        // A PowerShell 7 parent leaves its module path behind; Windows PowerShell 5.1 rebuilds it.
+        .env_remove("PSModulePath")
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
@@ -4861,6 +4865,7 @@ fn only_me(p: &Path) {
             "$a = Get-Acl -LiteralPath $env:FG_ACL_PATH; $a.SetAccessRuleProtection($true, $false); $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User; $a.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'Allow'))); Set-Acl -LiteralPath $env:FG_ACL_PATH -AclObject $a",
         ])
         .env("FG_ACL_PATH", p)
+        .env_remove("PSModulePath")
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
