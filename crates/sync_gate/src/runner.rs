@@ -1312,7 +1312,7 @@ pub(crate) fn render(s: &StatusReport) -> String {
 fn update_notice() -> Option<String> {
     sync_gate_core::update::notice(
         &data_dir()?,
-        load_config().update_check_days,
+        sync_gate_core::update::days_of(sync_gate_shim::load_config()),
         std::env::var_os("SYNC_GATE_UPDATE_CHECK").as_deref(),
         env!("CARGO_PKG_VERSION"),
     )

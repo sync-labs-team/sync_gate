@@ -113,11 +113,7 @@ fn main() -> ExitCode {
     };
     // The weekly look at the latest release; reads `update_check_days` again at every wake-up.
     if let Some(dir) = sync_gated::store::default_dir() {
-        sync_gated::update_check::spawn(dir, || {
-            load_config().map_or(sync_gate_core::update::DEFAULT_DAYS, |c| {
-                c.update_check_days
-            })
-        });
+        sync_gated::update_check::spawn(dir, || sync_gate_core::update::days_of(load_config()));
     }
     let _ = rx.recv();
     handle.shutdown();

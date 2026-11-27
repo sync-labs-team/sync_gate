@@ -5363,3 +5363,29 @@ fn hook_carries_the_update_line_as_a_notice_for_the_user() {
         "{strange}"
     );
 }
+
+#[test]
+fn a_broken_config_means_no_update_line_in_status_or_hook() {
+    // `update_check_days = 0` next to a syntax error: the file does not parse, so the safe
+    // reading is "off", never the 7-day default.
+    let broken = "update_check_days = 0\nguests = [\n";
+    let env = Env::new();
+    let (cfg, m) = one_job();
+    let d = env.start(cfg, m, OsControl);
+    seed_update_cache(&env.data_dir(), "99.0.0");
+    std::fs::write(env.file("config.toml"), broken).unwrap();
+    assert!(
+        !status_text(&env, &[]).contains("is available"),
+        "status with a broken config"
+    );
+    d.shutdown();
+    let h = Hook::new();
+    seed_update_cache(&h.s.env.data_dir(), "99.0.0");
+    std::fs::write(h.s.env.file("config.toml"), broken).unwrap();
+    let (code, out, _) = h.run(None, HOOK_STDIN, Hook::base_path(), &[]);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        !context(&out).contains("is available"),
+        "hook with a broken config: {out}"
+    );
+}

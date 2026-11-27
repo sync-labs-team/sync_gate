@@ -12,8 +12,6 @@ pub const CACHE_FILE: &str = "update-check.json";
 pub const DEFAULT_DAYS: u64 = 7;
 /// Largest interval honoured (ten years): keeps `days * 86400` finite.
 pub const MAX_DAYS: u64 = 3650;
-/// After a failed check the next try comes this soon, not after the whole interval.
-pub const RETRY_SECS: u64 = 6 * 3600;
 const CACHE_LIMIT: u64 = 4096;
 
 pub type Version = (u64, u64, u64);
@@ -59,6 +57,8 @@ pub fn read_cache(dir: &Path) -> Option<Cache> {
     struct Raw {
         version: u64,
         checked_unix: u64,
+        // Required: `null` is "none yet", a missing key is not what the daemon writes.
+        #[serde(deserialize_with = "Option::deserialize")]
         latest: Option<String>,
     }
     let mut buf = Vec::new();
@@ -82,6 +82,12 @@ pub fn read_cache(dir: &Path) -> Option<Cache> {
         checked_unix: raw.checked_unix,
         latest,
     })
+}
+
+/// The interval to use from a config that may not have loaded: a config that does not parse
+/// means off (no call, no notice), never the default, so a typo cannot undo `update_check_days = 0`.
+pub fn days_of<E>(config: Result<crate::config::Config, E>) -> u64 {
+    config.map_or(0, |c| c.update_check_days)
 }
 
 /// Off by `update_check_days = 0` or by `SYNC_GATE_UPDATE_CHECK=0`.
@@ -233,6 +239,30 @@ mod tests {
         };
         seed(&d, &c.to_json());
         assert_eq!(read_cache(&d), Some(c));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_config_that_did_not_load_means_off() {
+        let ok = crate::config::Config::from_toml("update_check_days = 3");
+        assert_eq!(days_of(ok), 3);
+        assert_eq!(days_of(crate::config::Config::from_toml("")), DEFAULT_DAYS);
+        let bad = crate::config::Config::from_toml(
+            "update_check_days = 0
+guests = [
+",
+        );
+        assert!(bad.is_err());
+        assert_eq!(days_of(bad), 0);
+    }
+
+    #[test]
+    fn cache_without_latest_is_rejected() {
+        let d = tmp("nolatest");
+        seed(&d, r#"{"version":1,"checked_unix":5}"#);
+        assert_eq!(read_cache(&d), None);
+        seed(&d, r#"{"version":1,"checked_unix":5,"latest":null}"#);
+        assert!(read_cache(&d).is_some());
         std::fs::remove_dir_all(&d).unwrap();
     }
 

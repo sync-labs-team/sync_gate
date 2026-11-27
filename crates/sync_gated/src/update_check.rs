@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sync_gate_core::update::{
-    CACHE_FILE, Cache, MAX_DAYS, RETRY_SECS, Version, disabled, due, parse_version, read_cache,
+    CACHE_FILE, Cache, Version, disabled, due, parse_version, read_cache,
 };
 
 const URL: &str = "https://api.github.com/repos/sync-labs-team/sync_gate/releases/latest";
@@ -28,10 +28,12 @@ pub enum Step {
 }
 
 /// One wake-up: remove the cache when off; otherwise, when due, call `fetch` once and record it.
-/// The attempt is stamped before the call, so a crash in it does not repeat at once; a failure
-/// keeps the old `latest` and retries after `RETRY_SECS`, not after the whole interval.
+/// The attempt is stamped before the call, so a crash in it does not repeat at once. Success or
+/// failure, the next try waits the whole interval (a failure keeps the old `latest`). `last` is the
+/// same stamp kept in memory, so a data folder that cannot be written does not mean a call an hour.
 pub fn step(
     dir: &Path,
+    last: &mut Option<u64>,
     now: u64,
     days: u64,
     env: Option<&OsStr>,
@@ -45,9 +47,11 @@ pub fn step(
     if old
         .as_ref()
         .is_some_and(|c| !due(now, c.checked_unix, days))
+        || last.is_some_and(|t| !due(now, t, days))
     {
         return Step::NotDue;
     }
+    *last = Some(now);
     let latest = old.and_then(|c| c.latest);
     write(
         dir,
@@ -67,19 +71,7 @@ pub fn step(
             );
             Step::Fetched
         }
-        None => {
-            // Stamped so the next try is due in RETRY_SECS (the interval is at least a day).
-            let secs = days.min(MAX_DAYS) * 86_400;
-            let checked_unix = now.saturating_sub(secs.saturating_sub(RETRY_SECS));
-            write(
-                dir,
-                &Cache {
-                    checked_unix,
-                    latest,
-                },
-            );
-            Step::Failed
-        }
+        None => Step::Failed,
     }
 }
 
@@ -168,9 +160,11 @@ pub fn spawn(dir: PathBuf, days: impl Fn() -> u64 + Send + 'static) {
                 let _ = std::fs::remove_file(dir.join(CACHE_FILE));
             }
             std::thread::sleep(FIRST_DELAY);
+            let mut last = None;
             loop {
                 step(
                     &dir,
+                    &mut last,
                     now_unix(),
                     days(),
                     env().as_deref(),
@@ -202,8 +196,20 @@ mod tests {
         env: Option<&str>,
         answer: Option<Version>,
     ) -> (Step, u32) {
+        run_mem(dir, &mut None, now, days, env, answer)
+    }
+
+    /// Same, with the in-memory stamp of the thread kept by the caller.
+    fn run_mem(
+        dir: &Path,
+        last: &mut Option<u64>,
+        now: u64,
+        days: u64,
+        env: Option<&str>,
+        answer: Option<Version>,
+    ) -> (Step, u32) {
         let mut calls = 0;
-        let s = step(dir, now, days, env.map(OsStr::new), &mut || {
+        let s = step(dir, last, now, days, env.map(OsStr::new), &mut || {
             calls += 1;
             answer
         });
@@ -275,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn failure_is_silent_keeps_latest_and_retries_in_hours() {
+    fn failure_is_silent_keeps_latest_and_waits_the_whole_interval() {
         let d = tmp("fail");
         let now = 100 * DAY;
         write(
@@ -288,17 +294,27 @@ mod tests {
         assert_eq!(run(&d, now, 7, None, None), (Step::Failed, 1));
         let c = read_cache(&d).unwrap();
         assert_eq!(c.latest, Some((0, 1, 3)), "old answer kept");
-        assert!(c.checked_unix > now - 8 * DAY, "attempt recorded");
-        assert_eq!(
-            run(&d, now + 3600, 7, None, None).1,
-            0,
-            "no retry within the hour"
-        );
-        assert_eq!(
-            run(&d, now + RETRY_SECS + 1, 7, None, None).1,
-            1,
-            "retry after hours"
-        );
+        assert_eq!(c.checked_unix, now, "attempt recorded");
+        for later in [3600, 6 * 3600 + 1, 3 * DAY, 7 * DAY - 1] {
+            assert_eq!(run(&d, now + later, 7, None, None).1, 0, "{later}s");
+        }
+        assert_eq!(run(&d, now + 7 * DAY, 7, None, None).1, 1, "after 7 days");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn an_unwritable_cache_still_limits_the_calls() {
+        let d = tmp("nowrite");
+        // A folder where the file should be: nothing can be written or read there.
+        std::fs::create_dir(d.join(CACHE_FILE)).unwrap();
+        let now = 100 * DAY;
+        let mut last = None;
+        let mut go = |t: u64| run_mem(&d, &mut last, t, 7, None, Some((0, 1, 3))).1;
+        assert_eq!(go(now), 1);
+        for h in 1..=168 {
+            assert_eq!(go(now + h * 3600 - 1), 0, "{h} h");
+        }
+        assert_eq!(go(now + 7 * DAY), 1);
         std::fs::remove_dir_all(&d).unwrap();
     }
 

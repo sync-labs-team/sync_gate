@@ -28,7 +28,8 @@ and what happened.
 
 - **The update check calls GitHub.** Once every `update_check_days` (default 7), the daemon runs
   `curl` for `releases/latest` of this repository: one anonymous GET over HTTPS, with no
-  token, cookie or data of yours. GitHub sees your IP address, the time and the `curl` version. The
+  token, cookie or data of yours. Your DNS resolver sees the name `api.github.com`, and GitHub sees your IP address, the time and
+  the `curl` version, in a TLS connection. On failure the daemon does not retry before the next interval. The
   answer is kept only as a plain `X.Y.Z` in `update-check.json` in the data folder. Off with
   `update_check_days = 0` in `config.toml` or `SYNC_GATE_UPDATE_CHECK=0` in the daemon's environment;
   off means no call and the file is removed.

@@ -59,12 +59,9 @@ pub fn session_start() -> i32 {
 /// The update line, read from the cache the daemon keeps; never a network call. Off by the config
 /// (`update_check_days = 0`) or `SYNC_GATE_UPDATE_CHECK=0`.
 fn update_notice() -> Option<String> {
-    let days = sync_gate_shim::load_config().map_or(sync_gate_core::update::DEFAULT_DAYS, |c| {
-        c.update_check_days
-    });
     sync_gate_core::update::notice(
         &sync_gate_core::config::data_dir()?,
-        days,
+        sync_gate_core::update::days_of(sync_gate_shim::load_config()),
         std::env::var_os("SYNC_GATE_UPDATE_CHECK").as_deref(),
         env!("CARGO_PKG_VERSION"),
     )
