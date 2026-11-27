@@ -222,7 +222,7 @@ fn owner_only_descriptor() -> io::Result<SecurityDescriptor> {
 }
 
 /// D:P = protected DACL with one allow-ACE, GENERIC_ALL, for `sid`; nothing for Everyone or Anonymous.
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn descriptor_for(sid: &str) -> io::Result<SecurityDescriptor> {
     sddl_descriptor(&format!("D:P(A;;GA;;;{sid})"))
 }
