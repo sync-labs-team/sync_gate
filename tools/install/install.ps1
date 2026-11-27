@@ -1255,7 +1255,7 @@ function Invoke-SyncGateUninstall {
             $plan = Set-SyncGatePath -Key $L.EnvKey -Placed $placed -Remove -Plan
             Set-SgWrote $L 'path' @{ Present = $plan.Present; Raw = $plan.Raw }
             [void](Set-SyncGatePath -Key $L.EnvKey -Placed $placed -Remove)
-            foreach ($n in (ConvertTo-SgHashtable $vars).Keys) { $w = $null; if ($origH.Contains($n)) { $w = [string]$origH[$n].value }; Set-SgWrote $L 'vars' $w $n }
+            foreach ($n in (ConvertTo-SgHashtable $vars).Keys) { $w = $null; if ($origH.Contains($n)) { $w = [string]$origH[$n].value }; Set-SgWrote $L 'vars' $w $n; if ($null -ne $w) { Set-SgWrote $L 'varkinds' $origH[$n].kind $n } }
             [void](Set-SyncGateUserVars -Key $L.EnvKey -Previous $vars -Original $origH -Remove)
             [void](Set-SyncGateProfileBlock -Profiles $L.Profiles -Previous $profs -Remove -Ahead { param($ap, $ah) Set-SgWrote $L 'profiles' $ah $ap })
             Unregister-ScheduledTask -TaskName $L.Task -Confirm:$false -ErrorAction SilentlyContinue
