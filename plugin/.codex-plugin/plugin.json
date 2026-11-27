@@ -1,6 +1,6 @@
 {
   "name": "sync-gate",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "sync_gate: queue heavy builds, tests and installs so parallel AI agents do not fight over the machine.",
   "author": { "name": "sync_labs" },
   "homepage": "https://gate.synclabs.team",
