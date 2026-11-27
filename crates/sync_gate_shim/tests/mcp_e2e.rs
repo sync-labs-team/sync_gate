@@ -466,8 +466,17 @@ fn ten_sessions(child: &str) -> Sandbox {
     for r in &mut relays {
         r.send(initialize());
     }
-    for r in &mut relays {
-        result(r.reply(0));
+    for i in 0..relays.len() {
+        let first = relays[i].reply(0);
+        if first.get("result").is_none() {
+            let errs: Vec<String> = relays.iter().map(|r| r.stderr()).collect();
+            let st = sb.status();
+            panic!(
+                "relay {i}: {first}\nstderr of every relay: {errs:?}\ndecisions: {:?}\nrows: {:?}",
+                st.decisions, st.mcp
+            );
+        }
+        let r = &mut relays[i];
         r.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
         r.send(tools_call(1));
     }
@@ -476,7 +485,12 @@ fn ten_sessions(child: &str) -> Sandbox {
         .map(|r| result(r.reply(1))["pid"].clone())
         .collect();
     let server = sb.pids("docs");
-    assert_eq!(server.len(), 1, "server pids: {server:?}");
+    let errs: Vec<String> = relays.iter().map(|r| r.stderr()).collect();
+    assert_eq!(
+        server.len(),
+        1,
+        "server pids: {server:?}; stderr of every relay: {errs:?}"
+    );
     assert!(pids.iter().all(|p| *p == server[0]), "{pids:?}");
     let row = sb.row("docs");
     assert_eq!((row.instances, row.clients), (1, 10), "{row:?}");

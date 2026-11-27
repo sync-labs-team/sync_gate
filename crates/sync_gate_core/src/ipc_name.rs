@@ -338,6 +338,27 @@ fn settle_holders<P>(
     None
 }
 
+/// Runs `attempt` (one [`settle_holders`]) again, up to `tries` times, while it gives None,
+/// calling `pause(n)` before attempt n+1. Other clients of the same pipe that connect or leave
+/// while the holders are read keep one round from settling; once they are in, the next round
+/// does. Never trusts more than a settled round does: after `tries` the answer is still None.
+#[cfg(any(windows, test))]
+fn retry_unsettled<T>(
+    tries: u32,
+    mut attempt: impl FnMut() -> Option<T>,
+    mut pause: impl FnMut(u32),
+) -> Option<T> {
+    for n in 0..tries {
+        if let Some(settled) = attempt() {
+            return Some(settled);
+        }
+        if n + 1 < tries {
+            pause(n);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,6 +701,33 @@ mod tests {
         (got, opened.into_inner(), calls.into_inner())
     }
 
+    /// Other clients joining while the holders are read (ten sessions starting at once) leave a
+    /// round unsettled; the retry settles once they are in, and still gives up after `tries`.
+    #[test]
+    fn an_unsettled_round_is_retried_and_never_trusted_past_the_limit() {
+        let mut calls = 0;
+        let mut pauses = Vec::new();
+        let got = retry_unsettled(
+            5,
+            || {
+                calls += 1;
+                (calls == 3).then_some("settled")
+            },
+            |n| pauses.push(n),
+        );
+        assert_eq!((got, calls, pauses), (Some("settled"), 3, vec![0, 1]));
+
+        let mut calls = 0;
+        let got: Option<()> = retry_unsettled(
+            4,
+            || {
+                calls += 1;
+                None
+            },
+            |_| {},
+        );
+        assert_eq!((got, calls), (None, 4));
+    }
     #[test]
     fn settle_holders_pins_before_it_trusts() {
         let (got, opened, _) = settle(&[Some(&[7, 9]), Some(&[7, 9])], &[]);
@@ -771,7 +819,7 @@ mod windows {
     use super::{GUEST_PIPE_ACCESS, SelfKind, classify_self};
     use super::{
         HolderFacts, Peers, holders_ok, parse_holder_ids, restricted_from_group_count,
-        settle_holders,
+        retry_unsettled, settle_holders,
     };
     use interprocess::local_socket::Stream;
     use interprocess::os::windows::named_pipe::local_socket::Stream as NamedPipeStream;
@@ -1250,9 +1298,16 @@ mod windows {
         // SAFETY: `token_info` checked the buffer holds a whole TOKEN_USER.
         let own_sid = unsafe { (*own.as_ptr().cast::<TOKEN_USER>()).User.Sid };
         let query = PROCESS_QUERY_LIMITED_INFORMATION;
-        let first =
-            server.and_then(|pid| Some((pid, pin_process(pid, query | PROCESS_SYNCHRONIZE)?)));
-        let pinned = settle_holders(first, || list_holders(pipe), |pid| pin_process(pid, query))?;
+        // Ten sessions starting at once keep a round from settling; see `retry_unsettled`.
+        let pinned = retry_unsettled(
+            8,
+            || {
+                let first = server
+                    .and_then(|pid| Some((pid, pin_process(pid, query | PROCESS_SYNCHRONIZE)?)));
+                settle_holders(first, || list_holders(pipe), |pid| pin_process(pid, query))
+            },
+            |n| std::thread::sleep(std::time::Duration::from_millis(25 * u64::from(n + 1))),
+        )?;
         let facts = pinned
             .iter()
             // SAFETY: each pin is an open process handle; the SIDs are valid (caller, above).
