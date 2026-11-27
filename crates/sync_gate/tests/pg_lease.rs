@@ -536,8 +536,8 @@ impl Fx {
         (self.spawn(self.run_cmd(mode, &out, &self.proj, &[])), out)
     }
 
-    /// `sync_gate shims install` into this sandbox, and a `real` folder whose `pytest` is this
-    /// test binary, found behind the shims as a shell would find it.
+    /// `sync_gate shims install` into this sandbox, and a `real` folder whose `pytest` and `cargo`
+    /// are this test binary, found behind the shims as a shell would find them.
     fn install_shims(&self) {
         let out = Command::new(env!("CARGO_BIN_EXE_sync_gate"))
             .args(["shims", "install"])
@@ -551,12 +551,12 @@ impl Fx {
         );
         let real = self.file("real");
         std::fs::create_dir_all(&real).unwrap();
-        let (exe, to) = (
-            std::env::current_exe().unwrap(),
-            real.join(exe_name("pytest")),
-        );
-        if std::fs::hard_link(&exe, &to).is_err() {
-            std::fs::copy(&exe, &to).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        for name in ["pytest", "cargo"] {
+            let to = real.join(exe_name(name));
+            if std::fs::hard_link(&exe, &to).is_err() {
+                std::fs::copy(&exe, &to).unwrap();
+            }
         }
     }
 
@@ -567,7 +567,19 @@ impl Fx {
 
     /// `<shims>/pytest child_entry ...` in `cwd`: heavy by its name, nothing forced.
     fn shim_cmd(&self, mode: &str, out: &Path, cwd: &Path) -> Command {
-        let mut c = Command::new(self.data_dir().join("shims").join(exe_name("pytest")));
+        self.shim_cmd_as("pytest", mode, out, cwd)
+    }
+
+    /// `<shims>/cargo child_entry ...` in `cwd`: light by its signature (`child_entry` is no heavy
+    /// cargo subcommand), nothing forced, so the CLI talks to the daemon only about the lease.
+    /// `sync_gate run` always queues; a shim is the path a light command still takes.
+    fn light_cmd(&self, mode: &str, out: &Path, cwd: &Path) -> Command {
+        self.install_shims();
+        self.shim_cmd_as("cargo", mode, out, cwd)
+    }
+
+    fn shim_cmd_as(&self, program: &str, mode: &str, out: &Path, cwd: &Path) -> Command {
+        let mut c = Command::new(self.data_dir().join("shims").join(exe_name(program)));
         for v in PG_VARS {
             c.env_remove(v);
         }
@@ -1183,11 +1195,6 @@ impl Drop for Proxy {
     }
 }
 
-/// Without `SYNC_GATE_FORCE_HEAVY` the command is light: the CLI talks to the daemon only about the lease.
-fn light(c: &mut Command) {
-    c.env_remove("SYNC_GATE_FORCE_HEAVY");
-}
-
 /// The CLI talks to the daemon through `proxy`.
 fn through(c: &mut Command, fx: &Fx) {
     c.env("SYNC_GATE_SOCKET", fx.proxy_name());
@@ -1249,11 +1256,11 @@ fn the_give_up_carries_the_request_id_of_the_lease() {
     let proxy = fx.proxy();
     let blocked = fx.fake.block("create_role");
     let out = fx.file("a");
-    let mut c = fx.run_cmd("env", &out, &fx.proj, &[]);
-    light(&mut c);
+    let mut c = fx.light_cmd("env", &out, &fx.proj);
     through(&mut c, &fx);
     let r = fx.spawn(c).finish();
     assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(fx.admitted(), 0, "a light command is never admitted");
     drop(blocked);
     proxy.wait_idle();
     let seen = proxy.seen();
@@ -1280,13 +1287,14 @@ fn a_daemon_error_runs_at_once_without_a_give_up() {
     let proxy = fx.proxy();
     let (held, _o, _pid) = fx.hold("a");
     let out = fx.file("b");
-    let mut c = fx.run_cmd("env", &out, &fx.proj, &[]);
-    light(&mut c);
+    let mut c = fx.light_cmd("env", &out, &fx.proj);
     mine(&mut c);
     through(&mut c, &fx);
+    let admitted = fx.admitted();
     let started = Instant::now();
     let r = fx.spawn(c).finish();
     assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(fx.admitted(), admitted, "a light command is never admitted");
     assert!(
         started.elapsed() < Duration::from_secs(30),
         "waited for the patience"
@@ -1998,13 +2006,13 @@ fn ctrl_c_during_the_migration_of_a_light_command_does_not_run_it() {
         },
     );
     let out = fx.file("a");
-    let mut c = fx.run_cmd("env", &out, &fx.proj, &[]);
-    light(&mut c);
+    let mut c = fx.light_cmd("env", &out, &fx.proj);
     c.env("SYNC_GATE_TEST_INTERRUPT_AFTER_MS", "2000");
     through(&mut c, &fx);
     let mut p = fx.spawn(c);
     assert_eq!(p.exited(EVENT), 130);
     assert_eq!(runs(&out), 0, "the command never ran");
+    assert_eq!(fx.admitted(), 0, "a light command is never admitted");
     wait_for("the key's row is gone", EVENT, || key_is_free(&fx));
     std::fs::write(fx.proj.join("release"), "").unwrap();
     p.finish();

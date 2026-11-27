@@ -2263,6 +2263,24 @@ fn shimrun_a_light_command_never_asks_the_daemon() {
     assert!(!out.stderr.contains("daemon"), "{}", out.stderr);
 }
 
+/// A shim still classifies: `SYNC_GATE_FORCE_HEAVY=0` keeps its light command away from the daemon,
+/// and "1" (the control, same daemon) does queue it.
+#[test]
+fn shimrun_force_heavy_only_accepts_1_or_true() {
+    let s = ShimRun::new(&["cargo"]);
+    let (cfg, m) = one_job();
+    let d = s.env.start(cfg, m, OsControl);
+    let mut seen = Vec::new();
+    for v in ["0", "1"] {
+        let mut c = s.cmd("cargo", &[], &s.default_dirs(), "exit:0");
+        c.env("SYNC_GATE_FORCE_HEAVY", v);
+        assert_eq!(Proc::spawn(c).finish().code, 0, "SYNC_GATE_FORCE_HEAVY={v}");
+        seen.push(s.admitted());
+    }
+    d.shutdown();
+    assert_eq!(seen, [0, 1]);
+}
+
 #[test]
 fn shimrun_four_nested_heavy_commands_all_run_under_one_admission() {
     let s = ShimRun::new(&NEST);
