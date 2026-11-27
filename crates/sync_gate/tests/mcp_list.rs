@@ -64,3 +64,34 @@ fn mcp_list_shows_servers_with_and_without_daemon() {
     assert_eq!(rows[2], ["solo", "per-session", "0", "0", "0", "0", "0"]);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Windows: a config in a folder others can change is not read.
+#[cfg(windows)]
+#[test]
+fn a_config_in_a_folder_others_can_write_is_not_read() {
+    let id = format!("sync_gate_mcplist-open-{}", std::process::id());
+    let dir = std::env::temp_dir().join(&id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("config.toml");
+    std::fs::write(&config, TOML).unwrap();
+    let out = Command::new("icacls")
+        .arg(&dir)
+        .args(["/grant", "*S-1-1-0:(OI)(CI)(M)"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "icacls: {out:?}");
+    let out = Command::new(env!("CARGO_BIN_EXE_sync_gate"))
+        .args(["mcp", "list"])
+        .env("SYNC_GATE_SOCKET", &id)
+        .env("SYNC_GATE_CONFIG", &config)
+        .output()
+        .unwrap();
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_ne!(out.status.code(), Some(0), "{stdout}");
+    assert!(!stdout.contains("docs"), "{stdout}");
+    assert!(stderr.contains("writable by other users"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -2035,6 +2035,49 @@ fn shims_remove_refuses_a_folder_others_can_write() {
     assert!(!s.exists(&npm));
 }
 
+/// The SDDL entries of `p` that let BUILTIN\Users read and execute (and nothing more).
+#[cfg(windows)]
+fn users_read(p: &Path) -> usize {
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command"])
+        .arg(format!("(Get-Acl -LiteralPath '{}').Sddl", p.display()))
+        .output()
+        .unwrap();
+    let sddl = String::from_utf8_lossy(&out.stdout).to_lowercase();
+    sddl.split('(')
+        .filter(|a| a.starts_with("a;") && a.contains(";0x1200a9;;;bu)"))
+        .count()
+}
+
+/// Others who may only read and run what is in the shims folder (a sandbox's group, inherited
+/// from the profile) keep that after `shims install`, for an existing folder and a new one.
+#[cfg(windows)]
+#[test]
+fn shims_install_keeps_what_others_may_only_read() {
+    for existing in [true, false] {
+        let s = Shims::new();
+        std::fs::create_dir_all(s.env.data_dir()).unwrap();
+        let out = Command::new("icacls")
+            .arg(s.env.data_dir())
+            .args(["/grant", "*S-1-5-32-545:(OI)(CI)(RX)"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "icacls: {out:?}");
+        if existing {
+            std::fs::create_dir(s.dir()).unwrap();
+        }
+        s.ok("install");
+        let npm = s.path(&shim_name("npm"));
+        for p in [s.dir(), npm, s.path("sync_gate_shims.json")] {
+            assert_eq!(users_read(&p), 1, "existing={existing}: {}", p.display());
+        }
+        assert_eq!(
+            sync_gate_core::check_private_dir(&s.dir()).unwrap(),
+            sync_gate_core::DirState::OthersCanRead
+        );
+    }
+}
+
 #[cfg(windows)]
 fn old_files(s: &Shims) -> Vec<String> {
     std::fs::read_dir(s.dir())

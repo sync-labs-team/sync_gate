@@ -149,6 +149,40 @@ fn unexpected_arguments_exit_two() {
     }
 }
 
+/// Windows: the daemon does not read a config in a folder others can change; it exits.
+#[cfg(windows)]
+#[test]
+fn a_config_in_a_folder_others_can_write_is_refused() {
+    let sb = Sandbox::new("opencfg");
+    let cfg = sb.dir.join("cfg");
+    std::fs::create_dir(&cfg).unwrap();
+    std::fs::write(cfg.join("config.toml"), "").unwrap();
+    let out = Command::new("icacls")
+        .arg(&cfg)
+        .args(["/grant", "*S-1-1-0:(OI)(CI)(M)"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "icacls: {out:?}");
+    let mut child = sb
+        .command(&[])
+        .env("SYNC_GATE_CONFIG", cfg.join("config.toml"))
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed() > LIMIT {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the daemon started with that config");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = text(&out.stderr);
+    assert!(err.contains("writable by other users"), "{err}");
+}
+
 /// Waits for the daemon to answer `Status` on the control socket (up to `LIMIT`), as the CLI does.
 fn status(sock: &str) -> Option<Response> {
     let start = Instant::now();

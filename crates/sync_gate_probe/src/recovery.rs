@@ -121,10 +121,10 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Creates `dir` and missing parents, readable only by the user (0700 on Unix; on Windows a
-/// protected DACL of the user, SYSTEM and Administrators). An existing folder is checked first:
-/// one others can write (or a link, or another owner's) is an error and is left as found; one
-/// others can only read is tightened (0700; Windows: that DACL).
+/// Creates `dir` and missing parents that only the user can change. An existing folder is
+/// checked first: one others can write (or a link, or another owner's) is an error and is left as
+/// found. Unix: 0700, and a folder others can only read is tightened to 0700. Windows: what
+/// others may only read is kept, inherited or not; a new folder loses any write access for others.
 pub fn create_private_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -1307,45 +1307,76 @@ mod tests {
         assert!(out.status.success(), "icacls: {out:?}");
     }
 
-    /// A new folder and the parents it creates: owned by the user, with a protected DACL of
-    /// exactly the user, SYSTEM and Administrators (inherited by what is created inside).
+    /// The DACL entries of an SDDL string, without the inherited flag.
     #[cfg(windows)]
-    #[test]
-    fn a_new_dir_gets_a_protected_dacl_of_the_user_system_and_administrators() {
-        let base = rdir("new-acl");
-        let d = base.join("a").join("b");
-        create_private_dir(&d).unwrap();
-        let u = user_sid();
-        let mut want = vec![
-            format!("(A;OICI;FA;;;{u})"),
-            "(A;OICI;FA;;;SY)".to_owned(),
-            "(A;OICI;FA;;;BA)".to_owned(),
-        ];
-        want.sort();
-        for p in [base.join("a"), d] {
-            let s = sddl(&p);
-            assert!(s.starts_with(&format!("O:{u}D:P")), "{}: {s}", p.display());
-            let dacl = &s[s.find("D:").unwrap() + 2..];
-            let mut aces: Vec<String> = dacl.split('(').skip(1).map(|a| format!("({a}")).collect();
-            aces.sort();
-            assert_eq!(aces, want, "{}: {s}", p.display());
-        }
-        let _ = std::fs::remove_dir_all(&base);
+    fn entries(s: &str) -> Vec<String> {
+        let dacl = &s[s.find("D:").unwrap() + 2..];
+        let mut v: Vec<String> = dacl
+            .split('(')
+            .skip(1)
+            .map(|a| format!("({a}").replace("ID;", ";"))
+            .collect();
+        v.sort();
+        v
     }
 
-    /// Like `chmod 700`: a folder of ours others can only read loses their entries; one others can
-    /// change is an error and keeps its DACL as found.
+    /// A new folder and the parents it creates are owned by this user and inherit what others
+    /// may read from where they are created; write access an inherited entry would give others
+    /// is taken out, and their read access stays.
     #[cfg(windows)]
     #[test]
-    fn an_existing_dir_is_tightened_only_when_others_can_just_read() {
+    fn a_new_dir_keeps_what_others_may_read_and_never_their_write() {
+        let u = user_sid();
+        let base = rdir("new-acl");
+        icacls(&base, &["/grant", "*S-1-5-32-545:(OI)(CI)(RX)"]);
+        let d = base.join("a").join("b");
+        create_private_dir(&d).unwrap();
+        for p in [base.join("a"), d.clone()] {
+            let s = sddl(&p);
+            assert!(!s.contains("D:P"), "{}: {s}", p.display());
+            assert!(s.contains("ID;0x1200a9;;;BU)"), "{}: {s}", p.display());
+        }
+        assert_eq!(
+            sync_gate_core::check_private_dir(&d).unwrap(),
+            sync_gate_core::DirState::OthersCanRead
+        );
+        // An entry that gives others write only to what is created inside.
+        let w = rdir("new-acl-io");
+        icacls(&w, &["/grant", "*S-1-5-32-545:(OI)(CI)(RX)"]);
+        icacls(&w, &["/grant", "*S-1-5-32-545:(OI)(CI)(IO)(M)"]);
+        let d = w.join("a").join("b");
+        create_private_dir(&d).unwrap();
+        for p in [w.join("a"), d.clone()] {
+            let s = sddl(&p);
+            assert!(s.starts_with(&format!("O:{u}")), "{}: {s}", p.display());
+            let bu: Vec<String> = entries(&s)
+                .into_iter()
+                .filter(|a| a.ends_with(";;;BU)"))
+                .collect();
+            assert_eq!(bu, ["(A;OICI;0x1200a9;;;BU)"], "{}: {s}", p.display());
+        }
+        std::fs::create_dir(d.join("c")).unwrap();
+        assert_eq!(
+            sync_gate_core::check_private_dir(&d.join("c")).unwrap(),
+            sync_gate_core::DirState::OthersCanRead
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&w);
+    }
+
+    /// A folder of ours others can only read is left as found; one others can change is an
+    /// error and keeps its DACL as found.
+    #[cfg(windows)]
+    #[test]
+    fn an_existing_dir_others_can_only_read_is_left_as_found() {
         let base = rdir("tighten-acl");
         let r = base.join("readable");
         std::fs::create_dir(&r).unwrap();
         icacls(&r, &["/grant", "*S-1-5-32-545:(OI)(CI)(RX)"]);
-        assert!(sddl(&r).contains(";;;BU)"), "{}", sddl(&r));
+        let before = sddl(&r);
+        assert!(before.contains(";;;BU)"), "{before}");
         create_private_dir(&r).unwrap();
-        let s = sddl(&r);
-        assert!(!s.contains(";;;BU)") && s.contains("D:P"), "{s}");
+        assert_eq!(sddl(&r), before);
         let w = base.join("writable");
         std::fs::create_dir(&w).unwrap();
         icacls(&w, &["/grant", "*S-1-5-32-545:(OI)(CI)(M)"]);

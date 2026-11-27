@@ -1,5 +1,5 @@
 //! The guest queue proven with the REAL `codex sandbox` in its three Windows modes (plan 3-S,
-//! Task 6): X1 to X6 (`elevated`), X9 (`unelevated`, F27), X10 (`mxc`), X11 (`unelevated`).
+//! Task 6): X1 to X6 and X12 (`elevated`), X9 (`unelevated`, F27), X10 (`mxc`), X11 (`unelevated`).
 //! X7, X8 and the pause parts of X10 and X11 live in `sync_gate_probe/tests`.
 //!
 //! All `#[ignore]`: they run only on request, with `SYNC_GATE_TEST_CODEX_SANDBOX=1` and `codex` on the
@@ -542,7 +542,6 @@ impl Ctx {
         std::fs::create_dir_all(c.work.join("proj").join(".git")).unwrap();
         std::fs::create_dir_all(c.work.join("proj").join("sub")).unwrap();
         std::fs::write(c.work.join("config.toml"), "").unwrap();
-        std::fs::write(c.tmp.join("config.toml"), "").unwrap();
         std::fs::copy(env!("CARGO_BIN_EXE_sync_gate"), c.tmp.join("sync_gate.exe")).unwrap();
         std::fs::copy(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/xuser/guest-probe.ps1"),
@@ -623,7 +622,11 @@ impl Ctx {
             .arg("--")
             .args(argv)
             .env("SYNC_GATE_SOCKET", &self.socket)
-            .env("SYNC_GATE_CONFIG", self.tmp.join("config.toml"))
+            // In a folder that does not exist: the defaults, with nothing to check.
+            .env(
+                "SYNC_GATE_CONFIG",
+                self.tmp.join("none").join("config.toml"),
+            )
             .env("SYNC_GATE_FORCE_HEAVY", "1")
             .env_remove("SYNC_GATE_DATA_DIR")
             .env_remove("SYNC_GATE_JOB")
@@ -1172,6 +1175,46 @@ fn x06_the_owner_is_unchanged() {
     assert_eq!(count_decisions(&s, "admitted #"), 1, "{:?}", s.decisions);
     assert_eq!(count_ended(&s), 1, "{:?}", s.decisions);
     assert!(!r.err.contains("continuing without queue"), "{}", r.err);
+    c.end();
+}
+
+/// X12. The shims folder as the installer leaves it, outside the sandbox's own folders, with what
+/// the sandbox may read inherited from the profile: a heavy command run in the sandbox with the
+/// shims first on the PATH finds the shim and goes through the queue.
+#[test]
+#[ignore]
+fn x12_shims_on_the_path_go_through_the_queue() {
+    let Some(c) = Ctx::begin("elevated") else {
+        return;
+    };
+    let acct = c.account.clone();
+    let r = run(c.owner_fg(&["shims", "install"]));
+    assert_eq!(r.code, 0, "{}{}", r.out, r.err);
+    let shims = c.data().join("shims");
+    // A stand-in for the real `go`, after the shims on the PATH: prints the account it runs as.
+    let sys = PathBuf::from(std::env::var("SystemRoot").unwrap()).join("System32");
+    let bin = c.work.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::copy(sys.join("whoami.exe"), bin.join("go.exe")).unwrap();
+    let path = std::env::join_paths([&shims, &bin, &sys]).unwrap();
+    let d = c.start(&[&acct]);
+    let cmd = sys.join("cmd.exe");
+    let mut sbx = c.sbx(&[cmd.to_str().unwrap(), "/d", "/c", "go"]);
+    sbx.env("PATH", &path);
+    let r = run(sbx);
+    let s = c.status();
+    d.shutdown();
+    println!(
+        "X12 exit={} stdout={:?} stderr={:?} decisions={:?}",
+        r.code,
+        r.out.trim(),
+        r.err.trim(),
+        s.decisions
+    );
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert!(r.out.to_lowercase().contains(&acct), "{}", r.out);
+    assert!(!r.err.contains("continuing without queue"), "{}", r.err);
+    assert_eq!(count_decisions(&s, "admitted #"), 1, "{:?}", s.decisions);
     c.end();
 }
 

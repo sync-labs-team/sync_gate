@@ -15,6 +15,21 @@ pub fn data_dir() -> Option<PathBuf> {
         })
 }
 
+/// Reads a `config.toml`, which can name commands to run. Windows: its folder and every ancestor
+/// pass `check_private_dir` first; a missing folder reads as a missing file.
+pub fn read_config(path: &Path) -> std::io::Result<String> {
+    #[cfg(windows)]
+    {
+        let path = std::path::absolute(path)?;
+        if let Some(dir) = path.parent()
+            && crate::check_private_dir(dir)? == crate::DirState::Missing
+        {
+            return Err(std::io::ErrorKind::NotFound.into());
+        }
+    }
+    std::fs::read_to_string(path)
+}
+
 /// Folder of the PATH shims: `<SYNC_GATE_DATA_DIR>/shims`, else `shims` in the per-user local data folder.
 pub fn shims_dir() -> Option<PathBuf> {
     shims_dir_from(

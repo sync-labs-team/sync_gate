@@ -20,7 +20,7 @@ fn load_config() -> Result<Config, (String, ConfigLoadError)> {
             None => return Ok(Config::default()),
         },
     };
-    match std::fs::read_to_string(&path) {
+    match sync_gate_core::read_config(&path) {
         Ok(text) => Config::from_toml(&text).map_err(|e| {
             let detail = format!("invalid {}: {e}", path.display());
             (detail, ConfigLoadError::parse(&text, &e))
