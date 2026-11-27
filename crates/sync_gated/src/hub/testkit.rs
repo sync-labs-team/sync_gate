@@ -178,6 +178,11 @@ pub struct FakeChild {
 }
 
 impl FakeChild {
+    /// True when the hub writes nothing to the child within `wait`.
+    pub fn stays_silent(&self, wait: Duration) -> bool {
+        self.input.recv_timeout(wait).is_err()
+    }
+
     pub fn next(&self) -> Value {
         recv_json(&self.input, "the hub (child stdin)")
     }

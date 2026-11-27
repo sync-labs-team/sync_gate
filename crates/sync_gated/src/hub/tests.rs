@@ -1425,6 +1425,33 @@ fn a_hub_queued_request_keeps_its_first_deadline() {
 }
 
 #[test]
+fn an_expired_hub_queued_request_never_reaches_the_server() {
+    let l = Arc::new(FakeLauncher::default());
+    let mut cfg = config();
+    if let Some(d) = cfg.mcp.get_mut("docs") {
+        d.max_instances = 3;
+        d.max_in_flight = 1;
+        d.request_timeout_secs = 2;
+    }
+    let hub = Hub::new(&cfg, l.clone(), None, None);
+    let (mut c, mut child) = pool_client(&hub, &l, false);
+    let seen = overflow(&hub, &mut c, &child, 1..=2, 1);
+    // shortcut: real sleep (the hub reads Instant::now() per event), 0.5 s past the deadline and
+    // no tick; swap for an injected clock if the hub ever takes one.
+    std::thread::sleep(Duration::from_millis(2500));
+    reply_to(&mut child, &seen[0]);
+    assert_eq!(c.recv()["id"], 1);
+    let e = c.recv();
+    assert_eq!(e["id"], 2);
+    assert_eq!(e["error"]["code"], -32001);
+    assert!(
+        child.stays_silent(Duration::from_millis(200)),
+        "the expired request reached the server"
+    );
+    hub.shutdown();
+}
+
+#[test]
 fn the_hub_queue_is_bounded_per_client() {
     let l = Arc::new(FakeLauncher::default());
     let hub = pool_hub(&l, 3, 1);

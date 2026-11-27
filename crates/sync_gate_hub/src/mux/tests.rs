@@ -621,6 +621,21 @@ fn queued_request_times_out_when_child_never_starts() {
 }
 
 #[test]
+fn an_expired_queued_request_is_answered_not_served_when_the_child_gets_ready() {
+    let mut m = Mux::new("docs", T);
+    let now = Instant::now();
+    m.client_attached(1);
+    assert!(req(&mut m, 1, json!(3), "tools/list", now).is_empty());
+    // ready exactly at the deadline, before any tick has swept the queue
+    let out = start_legacy(&mut m, now + T, "s");
+    assert!(!methods(&out).contains(&json!("tools/list")));
+    let e = &to_client(&out, 1)[0];
+    assert_eq!(e["id"], 3);
+    assert_eq!(e["error"]["code"], -32001);
+    assert!(m.tick(now + T * 2).is_empty(), "answered once only");
+}
+
+#[test]
 fn a_queued_request_keeps_its_first_deadline() {
     let mut m = Mux::new("docs", T);
     let now = Instant::now();

@@ -1526,6 +1526,8 @@ impl Inner {
     /// After any event that may have made room or changed a handshake: serves the hub queue in
     /// order, shares handshakes across units, and tracks how long each unit has been quiet.
     fn settle(&self, server: &str, g: &mut Inst, now: Instant) {
+        // An expired request is answered here, never handed to a unit.
+        self.expire_queue(server, g, now);
         let (_, max_in_flight) = self.limits(server);
         let mut i = 0;
         while i < g.queue.len() {

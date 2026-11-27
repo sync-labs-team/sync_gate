@@ -259,7 +259,7 @@ impl Mux {
 
     /// The child answered `server/discover`: no `initialize`. Legacy clients get
     /// an `initialize` result built from the `DiscoverResult`.
-    fn set_stateless(&mut self, discover: Value, out: &mut Vec<Out>) {
+    fn set_stateless(&mut self, discover: Value, now: Instant, out: &mut Vec<Out>) {
         self.reset_subscriptions();
         let mut discover = discover;
         // Advertise only what the hub serves: it refuses subscriptions and sends no list_changed here.
@@ -291,7 +291,7 @@ impl Mux {
         self.discover = Some(discover);
         self.era = Some(Era::Stateless);
         self.phase = Phase::Stateless;
-        self.serve_queued(out);
+        self.serve_queued(now, out);
     }
 
     /// Entries from an earlier legacy child can never be restored or undone now.
@@ -356,11 +356,11 @@ impl Mux {
             );
             out.push(Out::ToChild(msg.to_string()));
         }
-        self.serve_queued(out);
+        self.serve_queued(now, out);
     }
 
     /// Serves, in order, what clients queued while the child was not ready.
-    fn serve_queued(&mut self, out: &mut Vec<Out>) {
+    fn serve_queued(&mut self, now: Instant, out: &mut Vec<Out>) {
         let ids: Vec<ClientId> = self.clients.keys().copied().collect();
         for c in ids {
             let queued = match self.clients.get_mut(&c) {
@@ -371,7 +371,14 @@ impl Mux {
                 None => continue,
             };
             for q in queued {
-                if let Kind::Request { id, method } = classify(&q.msg) {
+                if now >= q.deadline {
+                    // Past its deadline but not yet swept by a tick: the server never sees it.
+                    push_client(
+                        out,
+                        c,
+                        error_response(&q.msg["id"], -32001, "request timed out"),
+                    );
+                } else if let Kind::Request { id, method } = classify(&q.msg) {
                     self.serve(c, id, &method, q.msg, q.deadline, out);
                 }
             }
@@ -933,7 +940,7 @@ impl Mux {
                     .and_then(Value::as_array);
                 if let Some(vs) = versions {
                     if vs.iter().any(|x| x == MODERN_VERSION) {
-                        self.set_stateless(v["result"].take(), out);
+                        self.set_stateless(v["result"].take(), now, out);
                     } else {
                         self.set_unsupported(out);
                     }
