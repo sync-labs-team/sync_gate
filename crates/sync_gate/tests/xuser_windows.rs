@@ -525,10 +525,11 @@ impl Ctx {
         let mut c = Ctx {
             mode,
             tmp: tmp_dir(),
-            work: std::env::temp_dir()
-                .join("trabalho")
-                .join("sync_gate")
-                .join(format!("xw-data-{pid}")),
+            // Not under the temporary folder: the sandbox is allowed to change that one, so the
+            // daemon refuses a data folder there.
+            work: PathBuf::from(std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA"))
+                .join("sync_gate-xw")
+                .join(format!("data-{pid}")),
             socket: format!(
                 "sync_gate-xw-{pid}-{}",
                 COUNTER.fetch_add(1, Ordering::SeqCst)
@@ -713,10 +714,15 @@ impl Ctx {
             "param([string]$Stop)\nwhile (-not (Test-Path $Stop)) { Start-Sleep -Milliseconds 100 }\n",
         )
         .unwrap();
+        // The key is the program and the folder it runs in (the script after `-File` is not
+        // part of it): a folder named after the marker puts the marker in the key.
+        let cwd = self.work.join(&marker);
+        std::fs::create_dir_all(&cwd).unwrap();
         let mut c = self.owner_fg(&["run", "--"]);
         c.args(["powershell", "-NoProfile", "-File"])
             .arg(&script)
-            .arg(&stop);
+            .arg(&stop)
+            .current_dir(&cwd);
         let job = OwnerJob {
             live: Some(Live::spawn_for(c, LONG_BOUND)),
             stop,
