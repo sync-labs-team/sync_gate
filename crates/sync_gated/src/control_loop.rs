@@ -300,14 +300,17 @@ impl<C: Control> Core<C> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Free memory (available plus reclaimable, as the resume rule counts it) and the reserve
+    /// Free memory (available plus reclaimable, as the resume rule counts it, minus the unused part
+    /// of running jobs' reservations) and the reserve
     /// (`total * reserve_fraction`) from the last snapshot; `None` while there is no data.
     pub fn memory(&self) -> Option<(u64, u64)> {
         let st = self.lock();
         let s = st.snapshot;
         (s.total > 0).then(|| {
             let reserve = (s.total as f64 * st.cfg.reserve_fraction) as u64;
-            (s.available.saturating_add(s.reclaimable), reserve)
+            // what jobs admitted since the snapshot reserved but do not use yet is not free
+            let free = s.available.saturating_add(s.reclaimable);
+            (free.saturating_sub(st.running_reserved()), reserve)
         })
     }
 

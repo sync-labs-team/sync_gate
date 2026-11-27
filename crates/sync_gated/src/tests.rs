@@ -2289,6 +2289,25 @@ fn memory_for_the_hub_comes_from_the_last_snapshot() {
     assert_eq!(c.memory(), Some((4 * GIB, reserve as u64)));
 }
 
+/// A job the core just admitted holds its reservation but the snapshot has not seen it yet:
+/// the hub must not hand that memory to its own servers as well.
+#[test]
+fn hub_memory_excludes_what_a_just_admitted_job_reserved() {
+    let (c, _) = core(Config::default());
+    let mut m = FakeMeasure {
+        snap: free(8 * GIB),
+        ..Default::default()
+    };
+    let t0 = Instant::now();
+    c.tick(&mut m, t0);
+    let before = c.memory().unwrap().0;
+    let id = admitted(&acquire(&c, "cargo build", t0));
+    c.handle(Request::Started { id, pid: 100 }, t0);
+    let reserved = c.estimate(&sig("cargo build"));
+    assert!(reserved > 0);
+    assert_eq!(c.memory().unwrap().0, before - reserved);
+}
+
 /// Records, at each leftover check, how many `Control` calls had already happened.
 struct OrderLauncher {
     ctl: FakeControl,

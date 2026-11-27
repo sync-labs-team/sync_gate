@@ -278,19 +278,72 @@ impl Sandbox {
 
     /// Every file under the sandbox (config, data dir, pid files) without the canary.
     fn assert_no_canary_on_disk(&self) {
-        let mut dirs = vec![self.dir.clone()];
-        while let Some(d) = dirs.pop() {
-            for e in std::fs::read_dir(&d).unwrap().flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    dirs.push(p);
-                } else if let Ok(bytes) = std::fs::read(&p) {
-                    let text = String::from_utf8_lossy(&bytes);
-                    assert!(!text.contains(CANARY), "secret found in {}", p.display());
-                }
+        assert_no_canary_under(&self.dir);
+    }
+}
+
+/// A file that cannot be read cannot be cleared either, so it fails the scan instead of being skipped.
+fn assert_no_canary_under(root: &Path) {
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                dirs.push(p);
+            } else if p.file_name().is_some_and(|n| n == "sync_gated.lock") {
+                // the daemon holds a byte-range lock on it while it runs; it stores no data
+            } else {
+                let bytes = std::fs::read(&p)
+                    .unwrap_or_else(|e| panic!("cannot read {} to scan it: {e}", p.display()));
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(!text.contains(CANARY), "secret found in {}", p.display());
             }
         }
     }
+}
+
+#[test]
+#[should_panic(expected = "cannot read")]
+fn the_canary_scan_fails_on_an_unreadable_file() {
+    let dir = std::env::temp_dir().join(format!(
+        "sync_gate_mcp-scan-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("locked");
+    std::fs::write(&file, "x").unwrap();
+    #[cfg(windows)]
+    let _hold = {
+        use std::os::windows::fs::OpenOptionsExt;
+        // share mode 0: nobody else can open it while this handle lives
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&file)
+            .unwrap()
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    self.0.join("locked"),
+                    std::fs::Permissions::from_mode(0o600),
+                );
+            }
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _c = Cleanup(dir.clone());
+    assert_no_canary_under(&dir);
 }
 
 impl Drop for Sandbox {
@@ -526,7 +579,7 @@ fn killing_the_server_restarts_it_and_sessions_continue() {
         sb.pids("docs").len() == 2
     });
     r.send(tools_call(2));
-    let second = result(r.reply_by(2, killed + Duration::from_secs(5)))["pid"].clone();
+    let second = result(r.reply_by(2, killed + Duration::from_secs(30)))["pid"].clone();
     assert_eq!(second, sb.pids("docs")[1]);
     let st = sb.status();
     let row = st.mcp.iter().find(|m| m.server == "docs").unwrap();

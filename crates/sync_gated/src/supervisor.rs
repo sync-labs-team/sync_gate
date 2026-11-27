@@ -154,14 +154,21 @@ pub fn stop_own(
 
 /// Daemon start: stop what a previous run left behind. Entries that still match pid + start
 /// time + exe path are terminated (their stdin pipe died with the old daemon); the rest are
-/// forgotten (an unreadable exe is no match). Returns how many were terminated.
+/// forgotten (an unreadable exe is no match); one that cannot be stopped keeps its row. Returns
+/// how many were terminated.
 pub fn reap_leftovers(l: &dyn Launcher, reg: &mut Registry) -> usize {
     let mut stopped = 0;
     for (name, pid, start_time, exe) in reg.leftovers() {
         if l.is_alive(pid, start_time) && l.exe_of(pid).is_some_and(|e| e == exe) {
             match l.terminate(pid, start_time) {
                 Ok(()) => stopped += 1,
-                Err(e) => eprintln!("sync_gated: cannot stop leftover {name} (pid {pid}): {e}"),
+                // refused as a target (pid 0, 1, ours): no retry will ever work
+                Err(e) if e.kind() == io::ErrorKind::InvalidInput => {}
+                Err(e) => {
+                    // keep the row: the next start tries again
+                    eprintln!("sync_gated: cannot stop leftover {name} (pid {pid}): {e}");
+                    continue;
+                }
             }
         }
         reg.forget(pid);
@@ -1648,6 +1655,8 @@ mod tests {
         only: Vec<u32>,
         /// What `exe_of` answers per pid.
         exes: BTreeMap<u32, PathBuf>,
+        /// Pids `terminate` refuses to stop.
+        stuck: Vec<u32>,
     }
     struct FakeStdin(Log, Arc<Mutex<bool>>, bool);
     impl Write for FakeStdin {
@@ -1674,6 +1683,7 @@ mod tests {
                 exit_on_close,
                 only: Vec::new(),
                 exes: BTreeMap::new(),
+                stuck: Vec::new(),
             }
         }
         fn stdin(&self) -> Option<Box<dyn Write + Send>> {
@@ -1708,6 +1718,9 @@ mod tests {
         }
         fn terminate(&self, pid: u32, _: u64) -> io::Result<()> {
             self.log.lock().unwrap().push(format!("terminate {pid}"));
+            if self.stuck.contains(&pid) {
+                return Err(io::Error::other("access denied"));
+            }
             Ok(())
         }
         fn exe_of(&self, pid: u32) -> Option<PathBuf> {
@@ -1788,6 +1801,27 @@ mod tests {
         std::fs::write(&path, "not json").unwrap();
         assert!(Registry::load(&path).leftovers().is_empty());
         assert!(dir.join("services.json.bad").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A leftover that is the same process but cannot be stopped keeps its row, so the next
+    /// daemon start tries again; one that is no longer the same process is forgotten.
+    #[test]
+    fn a_leftover_that_cannot_be_stopped_keeps_its_row() {
+        let dir = temp_dir("stuck-reg");
+        let path = dir.join("services.json");
+        let mut reg = Registry::load(&path);
+        reg.record("a", 10, 1, Path::new("/bin/a"));
+        reg.record("b", 20, 1, Path::new("/bin/b"));
+        let mut f = Fake::new(false, false);
+        f.only = vec![10, 20];
+        f.exes.insert(10, "/bin/a".into());
+        f.exes.insert(20, "/somewhere/else".into());
+        f.stuck = vec![10];
+        assert_eq!(reap_leftovers(&f, &mut reg), 0);
+        let left: Vec<_> = Registry::load(&path).leftovers();
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].1, 10);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
