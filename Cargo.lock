@@ -518,7 +518,7 @@ dependencies = [
 
 [[package]]
 name = "sync_gate"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "ctrlc",
@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "sync_gate_core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "directories",
  "interprocess",
@@ -551,7 +551,7 @@ dependencies = [
 
 [[package]]
 name = "sync_gate_hub"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde_json",
  "sync_gate_core",
@@ -559,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "sync_gate_probe"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "nix",
  "nvml-wrapper",
@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "sync_gate_shim"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ctrlc",
  "directories",
@@ -588,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "sync_gated"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ctrlc",
  "directories",
@@ -877,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
