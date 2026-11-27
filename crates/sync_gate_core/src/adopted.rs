@@ -55,19 +55,19 @@ pub struct Adopted {
 
 pub const RECORD: &str = "mcp-adopted.json";
 
-/// Unix: `data_dir` (and every ancestor) through check_private_dir, then the record is opened
+/// `data_dir` (and every ancestor) through check_private_dir; then, Unix: the record is opened
 /// without following a link and checked on the opened file, which is the one read
-/// (open_private_file); Windows: no check (profile ACL, as the pendings). Missing → empty.
+/// (open_private_file); Windows: read by path, which nobody else can swap. Missing → empty.
 /// Refused → Err. A parse error names a category and a position, never the file's text.
 pub fn read_adopted(data_dir: &Path) -> io::Result<Adopted> {
     let path = data_dir.join(RECORD);
+    if crate::check_private_dir(data_dir)? == crate::DirState::Missing {
+        return Ok(Adopted::default());
+    }
     #[cfg(unix)]
     let bytes = {
-        use crate::{DirState, check_private_dir, open_private_file};
+        use crate::open_private_file;
         use std::io::Read;
-        if check_private_dir(data_dir)? == DirState::Missing {
-            return Ok(Adopted::default());
-        }
         let mut bytes = Vec::new();
         match open_private_file(&path) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Adopted::default()),
@@ -150,6 +150,29 @@ mod tests {
         let r = read_adopted(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(r.unwrap().entries.is_empty());
+    }
+
+    /// Windows: the record is read only from a folder nobody else can change. Control: the same
+    /// record before the folder is opened to everyone.
+    #[cfg(windows)]
+    #[test]
+    fn read_refuses_a_record_in_a_folder_others_can_write() {
+        let dir = std::env::temp_dir().join(format!("fg-adopted-acl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(RECORD), br#"{"version":1,"entries":[]}"#).unwrap();
+        assert_eq!(read_adopted(&dir).unwrap().version, 1);
+        let out = std::process::Command::new("icacls")
+            .arg(&dir)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)(M)"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "icacls: {out:?}");
+        let r = read_adopted(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let e = r.unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        assert!(e.to_string().contains("writable by other users"), "{e}");
     }
 
     #[cfg(unix)]

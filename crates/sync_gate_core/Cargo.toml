@@ -11,7 +11,7 @@ rust-version.workspace = true
 
 [features]
 # Shared local-socket name conversion (pulls in interprocess).
-ipc = ["dep:interprocess", "dep:windows-sys"]
+ipc = ["dep:interprocess"]
 
 [dependencies]
 directories = "6"
@@ -29,12 +29,13 @@ windows-sys = { workspace = true, features = [
     "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Pipes",
     "Win32_System_Threading",
     "Win32_UI_Shell",
-], optional = true }
+] }
 
 [target.'cfg(windows)'.dev-dependencies]
 # The tests give their pipes an explicit descriptor (owner named, as the daemon does).

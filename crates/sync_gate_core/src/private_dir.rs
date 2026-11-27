@@ -1,13 +1,27 @@
-//! Private-folder checks for Unix: who owns a folder, who can write to it and to its ancestors.
-//! Only the owner (or root) can swap an entry of a folder they alone can write to, so a folder
-//! that passes `check_private_dir` cannot be replaced by another user (`inode(7)`, `rename(3p)`).
+//! Private-folder checks: who owns a folder, who can write to it and to its ancestors.
+//! Unix: only the owner (or root) can swap an entry of a folder they alone can write to, so a
+//! folder that passes `check_private_dir` cannot be replaced by another user (`inode(7)`,
+//! `rename(3p)`). Windows: the same rules in owners and DACLs (`private_dir/win.rs`); only the
+//! folders are checked there, not each file.
+#[cfg(unix)]
 use nix::unistd::{getegid, geteuid};
+#[cfg(unix)]
 use std::collections::VecDeque;
+#[cfg(unix)]
 use std::fs::Metadata;
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::{Component, PathBuf};
 
+#[cfg(windows)]
+mod win;
+#[cfg(windows)]
+pub use win::{check_private_dir, create_private_dir};
+
+#[cfg(unix)]
 const STICKY: u32 = 0o1000;
 
 /// What `check_private_dir` found, when the folder is safe to use.
@@ -26,7 +40,36 @@ fn deny(path: &Path, why: &str) -> io::Error {
     )
 }
 
+/// `IsReparseTagNameSurrogate`: the tag's bit 0x20000000 (symlink, mount point/junction...).
+pub fn is_name_surrogate(tag: u32) -> bool {
+    tag & 0x2000_0000 != 0
+}
+
+/// Windows: (attributes, reparse tag) of an open handle.
+#[cfg(windows)]
+pub fn tag_info(f: &std::fs::File) -> Option<(u32, u32)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_TAG_INFO, FileAttributeTagInfo, GetFileInformationByHandleEx,
+    };
+    let mut i = FILE_ATTRIBUTE_TAG_INFO {
+        FileAttributes: 0,
+        ReparseTag: 0,
+    };
+    // SAFETY: a valid handle and a buffer of the size passed.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            f.as_raw_handle() as _,
+            FileAttributeTagInfo,
+            (&raw mut i).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    };
+    (ok != 0).then_some((i.FileAttributes, i.ReparseTag))
+}
+
 /// An ancestor must not let another user replace what is under it.
+#[cfg(unix)]
 fn ancestor_ok(m: &Metadata) -> bool {
     let (euid, egid) = (geteuid().as_raw(), getegid().as_raw());
     let (mode, sticky) = (m.mode(), m.mode() & STICKY != 0);
@@ -38,6 +81,7 @@ fn ancestor_ok(m: &Metadata) -> bool {
 /// Walks `dir` component by component the way the kernel does, checking every folder or link
 /// entry it goes through (each link expansion included) except the last one, which is returned
 /// unfollowed (`None` when it does not exist). A trailing slash cannot make us follow a final link.
+#[cfg(unix)]
 fn walk(dir: &Path) -> io::Result<Option<Metadata>> {
     let mut queue = VecDeque::new();
     for c in dir.components() {
@@ -105,6 +149,7 @@ fn walk(dir: &Path) -> io::Result<Option<Metadata>> {
 
 /// Checks that `dir` (absolute) is a folder only this user can change, with ancestors nobody
 /// else can change either. `Missing` is not an error: the caller creates it.
+#[cfg(unix)]
 pub fn check_private_dir(dir: &Path) -> io::Result<DirState> {
     if !dir.is_absolute() {
         return Err(io::Error::new(
@@ -139,6 +184,7 @@ pub fn check_private_dir(dir: &Path) -> io::Result<DirState> {
 
 /// Checks a regular file of ours that nobody else can write or re-link. Its folder is the
 /// caller's job (it already passed `check_private_dir`).
+#[cfg(unix)]
 pub fn check_private_file(path: &Path) -> io::Result<()> {
     let m = path.symlink_metadata()?;
     if m.file_type().is_symlink() {
@@ -162,6 +208,7 @@ pub fn check_private_file(path: &Path) -> io::Result<()> {
 /// Opens a regular file of ours that nobody else can write or re-link, without following a final
 /// link, and checks it on the opened descriptor: what is read is what was checked, whatever
 /// happens to the path afterwards. `NotFound` when absent. The folder is the caller's job.
+#[cfg(unix)]
 pub fn open_private_file(path: &Path) -> io::Result<std::fs::File> {
     use nix::fcntl::{OFlag, open};
     // O_NONBLOCK: opening a FIFO must not wait for a writer; a regular file reads the same.
@@ -188,10 +235,10 @@ pub fn open_private_file(path: &Path) -> io::Result<std::fs::File> {
 }
 
 /// A scratch folder for tests, removed on drop.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) struct Scratch(pub PathBuf);
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Scratch {
     pub fn new(tag: &str) -> Self {
         use std::os::unix::fs::PermissionsExt;
@@ -214,14 +261,14 @@ impl Scratch {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};

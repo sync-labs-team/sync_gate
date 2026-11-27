@@ -40,6 +40,15 @@ jobs:
         run: echo "SYNC_GATE_TEST_PG_BIN=$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)" >> "$GITHUB_ENV"
       - if: runner.os == 'Windows'
         run: echo "SYNC_GATE_TEST_PG_BIN=$env:PGBIN" >> $env:GITHUB_ENV
+      # The tests' data folders live in the temporary folder, which must pass the data folder
+      # check (no other account or sandbox can change it): one inside the user profile, with a
+      # short name (the PostgreSQL socket paths under it must stay within 103 bytes).
+      - if: runner.os == 'Windows'
+        run: |
+          $t = Join-Path $env:LOCALAPPDATA 'sgt'
+          New-Item -ItemType Directory -Force $t | Out-Null
+          echo "TMP=$t" >> $env:GITHUB_ENV
+          echo "TEMP=$t" >> $env:GITHUB_ENV
       - run: cargo test --workspace --no-fail-fast
 
   test-macos:

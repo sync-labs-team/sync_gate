@@ -130,6 +130,8 @@ fn load(dir: &Path) -> io::Result<Option<Manifest>> {
             p.display()
         ))
     };
+    // Windows: the folder is the check (`check_private_dir` by both callers); nobody else can
+    // add or replace a file in it.
     #[cfg(unix)]
     sync_gate_core::check_private_file(&p).map_err(|e| bad(e.to_string()))?;
     let m: Manifest =
@@ -752,6 +754,8 @@ fn install_os(dir: &Path, exe: &Path, old: Option<Manifest>) -> io::Result<Insta
 /// deleted keeps the manifest (it is what makes the folder skipped when a real program is
 /// looked up) and makes this an error naming what is left.
 pub fn remove(dir: &Path) -> io::Result<usize> {
+    // The manifest names what gets deleted: trusted only in a folder nobody else can change.
+    sync_gate_core::check_private_dir(dir)?;
     let Some(m) = load(dir)? else {
         return Ok(0);
     };

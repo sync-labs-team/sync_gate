@@ -132,7 +132,6 @@ fn read_env_file(file: &Path) -> Option<String> {
 }
 
 fn shims_active(dir: &Path) -> bool {
-    #[cfg(unix)]
     if !matches!(
         sync_gate_core::check_private_dir(dir),
         Ok(sync_gate_core::DirState::Private | sync_gate_core::DirState::OthersCanRead)

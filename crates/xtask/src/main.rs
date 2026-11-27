@@ -242,6 +242,15 @@ fn host_steps() -> Vec<Step> {
     // Under `CI` the tests that need a real PostgreSQL fail instead of skipping, and the heavy
     // end-to-end tests run.
     test.1.env("CI", "1");
+    // Windows: the tests' data folders live in the temporary folder, which must pass the data
+    // folder check; `%TEMP%` may not (a sandbox can be granted changes there). A short name: the
+    // PostgreSQL socket paths under it must stay within 103 bytes.
+    #[cfg(windows)]
+    if let Some(local) = env::var_os("LOCALAPPDATA") {
+        let tmp = Path::new(&local).join("sgt");
+        let _ = std::fs::create_dir_all(&tmp);
+        test.1.env("TMP", &tmp).env("TEMP", &tmp);
+    }
     steps.push(test);
     steps
 }

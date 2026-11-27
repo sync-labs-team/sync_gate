@@ -154,7 +154,6 @@ fn sweep_with(
     alive: impl Fn(u32) -> Option<bool>,
     live: impl Fn(u64) -> bool,
 ) -> usize {
-    #[cfg(unix)]
     {
         use sync_gate_core::DirState;
         if !matches!(
@@ -571,16 +570,14 @@ mod tests {
     }
 
     /// T1.10: a folder other users can write is never swept.
-    #[cfg(unix)]
     #[test]
     fn an_unsafe_pending_folder_is_not_swept() {
-        use std::os::unix::fs::PermissionsExt;
         let d = claim_dir("unsafe");
         let p = put_aged(&d.join("1.json"), 26 * HOUR);
-        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o777)).unwrap();
+        crate::recovery::others_write(&d, true);
         assert_eq!(sweep_with(&d, PENDING_TTL, DEAD, NO_LIVE), 0);
         assert!(p.exists());
-        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::recovery::others_write(&d, false);
         assert_eq!(sweep_with(&d, PENDING_TTL, DEAD, NO_LIVE), 1);
         assert!(!p.exists());
         let _ = std::fs::remove_dir_all(&d);

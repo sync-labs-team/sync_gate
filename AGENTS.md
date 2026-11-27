@@ -14,6 +14,9 @@ Repository: https://github.com/sync-labs-team/sync_gate
   the situation you were in, what would have helped, and why.
 - **Contribute changes** through pull requests; plans live outside this repository, so describe the change in an
   issue first. Add a test that fails without the change, and keep `cargo xtask ci` green.
+  On Windows, run the tests through `cargo xtask ci`, or with `TMP` and `TEMP` set to a folder
+  inside your profile: the tests' data folders live there, and a data folder that another account
+  or a sandbox can change is refused.
 
 ## Public repository
 

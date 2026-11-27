@@ -121,9 +121,10 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Creates `dir` and missing parents, readable only by the user (0700 on Unix). On Unix an
-/// existing folder is checked first: one others can write (or a link, or another owner's) is an
-/// error and is left as found; one others can only read is tightened to 0700.
+/// Creates `dir` and missing parents, readable only by the user (0700 on Unix; on Windows a
+/// protected DACL of the user, SYSTEM and Administrators). An existing folder is checked first:
+/// one others can write (or a link, or another owner's) is an error and is left as found; one
+/// others can only read is tightened (0700; Windows: that DACL).
 pub fn create_private_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -142,8 +143,8 @@ pub fn create_private_dir(dir: &Path) -> io::Result<()> {
             .create(dir)?;
         check_private_dir(dir).map(|_| ())
     }
-    #[cfg(not(unix))]
-    std::fs::DirBuilder::new().recursive(true).create(dir)
+    #[cfg(windows)]
+    sync_gate_core::private_dir::create_private_dir(dir)
 }
 
 /// Writes a new temporary file beside `path`, fsyncs it, then renames it over `path`, so a crash
@@ -419,7 +420,6 @@ pub fn recover_as_owner(dir: &Path) -> RecoveryOutcome {
 pub fn recover_as_owner_with(dir: &Path, r: &mut impl Recover) -> RecoveryOutcome {
     // Records are read by path after a file check, which holds only if nobody else can change the
     // folder or its ancestors: refuse before opening the lock or reading anything.
-    #[cfg(unix)]
     {
         use sync_gate_core::{DirState, check_private_dir};
         let nothing = RecoveryOutcome::Done {
@@ -480,6 +480,32 @@ pub fn still_ours(
         .into_iter()
         .filter(|u| u.start_time != 0 && start(u.pid) == Some(u.start_time))
         .collect()
+}
+
+/// Tests: lets every user change the folder `p` (`on`), or takes that back: mode 0777/0700 on
+/// Unix, an inheritable Modify entry for Everyone on Windows.
+#[cfg(test)]
+pub(crate) fn others_write(p: &Path, on: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if on { 0o777 } else { 0o700 };
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let args = if on {
+            ["/grant", "*S-1-1-0:(OI)(CI)(M)"]
+        } else {
+            ["/remove:g", "*S-1-1-0"]
+        };
+        let out = std::process::Command::new("icacls")
+            .arg(p)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "icacls: {out:?}");
+    }
 }
 
 #[cfg(test)]
@@ -824,22 +850,23 @@ mod tests {
 
     /// A folder others can write is never trusted, even with a legitimate 0600 record in it:
     /// nothing is read, resumed or written. Control: the same with the folder 0700.
-    #[cfg(unix)]
     #[test]
     fn cli_recovery_refuses_a_folder_others_can_write() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = rdir("unsafe-dir");
         let path = dir.join(PAUSED_FILE);
         let text = r#"{"units":[[10,11,100]],"intents":[]}"#;
         std::fs::write(&path, text).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let chmod = |mode| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let reads = || RECORD_READS.with(std::cell::Cell::get);
         let mut fake = Fake {
             starts: [(10, 100)].into(),
             ..Fake::default()
         };
-        chmod(0o777).unwrap();
+        others_write(&dir, true);
         let before = reads();
         let outcome = recover_as_owner_with(&dir, &mut fake);
         assert!(
@@ -849,10 +876,11 @@ mod tests {
         assert_eq!(reads(), before, "the record was read");
         assert!(fake.resumed.is_empty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
-        chmod(0o700).unwrap();
+        others_write(&dir, false);
         recover_as_owner_with(&dir, &mut fake);
         assert_eq!(fake.resumed, vec![fu(10, 100)]);
-        assert_eq!(reads(), before + 1);
+        // Windows also counts the absent guest record (no file check refuses it first).
+        assert!(reads() > before, "the record was not read");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1199,6 +1227,132 @@ mod tests {
         chmod(&d, 0o777);
         assert!(create_private_dir(&d).is_err());
         assert_eq!(mode_of(&d), 0o777);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The descriptor of `p` in SDDL: owner and DACL.
+    #[cfg(windows)]
+    fn sddl(p: &Path) -> String {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+            SDDL_REVISION_1, SE_FILE_OBJECT,
+        };
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        };
+        let wide: Vec<u16> = p.as_os_str().encode_wide().chain([0]).collect();
+        let what = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: a NUL-terminated path; the out pointers are valid; `sd` is freed below.
+        let err = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                what,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        assert_eq!(err, 0, "GetNamedSecurityInfoW {}", p.display());
+        let (mut text, mut len) = (std::ptr::null_mut(), 0u32);
+        // SAFETY: `sd` is the valid descriptor read above; `text` is freed below.
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                sd,
+                SDDL_REVISION_1,
+                what,
+                &mut text,
+                &mut len,
+            )
+        };
+        assert_ne!(ok, 0);
+        // SAFETY: `text` holds `len` UTF-16 units.
+        let s = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len as usize) });
+        // SAFETY: both were allocated by the calls above and are freed once.
+        unsafe {
+            LocalFree(text.cast());
+            LocalFree(sd);
+        }
+        s.trim_end_matches('\0').to_owned()
+    }
+
+    /// This user's SID, as `whoami` prints it.
+    #[cfg(windows)]
+    fn user_sid() -> String {
+        let out = std::process::Command::new("whoami")
+            .args(["/user", "/fo", "csv", "/nh"])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.trim()
+            .rsplit(',')
+            .next()
+            .unwrap()
+            .trim_matches('"')
+            .to_owned()
+    }
+
+    #[cfg(windows)]
+    fn icacls(p: &Path, args: &[&str]) {
+        let out = std::process::Command::new("icacls")
+            .arg(p)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "icacls: {out:?}");
+    }
+
+    /// A new folder and the parents it creates: owned by the user, with a protected DACL of
+    /// exactly the user, SYSTEM and Administrators (inherited by what is created inside).
+    #[cfg(windows)]
+    #[test]
+    fn a_new_dir_gets_a_protected_dacl_of_the_user_system_and_administrators() {
+        let base = rdir("new-acl");
+        let d = base.join("a").join("b");
+        create_private_dir(&d).unwrap();
+        let u = user_sid();
+        let mut want = vec![
+            format!("(A;OICI;FA;;;{u})"),
+            "(A;OICI;FA;;;SY)".to_owned(),
+            "(A;OICI;FA;;;BA)".to_owned(),
+        ];
+        want.sort();
+        for p in [base.join("a"), d] {
+            let s = sddl(&p);
+            assert!(s.starts_with(&format!("O:{u}D:P")), "{}: {s}", p.display());
+            let dacl = &s[s.find("D:").unwrap() + 2..];
+            let mut aces: Vec<String> = dacl.split('(').skip(1).map(|a| format!("({a}")).collect();
+            aces.sort();
+            assert_eq!(aces, want, "{}: {s}", p.display());
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Like `chmod 700`: a folder of ours others can only read loses their entries; one others can
+    /// change is an error and keeps its DACL as found.
+    #[cfg(windows)]
+    #[test]
+    fn an_existing_dir_is_tightened_only_when_others_can_just_read() {
+        let base = rdir("tighten-acl");
+        let r = base.join("readable");
+        std::fs::create_dir(&r).unwrap();
+        icacls(&r, &["/grant", "*S-1-5-32-545:(OI)(CI)(RX)"]);
+        assert!(sddl(&r).contains(";;;BU)"), "{}", sddl(&r));
+        create_private_dir(&r).unwrap();
+        let s = sddl(&r);
+        assert!(!s.contains(";;;BU)") && s.contains("D:P"), "{s}");
+        let w = base.join("writable");
+        std::fs::create_dir(&w).unwrap();
+        icacls(&w, &["/grant", "*S-1-5-32-545:(OI)(CI)(M)"]);
+        let before = sddl(&w);
+        let e = create_private_dir(&w).unwrap_err();
+        assert!(e.to_string().contains("writable by other users"), "{e}");
+        assert_eq!(sddl(&w), before);
         let _ = std::fs::remove_dir_all(&base);
     }
 
