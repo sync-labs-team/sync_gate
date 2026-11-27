@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 authors = ["sync_labs"]
 homepage = "https://gate.synclabs.team"
 repository = "https://github.com/sync-labs-team/sync_gate"
-rust-version = "1.85"
+rust-version = "1.95"
 
 [workspace.dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
