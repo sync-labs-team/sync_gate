@@ -350,6 +350,25 @@ Invoke-Scenario '3.13u' {
     }
 }
 
+Invoke-Scenario '3.17u' {
+    # #6: removing a variable that is already gone must not warn "changed by someone else"; a changed one still warns.
+    [void](New-Item -ItemType Directory -Force -Path $B.SYNC_GATE_INSTALL_DIR)
+    $L = Get-TestLayout
+    Assert-That ($L.EnvKey -like 'HKCU:\Software\synclabs-test-*') "not an isolated key: $($L.EnvKey)"
+    $mine = @{ SG_T_X1 = 'a'; SG_T_X2 = 'b'; SG_T_X3 = 'c' }
+    $vars = Set-SyncGateUserVars -Key $L.EnvKey -Vars ($mine + @{ SG_T_KEEP = 'k' })
+    Save-SgState -Layout $L -Version '0.0.0' -PathPlaced @() -Vars $mine -ProfileEntries @()
+    $prev = (Read-SgState $L.StatePath).vars   # PSCustomObject, as the uninstaller gets it
+    $k = Open-SgEnvKey $L.EnvKey -Write
+    try { $k.DeleteValue('SG_T_X2'); $k.SetValue('SG_T_X3', 'other') } finally { $k.Dispose() }
+    $lines = @(Set-SyncGateUserVars -Key $L.EnvKey -Previous $prev -Remove 6>&1 | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { "$_" })
+    Assert-That ($null -eq (Read-SgUserVar $L.EnvKey 'SG_T_X1')) 'X1 was not removed'
+    Assert-That ($null -eq (Read-SgUserVar $L.EnvKey 'SG_T_X2')) 'X2 came back'
+    Assert-That ((Read-SgUserVar $L.EnvKey 'SG_T_X3') -ceq 'other') 'X3 was touched'
+    Assert-That ((Read-SgUserVar $L.EnvKey 'SG_T_KEEP') -ceq 'k') 'a variable outside the state was touched'
+    Assert-That ($lines.Count -eq 1 -and $lines[0] -like '*SG_T_X3*') "expected one warning, only for X3: [$($lines -join ' | ')]"
+}
+
 Invoke-Scenario '3.0g' {
     # I-4: a binary that ignores the test variables (here a stand-in that always prints the real values) is refused.
     $leaky = Join-Path $tmp 'leaky.cmd'

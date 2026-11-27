@@ -374,8 +374,10 @@ function Set-SyncGateUserVars {
     $k = Open-SgEnvKey $Key -Write
     try {
         foreach ($n in $prev.Keys) {
-            if (-not $Vars.Contains($n) -and ($k.GetValue($n, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) -ceq $prev[$n])) { $k.DeleteValue($n) }
-            elseif (-not $Vars.Contains($n)) { Write-SgLine "user variable $n changed by someone else; left as it is" }
+            if ($Vars.Contains($n)) { continue }
+            $cur = $k.GetValue($n, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            if ($null -ne $cur -and $cur -ceq $prev[$n]) { $k.DeleteValue($n) }
+            elseif ($null -ne $cur) { Write-SgLine "user variable $n changed by someone else; left as it is" }
         }
         foreach ($n in $Vars.Keys) { $k.SetValue($n, [string]$Vars[$n], [Microsoft.Win32.RegistryValueKind]::String) }
     } finally { $k.Dispose() }
