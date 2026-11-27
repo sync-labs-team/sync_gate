@@ -1077,10 +1077,10 @@ function Write-SgGuestHint {
 
 function Write-SgPluginHints {
     Write-SgLine 'Agent plugin (the installer does not install it):'
-    Write-SgLine '  claude plugin marketplace add sync-labs-team/sync_gate'
-    Write-SgLine '  claude plugin install sync-gate@sync_gate'
-    Write-SgLine '  codex plugin marketplace add sync-labs-team/sync_gate'
-    Write-SgLine '  codex plugin add sync-gate@sync_gate'
+    Write-SgLine '  claude plugin marketplace add sync-labs-team/plugins'
+    Write-SgLine '  claude plugin install sync-gate@sync-labs'
+    Write-SgLine '  codex plugin marketplace add sync-labs-team/plugins'
+    Write-SgLine '  codex plugin add sync-gate@sync-labs'
 }
 
 function Resolve-SgFailure {

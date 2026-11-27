@@ -111,6 +111,19 @@ stays. Your configuration and data folders are kept: the installer says where. T
 not removed; do it with `claude plugin uninstall sync-gate@sync_gate` and
 `codex plugin remove sync-gate@sync_gate`.
 
+## Agent plugin
+
+New installs use the `sync-labs` catalog:
+
+```sh
+claude plugin marketplace add sync-labs-team/plugins
+claude plugin install sync-gate@sync-labs
+codex plugin marketplace add sync-labs-team/plugins
+codex plugin add sync-gate@sync-labs
+```
+
+The old `sync_gate` catalog (`sync-labs-team/sync_gate`) still works for installs you already made.
+
 ## Recover
 
 Every change has an undo, and the previous state is kept in a `rollback` folder (Windows:

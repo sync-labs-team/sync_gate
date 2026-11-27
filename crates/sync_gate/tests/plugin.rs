@@ -145,3 +145,31 @@ fn the_skill_names_the_exit_code_and_the_resume() {
         );
     }
 }
+
+/// New installs go through the `sync-labs` catalog; the old `sync_gate` catalog stays only as a documented fallback.
+#[test]
+fn the_install_texts_use_the_sync_labs_catalog() {
+    for file in [
+        "README.md",
+        "README.pt-BR.md",
+        "README.es.md",
+        "plugin/README.md",
+        "tools/install/install.ps1",
+    ] {
+        let text = std::fs::read_to_string(root().join(file)).unwrap();
+        assert!(
+            text.contains("claude plugin marketplace add sync-labs-team/plugins"),
+            "{file}"
+        );
+        assert!(
+            text.contains("claude plugin install sync-gate@sync-labs"),
+            "{file}"
+        );
+        assert!(
+            !text.contains("claude plugin install sync-gate@sync_gate"),
+            "{file}"
+        );
+    }
+    let install = std::fs::read_to_string(root().join("docs/install.md")).unwrap();
+    assert!(install.contains("sync-gate@sync-labs"));
+}

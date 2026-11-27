@@ -7,15 +7,15 @@ Needs the `sync_gate` binary on the `PATH`; install the queue shims with `sync_g
 ## Claude Code
 
 ```
-claude plugin marketplace add sync-labs-team/sync_gate
-claude plugin install sync-gate@sync_gate
+claude plugin marketplace add sync-labs-team/plugins
+claude plugin install sync-gate@sync-labs
 ```
 
 ## Codex
 
 ```
-codex plugin marketplace add sync-labs-team/sync_gate
-codex plugin add sync-gate@sync_gate
+codex plugin marketplace add sync-labs-team/plugins
+codex plugin add sync-gate@sync-labs
 ```
 
 Then open Codex once and trust the hook in `/hooks`.
