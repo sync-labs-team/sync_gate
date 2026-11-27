@@ -115,7 +115,7 @@ macOS and Linux they go into the `env` file, the unit or the plist. A value that
 runs prints `override changed: <NAME>`.
 
 On Windows, a user variable of the same name that already existed when sync_gate first wrote it comes back
-with its value on uninstall and on `-ClearOverrides`, if nobody changed it in between.
+with the value it had at that first install, on uninstall and on `-ClearOverrides`, even if you changed it and reinstalled since.
 
 To forget them, run the install command with `-ClearOverrides` (Windows, scriptblock form) or
 `--clear-overrides` (macOS, Linux). Programs already installed in a custom `SYNC_GATE_INSTALL_DIR`

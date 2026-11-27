@@ -104,7 +104,8 @@ foreach ($k in $B.Keys) { Set-Item -Path "env:$k" -Value $B[$k] }   # this proce
 function Get-RealDataListing {
     if (-not (Test-Path -LiteralPath $real.data)) { return 'absent' }
     # Files only (a folder's mtime moves with its contents). Another session's queue (pending\) and the daemon's
-    # own bookkeeping (cost, paused, services) change while the test runs; a new or missing file still shows.
+    # own bookkeeping change while the test runs, so cost.json, paused.json, services.json and pending\* are left
+    # out of the comparison; any other new or missing file still shows.
     $s = Get-ChildItem -LiteralPath $real.data -File -Recurse -Force -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -notlike '*\pending\*' -and $_.Name -cnotin @('cost.json', 'paused.json', 'services.json') } |
         ForEach-Object { "$($_.FullName)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" }
