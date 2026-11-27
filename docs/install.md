@@ -92,7 +92,9 @@ and set it again afterwards. Nothing recovers it for you.
 
 Known limit (Windows): if the 0.1.2 installer crashed in the middle of a reinstall and 0.1.3 or newer recovered
 its journal, an empty `SYNC_GATE_*` variable of type MultiString that you had set yourself is removed instead of
-restored, because the 0.1.2 journal records an empty MultiString and a missing variable the same way.
+restored, because the 0.1.2 journal records an empty MultiString and a missing variable the same way. The same
+crash with a MultiString of 2 items or a DWord already lost the value in 0.1.2, which overwrote it; 0.1.3 and newer
+keep the installer's value instead of touching it.
 
 ## Uninstall
 
