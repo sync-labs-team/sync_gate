@@ -26,9 +26,9 @@ pub use config::{
 pub use cost::{CostModel, Estimate, MIB, PRIOR_HEAVY, PRIOR_LIGHT};
 pub use jsonrpc::{Kind, classify, error_response, result_response};
 pub use pressure::{JobSample, Verdict, analyze, under_pressure};
-pub use private_dir::{DirState, check_private_dir};
-#[cfg(unix)]
-pub use private_dir::{check_private_file, open_private_file};
+pub use private_dir::{
+    DirState, check_private_dir, check_private_file, is_refusal, open_private_file, refusal,
+};
 pub use program::{SHIMS_MANIFEST, find_program, find_ps1, resolve_in_env, resolve_program};
 pub use protocol::{
     DaemonInfo, ERR_ADMITTED, ERR_BUSY, ERR_CLAIMED, ERR_UNKNOWN_TICKET, Holder, HubHello,

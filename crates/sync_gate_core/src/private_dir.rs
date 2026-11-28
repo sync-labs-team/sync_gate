@@ -1,8 +1,8 @@
 //! Private-folder checks: who owns a folder, who can write to it and to its ancestors.
 //! Unix: only the owner (or root) can swap an entry of a folder they alone can write to, so a
 //! folder that passes `check_private_dir` cannot be replaced by another user (`inode(7)`,
-//! `rename(3p)`). Windows: the same rules in owners and DACLs (`private_dir/win.rs`); only the
-//! folders are checked there, not each file.
+//! `rename(3p)`). Windows: the same rules in owners and DACLs (`private_dir/win.rs`), for folders
+//! and for each file read.
 #[cfg(unix)]
 use nix::unistd::{getegid, geteuid};
 #[cfg(unix)]
@@ -19,7 +19,7 @@ use std::path::{Component, PathBuf};
 #[cfg(windows)]
 mod win;
 #[cfg(windows)]
-pub use win::{check_private_dir, create_private_dir};
+pub use win::{check_private_dir, check_private_file, create_private_dir, open_private_file};
 
 #[cfg(unix)]
 const STICKY: u32 = 0o1000;
@@ -33,8 +33,32 @@ pub enum DirState {
     OthersCanRead,
 }
 
+/// A refusal by the rules of this module, told apart from an error of the system by `is_refusal`
+/// (it has no OS error code and the kind alone does not say it).
+#[derive(Debug)]
+struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// An error that `is_refusal` recognises.
+pub fn refusal(kind: io::ErrorKind, msg: String) -> io::Error {
+    io::Error::new(kind, Refused(msg))
+}
+
+/// True for what a rule refused (link, kind, owner, who can write, path), false for an error of
+/// the system (a file in use, a failed read), which may pass on a retry.
+pub fn is_refusal(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|i| i.is::<Refused>())
+}
+
 fn deny(path: &Path, why: &str) -> io::Error {
-    io::Error::new(
+    refusal(
         io::ErrorKind::PermissionDenied,
         format!("{} {why}", path.display()),
     )

@@ -15,19 +15,20 @@ pub fn data_dir() -> Option<PathBuf> {
         })
 }
 
-/// Reads a `config.toml`, which can name commands to run. Windows: its folder and every ancestor
-/// pass `check_private_dir` first; a missing folder reads as a missing file.
+/// Reads a `config.toml`, which can name commands to run: its folder and every ancestor pass
+/// `check_private_dir`, then the file is opened with `open_private_file` (ours, nobody else can
+/// change it) and read from that handle. A missing folder reads as a missing file.
 pub fn read_config(path: &Path) -> std::io::Result<String> {
-    #[cfg(windows)]
+    use std::io::Read;
+    let path = std::path::absolute(path)?;
+    if let Some(dir) = path.parent()
+        && crate::check_private_dir(dir)? == crate::DirState::Missing
     {
-        let path = std::path::absolute(path)?;
-        if let Some(dir) = path.parent()
-            && crate::check_private_dir(dir)? == crate::DirState::Missing
-        {
-            return Err(std::io::ErrorKind::NotFound.into());
-        }
+        return Err(std::io::ErrorKind::NotFound.into());
     }
-    std::fs::read_to_string(path)
+    let mut text = String::new();
+    crate::open_private_file(&path)?.read_to_string(&mut text)?;
+    Ok(text)
 }
 
 /// Folder of the PATH shims: `<SYNC_GATE_DATA_DIR>/shims`, else `shims` in the per-user local data folder.
@@ -1219,6 +1220,133 @@ command=\"  \t\""
             assert!(
                 e.contains("stop_grace_secs must be in 1..=300"),
                 "{bad}: {e}"
+            );
+        }
+    }
+
+    /// A folder of ours for one test, removed on drop (Unix 0700; Windows: what the temporary
+    /// folder gives, which must pass the folder check: run with TMP in the profile).
+    struct CfgDir(PathBuf);
+
+    impl CfgDir {
+        fn new(tag: &str) -> Self {
+            let d = std::env::temp_dir().join(format!("fg-cfg-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir(&d).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let f = d.join("config.toml");
+            std::fs::write(
+                &f,
+                "max_wait_secs = 5
+",
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            Self(d)
+        }
+        fn file(&self) -> PathBuf {
+            self.0.join("config.toml")
+        }
+        /// Lets every other user change the file itself (not its folder).
+        fn open_to_others(&self) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(self.file(), std::fs::Permissions::from_mode(0o666))
+                    .unwrap();
+            }
+            #[cfg(windows)]
+            {
+                let out = std::process::Command::new("icacls")
+                    .arg(self.file())
+                    .args(["/grant", "*S-1-1-0:(W)"])
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "icacls: {out:?}");
+            }
+        }
+    }
+
+    impl Drop for CfgDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_config_of_ours_is_read() {
+        let d = CfgDir::new("ok");
+        assert_eq!(
+            read_config(&d.file()).unwrap(),
+            "max_wait_secs = 5
+"
+        );
+        assert_eq!(
+            read_config(&d.0.join("absent.toml")).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    /// The file itself, in a folder that passes, is judged too (Linux and macOS as well).
+    #[test]
+    fn a_config_others_can_write_is_refused() {
+        let d = CfgDir::new("w");
+        d.open_to_others();
+        let e = read_config(&d.file()).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+        assert!(e.to_string().contains("writable by other users"), "{e}");
+    }
+
+    /// Unix: a config in a folder with group write (as some setups under /etc have) is refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_in_a_group_writable_folder_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = CfgDir::new("g");
+        std::fs::set_permissions(&d.0, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let e = read_config(&d.file()).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+        assert!(e.to_string().contains("writable by other users"), "{e}");
+    }
+
+    /// What is read is what was judged: a config another program holds open for writing is not
+    /// read (Windows: sharing violation), even though its owner and DACL pass.
+    #[cfg(windows)]
+    #[test]
+    fn a_config_open_for_writing_is_not_read() {
+        let d = CfgDir::new("held");
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .open(d.file())
+            .unwrap();
+        let e = read_config(&d.file()).unwrap_err();
+        assert!(e.to_string().contains("sharing violation"), "{e}");
+        drop(held);
+        read_config(&d.file()).unwrap();
+    }
+
+    /// Windows: a stream of the config is never read; a final dot or space is dropped by
+    /// `absolute` before the folder walk and the open, so both see the same file.
+    #[cfg(windows)]
+    #[test]
+    fn a_config_path_that_names_a_stream_is_refused() {
+        let d = CfgDir::new("ads");
+        let s = d.file().display().to_string();
+        let e = read_config(Path::new(&format!("{s}:x"))).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
+        for p in [format!("{s}."), format!("{s} ")] {
+            assert_eq!(
+                read_config(Path::new(&p)).unwrap(),
+                "max_wait_secs = 5
+"
             );
         }
     }

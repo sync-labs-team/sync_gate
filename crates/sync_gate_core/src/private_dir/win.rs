@@ -24,8 +24,9 @@ use windows_sys::Win32::Security::{
     TokenOwner, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, GetDriveTypeW,
-    READ_CONTROL,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK,
+    GetDriveTypeW, GetFileType, READ_CONTROL,
 };
 
 // Access rights ("File Access Rights Constants", "Generic Access Rights").
@@ -50,6 +51,12 @@ const REPLACE_CHILD: u32 = DELETE_CHILD | WRITE_DAC | WRITE_OWNER | GENERIC_ALL;
 const ADD_CHILD: u32 = ADD_FILE | ADD_SUBDIRECTORY | GENERIC_WRITE | GENERIC_ALL;
 /// On the final folder: any change to it or to what is in it.
 const WRITE_DIR: u32 = ADD_CHILD | WRITE_EA | DELETE_CHILD | WRITE_ATTRIBUTES | REPLACE_SELF;
+// The same bits on a file: FILE_WRITE_DATA and FILE_APPEND_DATA.
+const WRITE_DATA: u32 = ADD_FILE;
+const APPEND_DATA: u32 = ADD_SUBDIRECTORY;
+/// On a file: any change to its content, attributes, descriptor, or the file itself.
+const WRITE_FILE: u32 =
+    WRITE_DATA | APPEND_DATA | WRITE_EA | WRITE_ATTRIBUTES | REPLACE_SELF | GENERIC_WRITE;
 
 const DRIVE_FIXED: u32 = 3;
 
@@ -243,6 +250,24 @@ impl Trust {
         !sid.is_null() && self.all.iter().any(|&t| unsafe { EqualSid(t, sid) } != 0)
     }
 
+    /// May own a file sync_gate trusts: this user, Administrators, SYSTEM, TrustedInstaller.
+    /// The token's default owner only when it is one of those; OWNER RIGHTS never (it only means
+    /// something in an entry).
+    fn owner_ok(&self, sid: PSID) -> bool {
+        let file_owners = [self.all[0], self.all[2], self.all[3], self.all[4]];
+        // SAFETY: as in `trusted`.
+        !sid.is_null()
+            && file_owners
+                .iter()
+                .any(|&t| unsafe { EqualSid(t, sid) } != 0)
+    }
+
+    /// May be granted changes in a file's DACL: a possible owner, or OWNER RIGHTS.
+    fn ace_ok(&self, sid: PSID) -> bool {
+        // SAFETY: as in `trusted`.
+        self.owner_ok(sid) || (!sid.is_null() && unsafe { EqualSid(self.all[5], sid) } != 0)
+    }
+
     /// The entry is ours to delete: owned by this user (or default owner), or its DACL grants
     /// this user DELETE. Then its parent must not let others add entries.
     fn mine(&self, e: &Entry) -> bool {
@@ -262,6 +287,8 @@ struct Entry {
     dacl: *const ACL,
     dir: bool,
     link: bool,
+    /// The reparse tag, when it is a reparse point of any kind.
+    reparse: Option<u32>,
 }
 
 impl Drop for Entry {
@@ -271,14 +298,18 @@ impl Drop for Entry {
     }
 }
 
+/// Shared with everyone (the default of `OpenOptions`).
+const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
 fn open(path: &Path) -> io::Result<Entry> {
-    open_with(path, 0).map(|(e, _)| e)
+    open_with(path, 0, SHARE_ALL).map(|(e, _)| e)
 }
 
-/// `open`, opened with `extra` access too, with its handle.
-fn open_with(path: &Path, extra: u32) -> io::Result<(Entry, std::fs::File)> {
+/// `open`, opened with `extra` access too and sharing `share`, with its handle.
+fn open_with(path: &Path, extra: u32, share: u32) -> io::Result<(Entry, std::fs::File)> {
     let f = std::fs::OpenOptions::new()
         .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES | extra)
+        .share_mode(share)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
     let (attrs, tag) = tag_info(&f).ok_or_else(io::Error::last_os_error)?;
@@ -310,6 +341,7 @@ fn open_with(path: &Path, extra: u32) -> io::Result<(Entry, std::fs::File)> {
         dacl,
         dir: attrs & 0x10 != 0,
         link: attrs & 0x400 != 0 && is_name_surrogate(tag),
+        reparse: (attrs & 0x400 != 0).then_some(tag),
     };
     Ok((e, f))
 }
@@ -371,17 +403,151 @@ fn fix(p: &Path, sids: Option<Vec<String>>) -> String {
     )
 }
 
+/// `p` is on the fixed local drive `root`.
+fn fixed_drive(root: &Path, p: &Path) -> io::Result<()> {
+    // SAFETY: a NUL-terminated path.
+    if unsafe { GetDriveTypeW(wide(root).as_ptr()) } != DRIVE_FIXED {
+        return Err(deny(
+            p,
+            "is not on a fixed local drive (network and removable drives are refused)",
+        ));
+    }
+    Ok(())
+}
+
+/// Why a file is not trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    Owner,
+    Writable,
+}
+
+/// The one rule for a file sync_gate trusts: owned by someone `owner_ok` accepts, and no grant
+/// of any change to anyone `ace_ok` rejects. No link-count rule: a hard link has no descriptor of
+/// its own (the file's is the only one), and the shims are hard links by design.
+///
+/// # Safety
+/// `owner` must be null or a valid SID, and `dacl` null or a valid ACL, for the whole call.
+unsafe fn file_refusal(
+    owner: PSID,
+    dacl: *const ACL,
+    owner_ok: &dyn Fn(PSID) -> bool,
+    ace_ok: &dyn Fn(PSID) -> bool,
+) -> Option<Refusal> {
+    if owner.is_null() || !owner_ok(owner) {
+        return Some(Refusal::Owner);
+    }
+    // SAFETY: as the caller guarantees.
+    (unsafe { others(dacl, ace_ok, WRITE_FILE, false) } == Others::Change)
+        .then_some(Refusal::Writable)
+}
+
+/// Opens `path` without following it and judges the opened file with `file_refusal`. `read`:
+/// opened to read its data and without sharing writes, so what is read is what was judged and no
+/// new opening for writing its data gets in while the handle lives; a file already open for that
+/// is refused (sharing violation). Else only its descriptor is read, whoever has it open.
+fn open_file(path: &Path, read: bool) -> io::Result<std::fs::File> {
+    let (root, _) = split(path)?;
+    // Win32 drops a final dot or space from a name and a verbatim path keeps it: refusing those
+    // keeps the caller's folder walk and this open on the same names. `:` names a stream.
+    let plain = path.components().all(|c| match c {
+        Component::Normal(n) => {
+            let n = n.to_string_lossy();
+            !n.contains(':') && !n.ends_with('.') && !n.ends_with(' ')
+        }
+        _ => true,
+    });
+    if !plain {
+        return Err(super::refusal(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} names a stream, a device or a drive that is not local and fixed",
+                path.display()
+            ),
+        ));
+    }
+    fixed_drive(&root, path)?;
+    let (access, share) = if read {
+        (FILE_GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE)
+    } else {
+        (0, SHARE_ALL)
+    };
+    let (e, f) = open_with(path, access, share).map_err(|e| {
+        if e.raw_os_error() == Some(32) {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "{} is in use by another program in a way that conflicts with a safe read (sharing violation); close it and retry",
+                    path.display()
+                ),
+            )
+        } else {
+            e
+        }
+    })?;
+    // SAFETY: a valid handle.
+    let disk = unsafe { GetFileType(f.as_raw_handle()) } == FILE_TYPE_DISK;
+    if e.link {
+        return Err(deny(path, "is a link"));
+    }
+    if let Some(tag) = e.reparse {
+        return Err(deny(
+            path,
+            &format!("is a reparse point (tag {tag:#x}), not a plain file"),
+        ));
+    }
+    if e.dir || !disk {
+        return Err(deny(path, "is not a file"));
+    }
+    let t = Trust::get()?;
+    let (owner_ok, ace_ok) = (|s: PSID| t.owner_ok(s), |s: PSID| t.ace_ok(s));
+    // SAFETY: the entry's owner and DACL are valid while it lives (all three calls).
+    match unsafe { file_refusal(e.owner, e.dacl, &owner_ok, &ace_ok) } {
+        None => Ok(f),
+        Some(Refusal::Owner) => {
+            let who = (!e.owner.is_null())
+                .then(|| sid_text(e.owner))
+                .flatten()
+                .unwrap_or_else(|| "none".into());
+            Err(deny(path, &format!("is owned by another user ({who})")))
+        }
+        Some(Refusal::Writable) => {
+            let sids = unsafe { writers(e.dacl, &ace_ok, WRITE_FILE, false) };
+            let who = sids
+                .as_ref()
+                .map_or_else(|| "some cannot be named".into(), |v| v.join(", "));
+            Err(deny(
+                path,
+                &format!(
+                    "is writable by other users ({who}): its content may have been changed (check it before you trust it again, then {})",
+                    fix(path, sids)
+                ),
+            ))
+        }
+    }
+}
+
+/// Judges a file of ours by its owner and DACL, without following a final link and without
+/// reading its data (it passes while another program has it open). Nothing about what it holds
+/// afterwards. Its folder and ancestors are the caller's job (`check_private_dir` first).
+/// `NotFound` when absent.
+pub fn check_private_file(path: &Path) -> io::Result<()> {
+    open_file(path, false).map(drop)
+}
+
+/// Opens a file of ours for reading, without following a final link, and judges the opened file:
+/// what is read from the handle is what was judged, and no new opening for writing its data gets
+/// in while it lives. A file already open for writing is refused. Its folder and ancestors are
+/// the caller's job (`check_private_dir` first). `NotFound` when absent.
+pub fn open_private_file(path: &Path) -> io::Result<std::fs::File> {
+    open_file(path, true)
+}
+
 /// Checks that `dir` (absolute, on a fixed local drive) is a folder only this user can change,
 /// with ancestors nobody else can change either. `Missing` is not an error: the caller creates it.
 pub fn check_private_dir(dir: &Path) -> io::Result<DirState> {
     let (root, names) = split(dir)?;
-    // SAFETY: a NUL-terminated path.
-    if unsafe { GetDriveTypeW(wide(&root).as_ptr()) } != DRIVE_FIXED {
-        return Err(deny(
-            dir,
-            "is not on a fixed local drive (network and removable drives are refused)",
-        ));
-    }
+    fixed_drive(&root, dir)?;
     let t = Trust::get()?;
     let trusted = |s: PSID| t.trusted(s);
     let changeable = |p: &Path, sids: Option<Vec<String>>| {
@@ -474,7 +640,7 @@ pub fn check_private_dir(dir: &Path) -> io::Result<DirState> {
 /// created, and keeps what they may read: the DACL becomes its own (protected), with the same
 /// entries less those rights. Nothing changes when they have none.
 fn drop_writes(dir: &Path, t: &Trust) -> io::Result<()> {
-    let (e, f) = open_with(dir, WRITE_DAC)?;
+    let (e, f) = open_with(dir, WRITE_DAC, SHARE_ALL)?;
     let trusted = |s: PSID| t.trusted(s);
     // SAFETY: the entry's DACL is valid while it lives (also below).
     if e.dacl.is_null() || unsafe { others(e.dacl, &trusted, WRITE_DIR, true) } != Others::Change {
@@ -1059,17 +1225,391 @@ mod tests {
         let _ = std::fs::remove_dir_all(&b);
     }
 
-    /// Step 12, read only: the real data and shims folders of this machine, as they are. Prints
-    /// the state; writes nothing. `cargo test -p sync_gate_core -- --ignored real_folders`.
+    /// Step 12, read only: the real data and shims folders of this machine, as they are, and every
+    /// file of theirs that sync_gate trusts, opened and read to the end (only the size is printed).
+    /// Writes nothing. `cargo test -p sync_gate_core -- --ignored real_folders`.
     #[test]
     #[ignore = "reads this machine's real folders"]
     fn real_folders() {
-        for d in [crate::data_dir(), crate::shims_dir()]
+        use std::io::Read;
+        let mut bad = 0;
+        let dirs: Vec<PathBuf> = [crate::data_dir(), crate::shims_dir()]
             .into_iter()
             .flatten()
-        {
-            println!("{}: {:?}", d.display(), check_private_dir(&d));
-            assert!(check_private_dir(&d).is_ok());
+            .collect();
+        for d in &dirs {
+            println!("{}: {:?}", d.display(), check_private_dir(d));
+            assert!(check_private_dir(d).is_ok());
         }
+        let mut files = Vec::new();
+        if let Some(d) = crate::data_dir() {
+            for n in [
+                "mcp-adopted.json",
+                "services.json",
+                "cost.json",
+                "paused.json",
+                "paused-guests.json",
+            ] {
+                files.push(d.join(n));
+            }
+            if let Ok(rd) = std::fs::read_dir(d.join("pending")) {
+                files.extend(rd.flatten().map(|e| e.path()));
+            }
+        }
+        if let Some(d) = crate::shims_dir()
+            && let Ok(rd) = std::fs::read_dir(&d)
+        {
+            files.extend(rd.flatten().map(|e| e.path()).filter(|p| p.is_file()));
+        }
+        if let Some(c) = directories::ProjectDirs::from("dev", "sync_labs", "sync_gate") {
+            files.push(c.config_dir().join("config.toml"));
+        }
+        for f in files {
+            let r = open_private_file(&f).and_then(|mut h| {
+                let mut n = Vec::new();
+                h.read_to_end(&mut n).map(|_| n.len())
+            });
+            match r {
+                Ok(n) => println!("ok {n} {}", f.display()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    println!("missing {}", f.display())
+                }
+                Err(e) => {
+                    bad += 1;
+                    println!("ERROR {}: {e}", f.display());
+                }
+            }
+        }
+        assert_eq!(bad, 0);
+    }
+
+    fn me() -> String {
+        token_info::<TOKEN_USER>(TokenUser)
+            // SAFETY: `token_info` checked the buffer holds a whole TOKEN_USER.
+            .and_then(|u| sid_text(unsafe { (*u.as_ptr().cast::<TOKEN_USER>()).User.Sid }))
+            .unwrap()
+    }
+
+    fn file_err(r: io::Result<impl Sized>) -> io::Error {
+        match r {
+            Ok(_) => panic!("accepted"),
+            Err(e) => e,
+        }
+    }
+
+    fn refused_with(r: io::Result<impl Sized>, what: &str) -> String {
+        let e = file_err(r);
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        let t = e.to_string();
+        assert!(t.contains(what), "{t}");
+        t
+    }
+
+    fn read_all(p: &Path) -> io::Result<String> {
+        use std::io::Read;
+        let mut s = String::new();
+        open_private_file(p)?.read_to_string(&mut s)?;
+        Ok(s)
+    }
+
+    /// F1: the file decision on hand-built SIDs and entries.
+    #[test]
+    fn the_file_decision() {
+        let (me, other) = (sid(5, &[21, 1, 2, 3, 1001]), sid(5, &[21, 1, 2, 3, 1002]));
+        let (ba, sy, ow) = (sid(5, &[32, 544]), sid(5, &[18]), sid(3, &[4]));
+        let ti = sid(
+            5,
+            &[
+                80, 956008885, 3418522649, 1831038044, 1853292631, 2271478464,
+            ],
+        );
+        let eq = |a: PSID, b: &[u64]| unsafe { EqualSid(a, psid(b)) } != 0;
+        let owner_ok = |s: PSID| [&me, &ba, &sy, &ti].iter().any(|t| eq(s, t));
+        let ace_ok = |s: PSID| owner_ok(s) || eq(s, &ow);
+        let judge = |owner: &[u64], aces: &[(u8, u8, u32, &[u64])]| {
+            let a = acl(aces);
+            // SAFETY: a valid hand-built SID and ACL.
+            unsafe { file_refusal(psid(owner), a.as_ptr().cast(), &owner_ok, &ace_ok) }
+        };
+        const FULL: u32 = 0x1F_01FF;
+        const RX: u32 = 0x12_00A9;
+        for o in [&me, &ba, &sy, &ti] {
+            assert_eq!(judge(o, &[(0, 0, FULL, &me)]), None);
+        }
+        assert_eq!(judge(&ow, &[]), Some(Refusal::Owner));
+        assert_eq!(judge(&other, &[(0, 0, FULL, &me)]), Some(Refusal::Owner));
+        for bit in [
+            WRITE_DATA,
+            APPEND_DATA,
+            WRITE_EA,
+            WRITE_ATTRIBUTES,
+            DELETE,
+            WRITE_DAC,
+            WRITE_OWNER,
+            GENERIC_WRITE,
+            GENERIC_ALL,
+        ] {
+            assert_eq!(
+                judge(&me, &[(0, 0, FULL, &me), (0, 0, bit, &other)]),
+                Some(Refusal::Writable),
+                "{bit:#x}"
+            );
+        }
+        assert_eq!(judge(&me, &[(0, 0, FULL, &ow)]), None);
+        assert_eq!(judge(&me, &[(0, 0, RX, &other)]), None);
+        assert_eq!(judge(&me, &[(0, 0x08, GENERIC_ALL, &other)]), None);
+        assert_eq!(judge(&me, &[(1, 0, GENERIC_ALL, &other)]), None);
+        assert_eq!(
+            judge(&me, &[(9, 0, WRITE_DATA, &me)]),
+            Some(Refusal::Writable)
+        );
+        // No DACL: everyone has everything.
+        // SAFETY: null is allowed for the DACL.
+        let nul = unsafe { file_refusal(psid(&me), std::ptr::null(), &owner_ok, &ace_ok) };
+        assert_eq!(nul, Some(Refusal::Writable));
+        // This process's own rule: Administrators may own a file, OWNER RIGHTS and others may not.
+        let t = Trust::get().unwrap();
+        assert!(t.owner_ok(psid(&ba)) && t.owner_ok(psid(&sy)) && t.owner_ok(psid(&ti)));
+        assert!(t.owner_ok(t.user));
+        assert!(!t.owner_ok(psid(&ow)) && !t.owner_ok(psid(&other)));
+        assert!(t.ace_ok(psid(&ow)) && !t.ace_ok(psid(&other)));
+    }
+
+    /// F2-F4: a file of ours passes and is read; one others can write is refused, and the
+    /// command the refusal offers makes it pass.
+    #[test]
+    fn private_file_rules() {
+        let b = base("file");
+        let f = b.join("config.toml");
+        std::fs::write(&f, "x").unwrap();
+        assert_eq!(read_all(&f).unwrap(), "x");
+        check_private_file(&f).unwrap();
+        // F3: an explicit grant to Everyone.
+        icacls(&f, &["/grant", "*S-1-1-0:(W)"]);
+        let t = refused_with(read_all(&f), "is writable by other users (S-1-1-0)");
+        refused_with(check_private_file(&f), "writable");
+        let cmd = &t[t.find("run: ").expect(&t) + 5..t.rfind(')').unwrap()];
+        use std::os::windows::process::CommandExt;
+        let out = Command::new("cmd").arg("/C").raw_arg(cmd).output().unwrap();
+        assert!(out.status.success(), "{cmd}: {out:?}");
+        assert_eq!(read_all(&f).unwrap(), "x");
+        // F4: a protected DACL that grants only Everyone (M).
+        let g = b.join("g");
+        std::fs::write(&g, "x").unwrap();
+        icacls(&g, &["/inheritance:r", "/grant", "*S-1-1-0:(M)"]);
+        refused_with(read_all(&g), "writable by other users");
+        // Others may read and run it: still ours.
+        let r = b.join("r");
+        std::fs::write(&r, "x").unwrap();
+        icacls(&r, &["/grant", "*S-1-5-32-545:(RX)"]);
+        assert_eq!(read_all(&r).unwrap(), "x");
+        icacls(&b, &["/reset", "/T"]);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// F4b: what a file inherits from its folder counts.
+    #[test]
+    fn an_inherited_grant_counts() {
+        let b = base("inh");
+        let d = b.join("d");
+        create_private_dir(&d).unwrap();
+        icacls(&d, &["/grant", "*S-1-5-32-545:(OI)(RX)"]);
+        let f = d.join("f");
+        std::fs::write(&f, "x").unwrap();
+        assert_eq!(read_all(&f).unwrap(), "x");
+        // Granted on the folder after the file exists: propagated to it as inherited (M).
+        icacls(&d, &["/grant", "*S-1-5-32-545:(OI)(M)"]);
+        refused_with(read_all(&f), "writable by other users (S-1-5-32-545)");
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// F5: not a file, absent, a junction, a file link.
+    #[test]
+    fn a_file_that_is_not_plain_is_refused() {
+        let b = base("kind");
+        refused_with(read_all(&b), "is not a file");
+        refused_with(check_private_file(&b), "is not a file");
+        assert_eq!(
+            file_err(read_all(&b.join("absent"))).kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            file_err(check_private_file(&b.join("absent"))).kind(),
+            io::ErrorKind::NotFound
+        );
+        let real = b.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let j = b.join("j");
+        let out = Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&j)
+            .arg(&real)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "mklink: {out:?}");
+        refused_with(read_all(&j), "is a link");
+        let f = b.join("f");
+        std::fs::write(&f, "x").unwrap();
+        let l = b.join("l");
+        match std::os::windows::fs::symlink_file(&f, &l) {
+            Ok(()) => {
+                refused_with(read_all(&l), "is a link");
+                refused_with(check_private_file(&l), "is a link");
+            }
+            Err(e) => println!("skipped: file symlink ({e})"),
+        }
+        std::fs::remove_dir(&j).unwrap();
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// F6: a hard link shares the file's descriptor: both names pass, and a grant made through
+    /// one name is refused through both.
+    #[test]
+    fn a_hard_link_has_the_file_s_descriptor() {
+        let b = base("hard");
+        let f = b.join("f");
+        std::fs::write(&f, "x").unwrap();
+        let g = b.join("g");
+        std::fs::hard_link(&f, &g).unwrap();
+        assert_eq!(read_all(&f).unwrap(), "x");
+        assert_eq!(read_all(&g).unwrap(), "x");
+        icacls(&g, &["/grant", "*S-1-1-0:(W)"]);
+        refused_with(read_all(&f), "writable");
+        refused_with(read_all(&g), "writable");
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// F7: a file open for writing elsewhere is not read; the inspection alone passes; a
+    /// replacement by rename while our handle lives leaves what the handle reads whole.
+    #[test]
+    fn a_file_open_for_writing_is_not_read() {
+        use std::io::Read;
+        let b = base("share");
+        let f = b.join("f");
+        std::fs::write(&f, "old").unwrap();
+        let w = std::fs::OpenOptions::new().write(true).open(&f).unwrap();
+        let t = file_err(read_all(&f)).to_string();
+        assert!(t.contains("sharing violation"), "{t}");
+        check_private_file(&f).unwrap();
+        drop(w);
+        let mut h = open_private_file(&f).unwrap();
+        let tmp = b.join("f.tmp");
+        std::fs::write(&tmp, "new").unwrap();
+        std::fs::rename(&tmp, &f).unwrap();
+        let mut s = String::new();
+        h.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "old");
+        drop(h);
+        assert_eq!(read_all(&f).unwrap(), "new");
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// F7b: a program that is running can be judged (opened for reading).
+    #[test]
+    fn a_running_program_can_be_judged() {
+        let b = base("run");
+        let exe = b.join("p.exe");
+        let sys = std::env::var_os("SystemRoot").unwrap();
+        std::fs::copy(Path::new(&sys).join(r"System32\PING.EXE"), &exe).unwrap();
+        let mut child = Command::new(&exe)
+            .args(["-n", "5", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let r = open_private_file(&exe).map(drop);
+        let _ = child.kill();
+        let _ = child.wait();
+        r.unwrap();
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// F8: a write-restricted token of this same user reads a file of this user.
+    #[test]
+    fn a_restricted_token_of_this_user_reads_its_file() {
+        let b = base("restr");
+        let f = b.join("config.toml");
+        std::fs::write(&f, "x").unwrap();
+        assert_eq!(as_restricted(|| read_all(&f)).unwrap(), "x");
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// F9: streams, devices, shares, and names the Win32 layer would change are refused; a
+    /// verbatim path to a plain file is read as the same file.
+    #[test]
+    fn a_path_that_is_not_a_plain_local_file_is_refused() {
+        let b = base("path");
+        let f = b.join("config.toml");
+        std::fs::write(&f, "x").unwrap();
+        let bad = |p: &str| {
+            let e = file_err(read_all(Path::new(p)));
+            assert_ne!(e.kind(), io::ErrorKind::NotFound, "{p}: {e}");
+            let e = file_err(check_private_file(Path::new(p)));
+            assert_ne!(e.kind(), io::ErrorKind::NotFound, "{p}: {e}");
+        };
+        let s = f.display().to_string();
+        bad(&format!("{s}:alt"));
+        bad(&format!("{s}::$DATA"));
+        bad(&format!("{s}."));
+        bad(&format!("{s} "));
+        bad(&format!(r"\\?\{s}."));
+        bad(&format!(r"\\?\{s} "));
+        bad(r"\\?\GLOBALROOT\Device\HarddiskVolume1\x");
+        bad(r"\\server\share\f");
+        bad(r"\\.\NUL");
+        bad(&format!(r"{}\NUL", b.display()));
+        bad("config.toml");
+        let dotted = b.join("d.").join("f");
+        bad(&dotted.display().to_string());
+        assert_eq!(read_all(Path::new(&format!(r"\\?\{s}"))).unwrap(), "x");
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// F10: a reparse point that is not a link (here WOF compression) is refused too.
+    #[test]
+    fn a_compressed_file_is_refused() {
+        let b = base("wof");
+        let f = b.join("big.bin");
+        std::fs::write(&f, vec![b'a'; 256 * 1024]).unwrap();
+        let out = Command::new("compact")
+            .args(["/c", "/exe:xpress4k"])
+            .arg(&f)
+            .output()
+            .unwrap();
+        let tag = std::fs::File::open(&f).ok().and_then(|_| {
+            let h = std::fs::OpenOptions::new()
+                .access_mode(FILE_READ_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&f)
+                .ok()?;
+            tag_info(&h)
+        });
+        match tag {
+            Some((attrs, 0x8000_0017)) if out.status.success() && attrs & 0x400 != 0 => {
+                refused_with(read_all(&f), "is a reparse point (tag 0x80000017)");
+            }
+            other => println!("skipped: compact gave no WOF reparse point ({other:?}, {out:?})"),
+        }
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// The owner of a file is judged: one owned by a SID outside the boundary is refused even
+    /// with a clean DACL. Needs SeRestorePrivilege to set another owner; skipped without it.
+    #[test]
+    fn a_file_of_another_owner_is_refused() {
+        let b = base("own");
+        let f = b.join("f");
+        std::fs::write(&f, "x").unwrap();
+        let out = Command::new("icacls")
+            .arg(&f)
+            .args(["/setowner", "*S-1-5-32-545"])
+            .output()
+            .unwrap();
+        if out.status.success() {
+            refused_with(read_all(&f), "is owned by another user (S-1-5-32-545)");
+        } else {
+            println!("skipped: cannot set another owner ({})", me());
+        }
+        let _ = std::fs::remove_dir_all(&b);
     }
 }
