@@ -349,7 +349,7 @@ fn open_with(path: &Path, extra: u32, share: u32) -> io::Result<(Entry, std::fs:
 /// The drive root (`C:\`) and the names under it; a path on a share is refused.
 fn split(dir: &Path) -> io::Result<(PathBuf, Vec<OsString>)> {
     let invalid = |why: &str| {
-        io::Error::new(
+        super::refusal(
             io::ErrorKind::InvalidInput,
             format!("{} {why}", dir.display()),
         )
@@ -446,26 +446,44 @@ unsafe fn file_refusal(
 /// opened to read its data and without sharing writes, so what is read is what was judged and no
 /// new opening for writing its data gets in while the handle lives; a file already open for that
 /// is refused (sharing violation). Else only its descriptor is read, whoever has it open.
-fn open_file(path: &Path, read: bool) -> io::Result<std::fs::File> {
-    let (root, _) = split(path)?;
-    // Win32 drops a final dot or space from a name and a verbatim path keeps it: refusing those
-    // keeps the caller's folder walk and this open on the same names. `:` names a stream.
+/// Refuses (14.5) a name the Win32 layer would change or read as something else: a final dot or
+/// space (dropped by Win32, kept by a verbatim path, so a folder walk and an open could see two
+/// objects), a stream (`:`) or a device (`NUL`, `COM1`...). Before any `absolute`, which drops them.
+pub(crate) fn check_names(path: &Path) -> io::Result<()> {
+    const DEVICES: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
+    let device = |n: &str| {
+        let stem = n.split('.').next().unwrap_or(n).trim_end();
+        // Bytes, not `str` slices: a name may hold any character.
+        let b = stem.as_bytes();
+        DEVICES.iter().any(|d| stem.eq_ignore_ascii_case(d))
+            || (b.len() == 4
+                && [b"COM", b"LPT"]
+                    .iter()
+                    .any(|p| b[..3].eq_ignore_ascii_case(*p))
+                && b[3].is_ascii_digit())
+    };
     let plain = path.components().all(|c| match c {
         Component::Normal(n) => {
             let n = n.to_string_lossy();
-            !n.contains(':') && !n.ends_with('.') && !n.ends_with(' ')
+            !n.contains(':') && !n.ends_with('.') && !n.ends_with(' ') && !device(&n)
         }
         _ => true,
     });
-    if !plain {
-        return Err(super::refusal(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "{} names a stream, a device or a drive that is not local and fixed",
-                path.display()
-            ),
-        ));
+    if plain {
+        return Ok(());
     }
+    Err(super::refusal(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "{} names a stream, a device or a drive that is not local and fixed",
+            path.display()
+        ),
+    ))
+}
+
+fn open_file(path: &Path, read: bool) -> io::Result<std::fs::File> {
+    let (root, _) = split(path)?;
+    check_names(path)?;
     fixed_drive(&root, path)?;
     let (access, share) = if read {
         (FILE_GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE)
@@ -950,14 +968,16 @@ mod tests {
         std::fs::write(b.join("f"), b"x").unwrap();
         assert!(err_text(check_private_dir(&b.join("f"))).contains("is not a folder"));
         // T8: the path itself.
-        let kind = |p: &str| check_private_dir(Path::new(p)).unwrap_err().kind();
-        assert_eq!(kind("rel"), io::ErrorKind::InvalidInput);
-        assert_eq!(kind(r"\no-drive"), io::ErrorKind::InvalidInput);
+        // A2: a refused path is a refusal by the rules (`is_refusal`), like every other one.
+        let kind = |p: &Path| {
+            let e = check_private_dir(p).unwrap_err();
+            assert!(super::super::is_refusal(&e), "{}: {e}", p.display());
+            e.kind()
+        };
+        assert_eq!(kind(Path::new("rel")), io::ErrorKind::InvalidInput);
+        assert_eq!(kind(Path::new(r"\no-drive")), io::ErrorKind::InvalidInput);
         let dots = b.join("readable").join("..").join("writable");
-        assert_eq!(
-            check_private_dir(&dots).unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
+        assert_eq!(kind(&dots), io::ErrorKind::InvalidInput);
         let t = err_text(check_private_dir(Path::new(r"\\server\share\data")));
         assert!(t.contains("network"), "{t}");
         let _ = std::fs::remove_dir_all(&b);
@@ -1237,11 +1257,35 @@ mod tests {
             .into_iter()
             .flatten()
             .collect();
+        // A folder that is missing proves nothing about this installation: it fails too.
         for d in &dirs {
-            println!("{}: {:?}", d.display(), check_private_dir(d));
-            assert!(check_private_dir(d).is_ok());
+            let r = check_private_dir(d);
+            println!("{}: {r:?}", d.display());
+            if !matches!(r, Ok(DirState::Private | DirState::OthersCanRead)) {
+                bad += 1;
+            }
         }
         let mut files = Vec::new();
+        // Every entry of `d` but folders; `d` absent is no entry, any other error counts.
+        let mut list = |d: &Path, files: &mut Vec<PathBuf>| match std::fs::read_dir(d) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => println!("no folder {}", d.display()),
+            Err(e) => {
+                bad += 1;
+                println!("ERROR listing {}: {e}", d.display());
+            }
+            Ok(rd) => {
+                for e in rd {
+                    match e.and_then(|e| Ok((e.file_type()?, e.path()))) {
+                        Ok((t, p)) if !t.is_dir() => files.push(p),
+                        Ok(_) => {}
+                        Err(e) => {
+                            bad += 1;
+                            println!("ERROR listing {}: {e}", d.display());
+                        }
+                    }
+                }
+            }
+        };
         if let Some(d) = crate::data_dir() {
             for n in [
                 "mcp-adopted.json",
@@ -1252,17 +1296,17 @@ mod tests {
             ] {
                 files.push(d.join(n));
             }
-            if let Ok(rd) = std::fs::read_dir(d.join("pending")) {
-                files.extend(rd.flatten().map(|e| e.path()));
-            }
+            list(&d.join("pending"), &mut files);
         }
-        if let Some(d) = crate::shims_dir()
-            && let Ok(rd) = std::fs::read_dir(&d)
-        {
-            files.extend(rd.flatten().map(|e| e.path()).filter(|p| p.is_file()));
+        if let Some(d) = crate::shims_dir() {
+            list(&d, &mut files);
         }
-        if let Some(c) = directories::ProjectDirs::from("dev", "sync_labs", "sync_gate") {
-            files.push(c.config_dir().join("config.toml"));
+        match std::env::var_os("SYNC_GATE_CONFIG") {
+            Some(c) => files.push(PathBuf::from(c)),
+            None => files.extend(
+                directories::ProjectDirs::from("dev", "sync_labs", "sync_gate")
+                    .map(|c| c.config_dir().join("config.toml")),
+            ),
         }
         for f in files {
             let r = open_private_file(&f).and_then(|mut h| {
@@ -1541,11 +1585,15 @@ mod tests {
         let b = base("path");
         let f = b.join("config.toml");
         std::fs::write(&f, "x").unwrap();
+        // A refusal by the rules (`is_refusal`), never an error of the system that a retry or
+        // another spelling could get past.
         let bad = |p: &str| {
-            let e = file_err(read_all(Path::new(p)));
-            assert_ne!(e.kind(), io::ErrorKind::NotFound, "{p}: {e}");
-            let e = file_err(check_private_file(Path::new(p)));
-            assert_ne!(e.kind(), io::ErrorKind::NotFound, "{p}: {e}");
+            for e in [
+                file_err(read_all(Path::new(p))),
+                file_err(check_private_file(Path::new(p))),
+            ] {
+                assert!(super::super::is_refusal(&e), "{p}: {e} ({:?})", e.kind());
+            }
         };
         let s = f.display().to_string();
         bad(&format!("{s}:alt"));
@@ -1558,44 +1606,76 @@ mod tests {
         bad(r"\\server\share\f");
         bad(r"\\.\NUL");
         bad(&format!(r"{}\NUL", b.display()));
+        bad(&format!(r"{}\com1.txt", b.display()));
         bad("config.toml");
         let dotted = b.join("d.").join("f");
         bad(&dotted.display().to_string());
         assert_eq!(read_all(Path::new(&format!(r"\\?\{s}"))).unwrap(), "x");
-        let _ = std::fs::remove_dir_all(&b);
-    }
-
-    /// F10: a reparse point that is not a link (here WOF compression) is refused too.
-    #[test]
-    fn a_compressed_file_is_refused() {
-        let b = base("wof");
-        let f = b.join("big.bin");
-        std::fs::write(&f, vec![b'a'; 256 * 1024]).unwrap();
-        let out = Command::new("compact")
-            .args(["/c", "/exe:xpress4k"])
-            .arg(&f)
-            .output()
-            .unwrap();
-        let tag = std::fs::File::open(&f).ok().and_then(|_| {
-            let h = std::fs::OpenOptions::new()
-                .access_mode(FILE_READ_ATTRIBUTES)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-                .open(&f)
-                .ok()?;
-            tag_info(&h)
-        });
-        match tag {
-            Some((attrs, 0x8000_0017)) if out.status.success() && attrs & 0x400 != 0 => {
-                refused_with(read_all(&f), "is a reparse point (tag 0x80000017)");
-            }
-            other => println!("skipped: compact gave no WOF reparse point ({other:?}, {out:?})"),
+        // Names that only look like a device are plain files: a non-ASCII 4-byte name included
+        // (the device check must not cut a character in two).
+        for n in ["abİ", "COMx", "console"] {
+            let g = b.join(n);
+            std::fs::write(&g, "y").unwrap();
+            assert_eq!(read_all(&g).unwrap(), "y", "{n}");
         }
         let _ = std::fs::remove_dir_all(&b);
     }
 
-    /// The owner of a file is judged: one owned by a SID outside the boundary is refused even
-    /// with a clean DACL. Needs SeRestorePrivilege to set another owner; skipped without it.
+    /// F10: a reparse point that is not a link is refused too. WOF compression here leaves no
+    /// reparse point (step S5: attributes 0x20), so the test sets one itself: a third-party tag
+    /// (neither the Microsoft bit nor the name-surrogate bit), which a user may set on a file of
+    /// theirs.
     #[test]
+    fn a_reparse_point_that_is_not_a_link_is_refused() {
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+        const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+        const TAG: u32 = 0x0000_1234;
+        let b = base("rp");
+        let f = b.join("f");
+        std::fs::write(&f, "x").unwrap();
+        assert_eq!(read_all(&f).unwrap(), "x");
+        // REPARSE_GUID_DATA_BUFFER: tag, data length, reserved, GUID, data.
+        let mut buf = Vec::new();
+        buf.extend(TAG.to_le_bytes());
+        buf.extend(4u16.to_le_bytes());
+        buf.extend(0u16.to_le_bytes());
+        buf.extend([0x5a_u8; 16]);
+        buf.extend([1u8, 2, 3, 4]);
+        let h = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&f)
+            .unwrap();
+        let mut n = 0;
+        // SAFETY: a valid handle and an input buffer of the length passed.
+        let ok = unsafe {
+            DeviceIoControl(
+                h.as_raw_handle(),
+                FSCTL_SET_REPARSE_POINT,
+                buf.as_ptr().cast(),
+                buf.len() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut n,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0, "set reparse point: {}", io::Error::last_os_error());
+        drop(h);
+        refused_with(
+            read_all(&f),
+            "is a reparse point (tag 0x1234), not a plain file",
+        );
+        refused_with(check_private_file(&f), "is a reparse point (tag 0x1234)");
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// The owner of a file is judged: one owned by a SID outside the boundary is refused even
+    /// with a clean DACL. Setting another owner needs SeRestorePrivilege, so this runs only when
+    /// asked for (elevated): `cargo test -p sync_gate_core -- --ignored another_owner`. It fails,
+    /// never passes, when it cannot set the owner. Without it the rule is proven by `the_file_decision`.
+    #[test]
+    #[ignore = "needs SeRestorePrivilege: run elevated"]
     fn a_file_of_another_owner_is_refused() {
         let b = base("own");
         let f = b.join("f");
@@ -1605,11 +1685,12 @@ mod tests {
             .args(["/setowner", "*S-1-5-32-545"])
             .output()
             .unwrap();
-        if out.status.success() {
-            refused_with(read_all(&f), "is owned by another user (S-1-5-32-545)");
-        } else {
-            println!("skipped: cannot set another owner ({})", me());
-        }
+        assert!(
+            out.status.success(),
+            "cannot set another owner ({}): {out:?}",
+            me()
+        );
+        refused_with(read_all(&f), "is owned by another user (S-1-5-32-545)");
         let _ = std::fs::remove_dir_all(&b);
     }
 }

@@ -19,6 +19,8 @@ use std::path::{Component, PathBuf};
 #[cfg(windows)]
 mod win;
 #[cfg(windows)]
+pub(crate) use win::check_names;
+#[cfg(windows)]
 pub use win::{check_private_dir, check_private_file, create_private_dir, open_private_file};
 
 #[cfg(unix)]

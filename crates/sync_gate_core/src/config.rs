@@ -20,6 +20,9 @@ pub fn data_dir() -> Option<PathBuf> {
 /// change it) and read from that handle. A missing folder reads as a missing file.
 pub fn read_config(path: &Path) -> std::io::Result<String> {
     use std::io::Read;
+    // Windows: `absolute` would drop a final dot or space; the names are judged as given.
+    #[cfg(windows)]
+    crate::private_dir::check_names(path)?;
     let path = std::path::absolute(path)?;
     if let Some(dir) = path.parent()
         && crate::check_private_dir(dir)? == crate::DirState::Missing
@@ -1333,21 +1336,28 @@ command=\"  \t\""
         read_config(&d.file()).unwrap();
     }
 
-    /// Windows: a stream of the config is never read; a final dot or space is dropped by
-    /// `absolute` before the folder walk and the open, so both see the same file.
+    /// Windows (14.5): a stream of the config, or a name ending in a dot or a space (which Win32
+    /// would change before the folder walk and the open), is refused by the rules; a verbatim
+    /// path to the same plain file is read.
     #[cfg(windows)]
     #[test]
     fn a_config_path_that_names_a_stream_is_refused() {
         let d = CfgDir::new("ads");
         let s = d.file().display().to_string();
-        let e = read_config(Path::new(&format!("{s}:x"))).unwrap_err();
-        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
-        for p in [format!("{s}."), format!("{s} ")] {
-            assert_eq!(
-                read_config(Path::new(&p)).unwrap(),
-                "max_wait_secs = 5
-"
-            );
+        for p in [
+            format!("{s}:x"),
+            format!("{s}."),
+            format!("{s} "),
+            format!(r"\\?\{s}."),
+            "config.toml.".to_owned(),
+        ] {
+            let e = read_config(Path::new(&p)).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{p}: {e}");
+            assert!(crate::is_refusal(&e), "{p}: {e}");
         }
+        assert_eq!(
+            read_config(Path::new(&format!(r"\\?\{s}"))).unwrap(),
+            "max_wait_secs = 5\n"
+        );
     }
 }
