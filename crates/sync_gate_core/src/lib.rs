@@ -45,13 +45,19 @@ pub use template::{KeyError, is_template_key, template_key};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// `cargo test -p sync_gate_core` alone leaves `ipc` off and its tests out; libtest prints an
-/// ignore reason without `--nocapture`, so the run shows it.
+/// `cargo test -p sync_gate_core` alone leaves `ipc` off and its tests out. The note goes straight
+/// to the stderr handle, which libtest does not capture, so it shows even with `--quiet`.
 #[cfg(all(test, not(feature = "ipc")))]
 mod ipc_coverage {
     #[test]
-    #[ignore = "ipc coverage skipped: run with --features ipc"]
-    fn skipped() {}
+    fn skipped() {
+        use std::io::Write;
+        writeln!(
+            std::io::stderr(),
+            "warning: ipc coverage skipped: run with --features ipc"
+        )
+        .unwrap();
+    }
 }
 
 #[cfg(test)]
