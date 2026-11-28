@@ -636,6 +636,9 @@ fn short_options() -> sync_gate_shim::RunOptions {
     }
 }
 
+/// How long "nothing happened" is watched: several `short_options` write timeouts (80 ms).
+const ABSENCE_WINDOW: Duration = Duration::from_millis(320);
+
 fn wait_for(message: &str, mut condition: impl FnMut() -> bool) {
     let until = Instant::now() + Duration::from_secs(5);
     while !condition() {
@@ -1372,8 +1375,8 @@ fn client_stops_reading(mode: McpMode) {
     wait_for("the relay never wrote to the client", || {
         gate.entered.load(Ordering::SeqCst)
     });
-    std::thread::sleep(Duration::from_millis(500));
-    let ended = s.done.try_recv().is_ok();
+    // Absence window: returns at once if the session ends, else after a few write timeouts.
+    let ended = s.done.recv_timeout(ABSENCE_WINDOW).is_ok();
     gate.open();
     assert!(
         !ended,
@@ -1413,7 +1416,8 @@ fn big_request(id: i64) -> Vec<u8> {
 
 #[test]
 fn direct_child_that_stops_reading_stdin_does_not_end_the_session() {
-    let mut cfg = config(McpMode::PerSession, 0, &methods_file("slow-reader"));
+    let file = methods_file("slow-reader");
+    let mut cfg = config(McpMode::PerSession, 0, &file);
     cfg.mcp
         .get_mut("docs")
         .unwrap()
@@ -1422,9 +1426,10 @@ fn direct_child_that_stops_reading_stdin_does_not_end_the_session() {
     let mut s = Session::with_options(cfg, &tmp_name("slow"), "docs", short_options());
     // Larger than any pipe buffer: the relay's write blocks until the child reads.
     s.stdin.as_ref().unwrap().send(big_request(1)).unwrap();
-    std::thread::sleep(Duration::from_millis(400));
+    // The child exists (it opens its file first) and is still in its start delay: the write blocks.
+    wait_for("the child never started", || file.exists());
     assert!(
-        s.done.try_recv().is_err(),
+        s.done.recv_timeout(ABSENCE_WINDOW).is_err(),
         "a direct server busy for a while ended the session: {}",
         s.err.text()
     );
