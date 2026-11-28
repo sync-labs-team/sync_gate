@@ -114,6 +114,9 @@ Invoke-SyncGateMain -Uninstall
         function Start-SyncGateDaemon { param($Layout) $calls.Add('daemon start') }
         function Invoke-SgNative { param($File, $Arguments, $Env) $calls.Add(($Arguments -join ' ')); @{ ExitCode = 0 } }
         function Get-SyncGateLayout { $layout }
+        # The judge is bin\sync_gate.exe of the layout's root; what it checks is covered by test-install.ps1.
+        function Get-SgInstallRoot { Split-Path -Parent $layout.Bin }
+        function Assert-SgPrivateFiles { }
         function Get-SyncGatePaths { @{} }
         function Find-SgConfigReferences { }
         function Save-SyncGateRollback { param($Layout, $Fresh, $Stamp, $FirstStep) [IO.File]::WriteAllText($marker, $FirstStep) }
@@ -184,6 +187,9 @@ Invoke-SyncGateMain -Uninstall
         $layout = @{ Bin = $bin; Rollback = (Join-Path $folder 'unused'); Overrides = @{} }
         $seen = @{}
         function Get-SyncGateLayout { $layout }
+        # The judge is bin\sync_gate.exe of the layout's root; what it checks is covered by test-install.ps1.
+        function Get-SgInstallRoot { Split-Path -Parent $layout.Bin }
+        function Assert-SgPrivateFiles { }
         function Get-SyncGatePaths { @{} }
         function Invoke-SgNative { param($File, $Arguments, $Env) $seen.Restore = $Arguments; @{ ExitCode = 0 } }
         function Save-SyncGateRollback { throw 'uninstall advanced past the config guard' }

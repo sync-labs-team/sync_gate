@@ -1257,10 +1257,18 @@ function Invoke-SyncGateInstall {
 }
 
 function Invoke-SyncGateUninstall {
-    # No other binary is at hand: the installed one judges (it runs below anyway), before the state is read.
+    # No other binary is at hand: the installed one judges (it runs below anyway), before the state is read. Without
+    # it nothing can judge the state or the rollback, so neither is read (only whether they exist): a reinstall judges
+    # them with the downloaded binary and finishes an interrupted run.
     $root = Get-SgInstallRoot
     $judge = Join-Path $root 'bin\sync_gate.exe'
-    if (Test-Path -LiteralPath $judge) { Assert-SgPrivateFiles -Root $root -Judge $judge -Nothing 'nothing was removed' -AllowOld }
+    if (-not (Test-Path -LiteralPath $judge)) {
+        if ((Test-Path -LiteralPath (Join-Path $root 'install-state.json')) -or (Test-Path -LiteralPath (Join-Path $root 'rollback\in-progress'))) {
+            throw "$judge is missing, so nothing can check the installer's state in ${root}: reinstall first, then uninstall; nothing was removed"
+        }
+        Write-SgLine "sync_gate is not installed in $root; nothing to do"; return
+    }
+    Assert-SgPrivateFiles -Root $root -Judge $judge -Nothing 'nothing was removed' -AllowOld
     $L = Get-SyncGateLayout
     if (Test-Path -LiteralPath (Join-Path $L.Rollback 'in-progress')) {
         $was = [IO.File]::ReadAllText((Join-Path $L.Rollback 'in-progress')).Trim()

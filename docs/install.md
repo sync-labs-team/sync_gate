@@ -133,7 +133,9 @@ until the new daemon answers.
 - A run that failed undoes itself and prints `previous version restored`.
 - A run that was cut off (closed window, power loss) is undone by the next run, before anything
   else: it prints `a previous run stopped at <step>; restoring it first`. Run the install or the
-  uninstall command again.
+  uninstall command again. On Windows an uninstall needs `bin\sync_gate.exe` to check the
+  installer's files first; without it, it stops and changes nothing: run the install command,
+  then the uninstall.
 - If the message says `could not restore ...; files kept in <rollback folder>`, something could
   not be put back (a file in use or a replaced program, for example). On Windows, a binary
   conflict during uninstall recovery blocks shim recreation and scheduled task startup.

@@ -1326,6 +1326,31 @@ Invoke-Scenario '3.29' {
     Assert-SgRefused (Invoke-Inst -From $FromNew) $before 'nothing was changed'
     Assert-SgRefused (Invoke-Inst -Uninstall) $before 'nothing was removed'
 }
+# C-01: an uninstall without the installed sync_gate.exe has no judge. It reads neither the state (broken here) nor
+# the rollback (an interrupted run to resume), changes nothing and says to reinstall first. With neither there, it
+# has nothing to do.
+Invoke-Scenario '3.29m' {
+    [void](Install-Ok $FromNew)
+    Stop-TestDaemons
+    $L = Get-TestLayout
+    Remove-Item -LiteralPath (Join-Path $L.Bin 'sync_gate.exe') -Force
+    [IO.File]::WriteAllText($L.StatePath, '{ not json')
+    foreach ($resume in $false, $true) {
+        if ($resume) {
+            # An interrupted first install: no state, only the rollback.
+            Remove-Item -LiteralPath $L.StatePath -Force
+            [void](New-Item -ItemType Directory -Force -Path $L.Rollback)
+            [IO.File]::WriteAllText((Join-Path $L.Rollback 'in-progress'), 'U4')
+        }
+        $before = Get-InstallView $B.SYNC_GATE_INSTALL_DIR
+        $r = Invoke-Inst -Uninstall
+        Assert-That ($r.Code -ne 0 -and $r.Text.Contains('reinstall') -and $r.Text.Contains('nothing was removed') -and -not $r.Text.Contains('restoring')) "no judge (resume=$resume): exit $($r.Code): $($r.Text)"
+        Assert-That ((Get-InstallView $B.SYNC_GATE_INSTALL_DIR) -ceq $before) "the install folder changed (resume=$resume)"
+    }
+    Remove-Item -LiteralPath $L.Rollback -Recurse -Force
+    $r = Invoke-Inst -Uninstall
+    Assert-That ($r.Code -eq 0 -and $r.Text.Contains('nothing to do')) "nothing installed: exit $($r.Code): $($r.Text)"
+}
 # C-06: the rollback folder is judged before it is listed. One others can change, holding a folder this user cannot
 # list: refused with the reason, never a listing error first.
 Invoke-Scenario '3.30' {
