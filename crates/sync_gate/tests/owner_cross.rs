@@ -393,6 +393,14 @@ fn a_ticket_saved_by_a_normal_process_is_run_by_wait_here() {
     };
     // A job holds the one slot until `stop` exists.
     let (started, stop) = (d.join("started"), d.join("stop"));
+    // A failed assert below still lets the holding job end.
+    struct Stop(PathBuf);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, "");
+        }
+    }
+    let _stop = Stop(stop.clone());
     let hold = format!(
         "New-Item -ItemType File '{}' | Out-Null; while (-not (Test-Path '{}')) {{ Start-Sleep -Milliseconds 100 }}",
         started.display(),

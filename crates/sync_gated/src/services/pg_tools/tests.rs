@@ -390,11 +390,12 @@ fn check_tree_refuses_a_file_open_for_writing() {
 /// B3, Windows: the contract of the DELETE probe that stands in for `open_private_file` in
 /// `check_tree`. Refused, like a read would be: any handle with write or append access to the
 /// data, whatever it shares. Passed, like a read: readers that share deletes, a read-only file.
-/// The one difference, refused here and read by `open_private_file`: a handle that does not share
-/// deletes; told as an error of the system (retry), never as a refusal by the rules.
+/// A difference this pins, refused here and read by `open_private_file`: a handle that does not
+/// share deletes; told as an error of the system, never as a refusal by the rules. Not pinned:
+/// permissions that grant reading but not DELETE (the probe asks for DELETE, not a read).
 #[cfg(windows)]
 #[test]
-fn check_tree_probe_refuses_what_a_read_refuses() {
+fn check_tree_probe_refuses_writers() {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_APPEND_DATA: u32 = 0x4;
     const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
