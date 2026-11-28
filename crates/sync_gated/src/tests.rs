@@ -2258,7 +2258,7 @@ fn hub_decisions_reach_the_status_log() {
     let probe = child.next();
     let bad = serde_json::json!({"jsonrpc": "2.0", "id": probe["id"], "result": {"supportedVersions": ["2099-01-01"]}});
     child.send(bad);
-    let want = "mcp docs: no supported protocol version; not restarting";
+    let want = "mcp docs: no supported protocol version; not restarting for 10 min";
     wait_until("the decision in status", || {
         match crate::respond(
             &h.core,
