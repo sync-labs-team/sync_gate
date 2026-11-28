@@ -12,10 +12,14 @@ use std::time::{Duration, Instant};
 use sync_gate_core::{Kind, McpServer, classify, error_response};
 
 const MAX_PARSED_LINE: usize = 1 << 20;
-/// An `initialize` is stored for replay up to this size, kept across pieces. Measured: a real
-/// client sends well under 100 KiB; 8 MiB is the per-client queue limit, so one stored line never
-/// outweighs what the hub already holds for a session.
+/// Bytes of content, not of memory: the stored `initialize` (kept across pieces for replay) and
+/// the reply to its replay (kept until checked) each stop at this size. Parsing either, and the
+/// copy sent as replay, allocate on top of it, more for JSON with many small values; the relay
+/// has no ceiling on its total memory. Measured: a real client sends well under 100 KiB; 8 MiB is
+/// the per-client queue limit, so one stored line never outweighs what the hub holds for a session.
 const MAX_STORED_INITIALIZE: usize = 8 << 20;
+/// Counts requests, not their bytes: an id is as long as the client writes it (up to the 1 MiB
+/// first piece), so this bounds memory only as far as the client's own ids do.
 const MAX_TRACKED: usize = 4096;
 const LOST: &str = "hub connection lost; request not completed";
 const UNAVAILABLE: &str = "hub connection lost; direct server unavailable";
@@ -273,8 +277,8 @@ struct Session<'a> {
     tx: Sender<Event>,
     flight: HashSet<String>,
     initialize: Option<(String, Vec<u8>)>,
-    /// The first `initialize` exceeded [`MAX_STORED_INITIALIZE`] and was not stored.
-    initialize_too_large: bool,
+    /// Why a line that may be the first `initialize` was not stored (too large, unreadable).
+    initialize_lost: Option<&'static str>,
     /// A line that may be the first `initialize` is still arriving (bytes so far).
     init_partial: Option<Vec<u8>>,
     replay: Option<(String, Instant)>,
@@ -290,7 +294,8 @@ struct Session<'a> {
     output_id: Option<String>,
     input_open: bool,
     unknown_large: bool,
-    swallowing: bool,
+    /// The reply to a silent replay, kept until it is whole and checked.
+    swallowed: Option<Vec<u8>>,
     noted: bool,
     cleanup_until: Option<Instant>,
 }
@@ -355,7 +360,7 @@ pub(crate) fn run(
         tx,
         flight: HashSet::new(),
         initialize: None,
-        initialize_too_large: false,
+        initialize_lost: None,
         init_partial: None,
         replay: None,
         replay_is_client: false,
@@ -369,7 +374,7 @@ pub(crate) fn run(
         output_id: None,
         input_open: false,
         unknown_large: false,
-        swallowing: false,
+        swallowed: None,
         noted: false,
         cleanup_until: None,
     };
@@ -510,10 +515,8 @@ impl Session<'_> {
         // would refuse every request.
         let refused = if self.init_partial.take().is_some() {
             Some("hub connection lost while the client's initialize was still arriving")
-        } else if self.initialize.is_none() && self.initialize_too_large {
-            Some("hub connection lost; initialize too large to replay")
         } else {
-            None
+            self.initialize_lost.filter(|_| self.initialize.is_none())
         };
         if let Some(why) = refused {
             self.log.line(&format!(
@@ -742,25 +745,36 @@ impl Session<'_> {
                             self.replay.as_ref().is_some_and(|(key, _)| id == *key)
                         })
                     {
+                        // The client's own initialize: its reply, error or not, is the client's to
+                        // judge, as with a direct server; the session goes on either way.
                         if self.replay_is_client {
                             self.forwarding = true;
-                        } else if is_error(&piece.bytes) {
-                            // The client was told it is initialized; this server is not.
-                            self.log.line(&format!(
-                                "sync_gate_mcp: '{}' refused the replayed initialize",
-                                self.name
-                            ));
-                            return self.fail_replay(rx, 1);
                         } else {
-                            self.swallowing = true;
+                            self.swallowed = Some(Vec::new());
                         }
                     }
-                    if self.swallowing {
+                    if let Some(reply) = self.swallowed.as_mut() {
                         if let Some(e) = &self.endpoint {
                             let _ = e.ack.send(());
                         }
+                        // The client was told it is initialized: only a whole, checked success
+                        // lets the session go on with this server.
+                        let why = if reply.len() + piece.bytes.len() > MAX_STORED_INITIALIZE {
+                            // shortcut: a reply over 8 MiB to the replayed initialize ends the
+                            // session, check it while streaming if real servers send that much.
+                            Some("replied to the replayed initialize with more than 8 MiB")
+                        } else {
+                            reply.extend_from_slice(&piece.bytes);
+                            let key = self.replay.as_ref().map_or("", |(key, _)| key.as_str());
+                            piece.end.then(|| not_accepted(reply, key)).flatten()
+                        };
+                        if let Some(why) = why {
+                            self.log
+                                .line(&format!("sync_gate_mcp: '{}' {why}", self.name));
+                            return self.fail_replay(rx, 1);
+                        }
                         if piece.end {
-                            self.swallowing = false;
+                            self.swallowed = None;
                             self.replay = None;
                             if !self.send(
                                 b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n"
@@ -792,7 +806,8 @@ impl Session<'_> {
                     self.output_open = !piece.end;
                     let end = piece.end;
                     // Only one output piece per endpoint is admitted until its write completes;
-                    // the remaining queue consists of at most MAX_TRACKED + 1 small error replies.
+                    // the rest of the queue is at most MAX_TRACKED + 1 error replies, each as
+                    // long as the id it echoes.
                     self.out.push(piece.bytes, Some(source));
                     if self.forwarding && end {
                         // The client's own initialize is answered; the rest was lost with the hub.
@@ -850,7 +865,7 @@ impl Session<'_> {
                 // JSON fields come in any order: until it has an `initialize`, the relay keeps
                 // every object whose start does not show another method, and reads it whole.
                 if self.initialize.is_none()
-                    && !self.initialize_too_large
+                    && self.initialize_lost.is_none()
                     && piece.bytes.trim_ascii_start().first() == Some(&b'{')
                     && prefix_value(&piece.bytes, "method").is_none_or(|v| v == "initialize")
                 {
@@ -864,19 +879,29 @@ impl Session<'_> {
             if buf.len() + piece.bytes.len() > MAX_STORED_INITIALIZE {
                 // Too large to keep is too large to tell; MCP sends `initialize` first, so a
                 // line this size before it is taken for one.
+                // shortcut: an undecided line over 8 MiB before the initialize disables the
+                // fallback, classify it while streaming if larger compliant handshakes appear.
                 self.init_partial = None;
-                self.initialize_too_large = true;
+                self.initialize_lost = Some("hub connection lost; initialize too large to replay");
             } else {
                 buf.extend_from_slice(&piece.bytes);
                 if piece.end
                     && let Some(line) = self.init_partial.take()
-                    && let Some(Kind::Request { id, method }) = parse(&line)
-                    && method == "initialize"
                 {
-                    // Its id may lie past the start the first piece was scanned for.
-                    let id = id.to_string();
-                    self.flight.insert(id.clone());
-                    self.initialize = Some((id, line));
+                    match parse(&line) {
+                        Some(Kind::Request { id, method }) if method == "initialize" => {
+                            // Its id may lie past the start the first piece was scanned for.
+                            let id = id.to_string();
+                            self.flight.insert(id.clone());
+                            self.initialize = Some((id, line));
+                        }
+                        Some(_) => {}
+                        // Unreadable (too deep, not JSON) is not "no initialize": it may be one.
+                        None => {
+                            self.initialize_lost =
+                                Some("hub connection lost; initialize could not be read to replay");
+                        }
+                    }
                 }
             }
         }
@@ -932,11 +957,19 @@ fn response_id(bytes: &[u8]) -> Option<String> {
         _ => None,
     }
 }
-/// An error response: parsed, or for a line too large to parse, a top-level `error` near its start.
-fn is_error(bytes: &[u8]) -> bool {
-    match serde_json::from_slice::<Value>(bytes) {
-        Ok(v) => v.get("error").is_some(),
-        Err(_) => prefix_field(bytes, "error").is_some(),
+/// Why the whole reply to a silent replay is not a success for `key`; `None` when it is.
+fn not_accepted(reply: &[u8], key: &str) -> Option<&'static str> {
+    let Ok(v) = serde_json::from_slice::<Value>(reply) else {
+        return Some("gave no valid reply to the replayed initialize");
+    };
+    if v.get("error").is_some() {
+        Some("refused the replayed initialize")
+    } else if v.get("result").is_some()
+        && matches!(classify(&v), Kind::Response { id } if serde_json::from_str::<Value>(key).is_ok_and(|k| k == id))
+    {
+        None
+    } else {
+        Some("gave no valid reply to the replayed initialize")
     }
 }
 /// Tolerant top-level id scan: ignores strings, nested ids and the rest of a huge JSON value.
