@@ -718,13 +718,7 @@ impl Mux {
         let stateless = matches!(self.phase, Phase::Stateless);
         let field = |k: &str| v.pointer("/params/_meta").and_then(|m| m.get(k));
         let version = field(META_VERSION);
-        let legacy = version
-            .and_then(Value::as_str)
-            .is_some_and(|ver| LEGACY_VERSIONS.contains(&ver));
-        // Per-request protocol fields make a request modern, even a malformed one; on a stateless
-        // child `server/discover` is modern whatever it carries (legacy revisions have none).
-        let modern = (stateless && method == "server/discover")
-            || (!legacy && (version.is_some() || field(META_CAPS).is_some()));
+        let modern = is_modern(method, &v, stateless);
         // A stateless child is served in the one modern version the hub speaks, and only to a
         // request that carries every required `_meta` field (basic/index, "_meta").
         if stateless && modern {
@@ -1182,11 +1176,17 @@ fn truncate(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-/// The protocol version a modern request names; `None` for a legacy client's request.
-fn modern_version(v: &Value) -> Option<&str> {
-    v.pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+/// Whether a request is in the modern revision. Per-request protocol fields make it modern, even a
+/// malformed one; where the hub is a modern server (`discover_modern`), `server/discover` is
+/// modern whatever it carries (legacy revisions have none).
+fn is_modern(method: &str, v: &Value, discover_modern: bool) -> bool {
+    let field = |k: &str| v.pointer("/params/_meta").and_then(|m| m.get(k));
+    let version = field(META_VERSION);
+    let legacy = version
         .and_then(Value::as_str)
-        .filter(|ver| !LEGACY_VERSIONS.contains(ver))
+        .is_some_and(|ver| LEGACY_VERSIONS.contains(&ver));
+    (discover_modern && method == "server/discover")
+        || (!legacy && (version.is_some() || field(META_CAPS).is_some()))
 }
 
 /// UnsupportedProtocolVersionError (basic/versioning, "Protocol Version Negotiation").
@@ -1198,8 +1198,15 @@ fn version_error(rid: &Value, requested: &str, supported: &[&str]) -> Value {
 }
 
 /// A request to a child the hub cannot speak to: a modern one learns that no version works here.
+/// Classified as `serve` does on a stateless child; a modern request with no string version keeps
+/// the legacy error, as there is no `requested` to report.
 fn unsupported_reply(rid: &Value, v: &Value) -> Value {
-    match modern_version(v) {
+    let method = v["method"].as_str().unwrap_or_default();
+    let version = v
+        .pointer("/params/_meta")
+        .and_then(|m| m.get(META_VERSION))
+        .and_then(Value::as_str);
+    match version.filter(|_| is_modern(method, v, true)) {
         Some(ver) => version_error(rid, ver, &[]),
         None => error_response(rid, -32000, NO_VERSION),
     }

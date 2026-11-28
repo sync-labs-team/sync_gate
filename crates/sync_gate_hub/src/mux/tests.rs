@@ -1739,7 +1739,7 @@ fn a_legacy_to_stateless_restart_clears_old_subscriptions() {
 }
 
 #[test]
-fn only_a_non_legacy_string_version_makes_a_request_modern() {
+fn a_legacy_version_is_rewritten_except_on_discover_which_gets_32022() {
     let now = Instant::now();
     let mut m = stateless_two(now);
     for v in [json!("2025-11-25"), json!("2024-11-05")] {
@@ -2084,6 +2084,28 @@ fn an_unsupported_child_answers_32022_with_supported_versions() {
     assert_eq!(to_client(&out, 1)[0]["error"]["message"], NO_VERSION);
 }
 
+// Same section: `server/discover` is modern whatever version it names (legacy revisions have
+// none), so through an unsupported child one naming a legacy version also gets -32022, queued
+// or new, as `serve` classifies it on a stateless child.
+#[test]
+fn an_unsupported_child_answers_32022_to_a_discover_naming_a_legacy_version() {
+    let now = Instant::now();
+    let discover = |rid: i64| {
+        let mut line: Value =
+            serde_json::from_str(&modern_line(rid, "server/discover", json!({}))).unwrap();
+        line["params"]["_meta"][MODERN_META] = json!("2025-11-25");
+        line.to_string()
+    };
+    let (mut m, out) = unsupported_one(now, &[discover(1)]);
+    let queued = to_client(&out, 1);
+    let new = to_client(&m.client_line(1, &discover(2), now), 1);
+    for (what, e) in [("queued", &queued[0]), ("new", &new[0])] {
+        assert_eq!(e["error"]["code"], -32022, "{what}: {e}");
+        assert_eq!(e["error"]["data"]["supported"], json!([]), "{what}");
+        assert_eq!(e["error"]["data"]["requested"], "2025-11-25", "{what}");
+    }
+}
+
 // MCP 2026-07-28 basic, "ResultType": the `result` MUST include a `resultType` field. Results the
 // hub makes itself for a modern request say "complete"; a legacy client's stay as they were.
 #[test]
@@ -2124,8 +2146,9 @@ fn a_modern_request_without_client_capabilities_is_invalid_params() {
 // MCP 2026-07-28 basic/patterns/subscriptions, "Acknowledgment": the server MUST send
 // `notifications/subscriptions/acknowledged` first, carrying the subscription id (the listen
 // request's id) in `_meta`; types it does not support are omitted. The hub opens no stream on
-// the child, so it honors none: an empty filter, nothing sent to the child, no reply until the
-// client cancels (basic/index: all implementations MUST support the message patterns).
+// the child, so it honors none: an empty filter, nothing sent to the child, then a completion
+// result that ends the subscription at once (basic/index: all implementations MUST support the
+// message patterns).
 #[test]
 fn subscriptions_listen_is_acknowledged_with_no_notification_types() {
     let now = Instant::now();

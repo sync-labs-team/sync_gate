@@ -1416,7 +1416,11 @@ fn a_line_without_jsonrpc_neither_waits_nor_cancels_in_the_hub_queue() {
     let refused = c.recv();
     assert_eq!(refused["id"], 9);
     assert_eq!(refused["error"]["code"], -32600);
-    assert_eq!(queued(&hub), 1, "the queued request was cancelled");
+    assert_eq!(
+        queued(&hub),
+        1,
+        "request 2 must stay queued: the line without jsonrpc cancels nothing"
+    );
     reply_to(&mut child, &seen[0]);
     assert_eq!(c.recv()["id"], 1);
     let moved = child.next();
