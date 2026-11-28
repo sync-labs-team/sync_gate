@@ -55,10 +55,12 @@ const UNSUPPORTED_VERSION: i64 = -32022;
 const LEGACY_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 /// Not a valid method name, so a child cannot collide with it.
 const NOTE_SUBSCRIPTIONS: &str = "\u{0}subscriptions";
+const NOTE_ENVELOPE: &str = "\u{0}jsonrpc";
 const NO_VERSION: &str = "mcp server speaks no supported version";
 const META_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
 const META_INFO: &str = "io.modelcontextprotocol/clientInfo";
 const META_CAPS: &str = "io.modelcontextprotocol/clientCapabilities";
+const META_SUBSCRIPTION: &str = "io.modelcontextprotocol/subscriptionId";
 
 #[derive(Debug, Clone, Copy)]
 enum Phase {
@@ -397,7 +399,11 @@ impl Mux {
         for (c, cl) in &mut self.clients {
             cl.queued_bytes = 0;
             for q in cl.queue.drain(..) {
-                push_client(out, *c, error_response(&q.msg["id"], code, message));
+                let reply = match self.phase {
+                    Phase::Unsupported => unsupported_reply(&q.msg["id"], &q.msg),
+                    _ => error_response(&q.msg["id"], code, message),
+                };
+                push_client(out, *c, reply);
             }
         }
     }
@@ -580,7 +586,20 @@ impl Mux {
             push_client(&mut out, id, err(-32700, "parse error", &Value::Null));
             return out;
         };
+        // JSON-RPC 2.0 section 4: no exact "jsonrpc":"2.0", no valid message; never forwarded.
+        let envelope = v.get("jsonrpc").and_then(Value::as_str) == Some("2.0");
         match classify(&v) {
+            Kind::Request { id: rid, .. } if !envelope => {
+                push_client(&mut out, id, err(-32600, "invalid request", &rid))
+            }
+            Kind::Notification { .. } if !envelope => {
+                if self.noted.insert(NOTE_ENVELOPE.to_string()) {
+                    out.push(Out::Note(format!(
+                        "{}: client notification without jsonrpc 2.0 dropped",
+                        self.server
+                    )));
+                }
+            }
             Kind::Request { id: rid, method } => {
                 self.client_request(id, rid, &method, v, line.len(), deadline, &mut out)
             }
@@ -613,7 +632,7 @@ impl Mux {
     ) {
         match self.phase {
             Phase::Ready | Phase::Stateless => self.serve(c, rid, method, v, deadline, out),
-            Phase::Unsupported => push_client(out, c, error_response(&rid, -32000, NO_VERSION)),
+            Phase::Unsupported => push_client(out, c, unsupported_reply(&rid, &v)),
             Phase::Failed { .. } => push_client(
                 out,
                 c,
@@ -695,16 +714,29 @@ impl Mux {
     ) {
         let over = self.over_cap(c);
         let stateless = matches!(self.phase, Phase::Stateless);
-        // A request is modern when it carries its own protocol version.
-        let modern = v
-            .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
-            .and_then(Value::as_str)
-            .is_some_and(|ver| !LEGACY_VERSIONS.contains(&ver));
-        if modern && let Some(cl) = self.clients.get_mut(&c) {
-            cl.handshaken = true;
+        let modern = modern_version(&v).is_some();
+        // A stateless child is served in the one modern version the hub speaks, and only to a
+        // request that carries every required `_meta` field (basic/index, "_meta").
+        if stateless && let Some(ver) = modern_version(&v) {
+            if ver != MODERN_VERSION {
+                return push_client(out, c, version_error(&rid, ver, &[MODERN_VERSION]));
+            }
+            if v.pointer("/params/_meta")
+                .and_then(|m| m.get(META_CAPS))
+                .is_none()
+            {
+                let m = "invalid params: _meta needs io.modelcontextprotocol/clientCapabilities";
+                return push_client(out, c, error_response(&rid, -32602, m));
+            }
         }
         let strict = stateless && !modern;
-        let local = |out: &mut Vec<Out>, r: Value| push_client(out, c, result_response(&rid, r));
+        // A modern result names its type (basic/index, "ResultType"); a legacy one stays as it was.
+        let local = |out: &mut Vec<Out>, mut r: Value| {
+            if modern && let Some(o) = r.as_object_mut() {
+                o.entry("resultType").or_insert_with(|| json!("complete"));
+            }
+            push_client(out, c, result_response(&rid, r))
+        };
         let too_many = |out: &mut Vec<Out>| {
             push_client(
                 out,
@@ -731,8 +763,18 @@ impl Mux {
             ("server/discover", _) => {
                 push_client(out, c, error_response(&rid, -32601, "method not found"))
             }
-            // `subscriptions/listen` streams replace subscribe in the new revision;
-            // sharing them across clients is not built, so refuse (see report).
+            // The hub opens no stream on the child, so it agrees to no notification type: an empty
+            // acknowledgment, and the stream stays open until the client cancels it.
+            ("subscriptions/listen", _) if stateless && modern => {
+                let params = json!({"_meta": {META_SUBSCRIPTION: rid}, "notifications": {}});
+                let method = "notifications/subscriptions/acknowledged";
+                push_client(
+                    out,
+                    c,
+                    json!({"jsonrpc":"2.0","method":method,"params":params}),
+                );
+            }
+            // A legacy client on a stateless child: it was offered no subscribe, so none is served.
             ("resources/subscribe" | "resources/unsubscribe" | "subscriptions/listen", _)
                 if stateless =>
             {
@@ -1124,6 +1166,29 @@ fn truncate(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// The protocol version a modern request names; `None` for a legacy client's request.
+fn modern_version(v: &Value) -> Option<&str> {
+    v.pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+        .and_then(Value::as_str)
+        .filter(|ver| !LEGACY_VERSIONS.contains(ver))
+}
+
+/// UnsupportedProtocolVersionError (basic/versioning, "Protocol Version Negotiation").
+fn version_error(rid: &Value, requested: &str, supported: &[&str]) -> Value {
+    let data = json!({"supported": supported, "requested": requested});
+    let message = "unsupported protocol version";
+    let error = json!({"code": UNSUPPORTED_VERSION, "message": message, "data": data});
+    json!({"jsonrpc": "2.0", "id": rid, "error": error})
+}
+
+/// A request to a child the hub cannot speak to: a modern one learns that no version works here.
+fn unsupported_reply(rid: &Value, v: &Value) -> Value {
+    match modern_version(v) {
+        Some(ver) => version_error(rid, ver, &[]),
+        None => error_response(rid, -32000, NO_VERSION),
+    }
 }
 
 fn hub_meta() -> Value {

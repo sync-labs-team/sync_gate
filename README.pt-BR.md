@@ -84,6 +84,7 @@ sync_gate mcp adopt
 - No Windows, o atalho não esconde um programa que existe só como `.ps1` na hora do `sync_gate shims install`. Se um aparecer depois, ele sai com 127 e uma instrução até a próxima instalação.
 - O benchmark é um proxy: os processos dos agentes não entram.
 - Toda semana o daemon busca no GitHub uma versão nova; `status` a mostra. Desligue com `update_check_days = 0` ([detalhes](docs/install.md#update)).
+- Os avisos de mudança de um servidor MCP compartilhado só vão às sessões que abriram com `initialize`. Um cliente da revisão 2026-07-28 recebe `subscriptions/listen` confirmado sem nenhum tipo de aviso, e nenhum log `notifications/message`: ele vê a mudança no próximo pedido.
 
 <!-- s:docs -->
 ## Documentação
