@@ -159,3 +159,51 @@ fn the_default_folders_are_under_the_sync_labs_vendor_folder() {
         "{config} {data}"
     );
 }
+
+/// D3: `paths --check` judges files and folders the way sync_gate judges its own (the installer
+/// uses it): one of ours passes, absent passes, one others can change is refused with the reason.
+#[test]
+fn paths_check_judges_files_and_folders() {
+    let e = Env::new("check");
+    let f = e.dir.join("launcher.cmd");
+    std::fs::write(&f, "@echo off\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&e.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let absent = e.dir.join("absent.json");
+    let check = |paths: &[&PathBuf]| {
+        let mut c = e.cmd(&["paths", "--check"], None);
+        c.args(paths);
+        c.output().unwrap()
+    };
+    let ok = check(&[&e.dir, &f, &absent]);
+    assert_eq!(
+        ok.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o666)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let out = Command::new("icacls")
+            .arg(&f)
+            .args(["/grant", "*S-1-1-0:(W)"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "icacls: {out:?}");
+    }
+    let bad = check(&[&e.dir, &f]);
+    let err = String::from_utf8_lossy(&bad.stderr);
+    let _ = std::fs::remove_dir_all(&e.dir);
+    assert_eq!(bad.status.code(), Some(1), "{err}");
+    assert!(err.contains("writable by other users"), "{err}");
+    assert!(err.contains("launcher.cmd"), "{err}");
+}

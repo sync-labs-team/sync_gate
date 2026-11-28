@@ -48,7 +48,13 @@ enum Cmd {
         cmd: ShimsCmd,
     },
     /// Print the paths and socket names this sync_gate uses, one `key=value` per line.
-    Paths,
+    Paths {
+        /// Instead, judge each PATH as sync_gate judges what it trusts (a folder only you can
+        /// change; a file nobody else can change, not a link); absent paths pass. One line per
+        /// refusal; exit 1 when any is refused. The installer uses it.
+        #[arg(long, num_args = 1.., value_name = "PATH")]
+        check: Vec<PathBuf>,
+    },
     /// Agent hook entry points (Claude Code, Codex).
     Hook {
         #[command(subcommand)]
@@ -109,6 +115,26 @@ enum McpCmd {
         strict: bool,
         servers: Vec<String>,
     },
+}
+
+/// `paths --check`: folders by `check_private_dir`, anything else by `check_private_file`.
+fn check_paths(paths: &[PathBuf]) -> i32 {
+    let mut refused = 0;
+    for p in paths {
+        let r = match std::fs::symlink_metadata(p) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(m) if m.is_dir() => sync_gate_core::check_private_dir(p).map(drop),
+            _ => match sync_gate_core::check_private_file(p) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                r => r,
+            },
+        };
+        if let Err(e) = r {
+            eprintln!("sync_gate: refused: {e}");
+            refused += 1;
+        }
+    }
+    i32::from(refused > 0)
 }
 
 /// `key=value` lines, values as they are; a value that is missing, not UTF-8 or multi-line fails.
@@ -217,7 +243,8 @@ fn main() {
         Cmd::Shims {
             cmd: ShimsCmd::Remove,
         } => sync_gate::shims::cli_remove(),
-        Cmd::Paths => paths(),
+        Cmd::Paths { check } if check.is_empty() => paths(),
+        Cmd::Paths { check } => check_paths(&check),
         Cmd::Hook {
             event: HookEvent::SessionStart,
         } => sync_gate::hook::session_start(),
