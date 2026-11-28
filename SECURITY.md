@@ -77,16 +77,21 @@ and what happened.
 - **What is checked is the state when it is read.** A program that opened a file for writing
   before its permissions were fixed keeps that access, and Windows cannot take it back: delete the
   file and sign out. Files that Windows or PostgreSQL run or read later (the shims, the cluster)
-  are checked when sync_gate puts them on `PATH` or starts the server.
+  are checked when sync_gate puts them on `PATH` or starts the server. On Windows the start looks
+  for a cluster file a program has open for writing by opening it for deletion, not by reading it:
+  it also stops when a program has one open without letting others delete it.
 - **The program files and the logon task are checked by the installer only.** Task Scheduler and
   your shell run `launcher.cmd` and the programs before any code of sync_gate does.
 - **The installer checks at one instant.** It checks its files once, before it starts, and
   then reads and copies them by path (PowerShell keeps no handle open across the run). In between
-  only an account inside the boundary, or a program that opened a file for writing earlier and
-  closed it by then, could change one. The check refuses a file open for writing when it runs.
+  only an account inside the boundary could open one to change it. The check refuses a file a
+  program has open for writing when it runs; what a program wrote and closed before the check is
+  not told apart.
 - **An uninstall trusts the installed `sync_gate.exe` to check.** No other copy is at hand, so a
   `sync_gate.exe` another account already replaced is not caught by the uninstall; it would run
-  anyway, as it does every time your shell runs `sync_gate`. An install or update checks with the
+  anyway, as it does every time your shell runs `sync_gate`. Without an installed `sync_gate.exe`
+  the uninstall reads neither the state nor the rollback copies and stops: reinstall (which checks
+  them and finishes an interrupted run), then uninstall. An install or update checks with the
   downloaded binary, verified against `SHA256SUMS`. A version before 0.1.5 cannot check: the
   installer says so and goes on only when you uninstall it or pin it with `-Version`.
 - **A shims folder already on your `PATH`.** The session hook never adds a refused shims folder,
