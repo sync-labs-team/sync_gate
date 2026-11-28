@@ -226,6 +226,8 @@ struct Unit {
 struct Waiting {
     client: ClientId,
     rid: Value,
+    /// `resources/subscribe` or `resources/unsubscribe`: see `target`.
+    sub: bool,
     line: String,
     since: Instant,
     deadline: Instant,
@@ -805,17 +807,14 @@ impl Hub {
                 }
                 let idle_for =
                     Duration::from_secs(inner.server(server).map_or(0, |s| s.idle_stop_secs));
-                // A crash-loop pause keeps the crash history: no idle retirement until it ends,
-                // nor while a crash still counts towards one. An unsupported first unit keeps
-                // the key refused until its retry.
+                // Retiring drops every unit's state: not while one is starting, in its
+                // crash-loop pause, unsupported (until its retry; the first one keeps the key
+                // refused) or with a crash that still counts towards a crash loop.
                 let is_idle = g.clients.is_empty()
-                    && !unavailable(g)
                     && !g.units.iter().any(|u| {
-                        matches!(u.child, Child::Starting)
+                        matches!(u.child, Child::Starting | Child::Unsupported { .. })
                             || crash_looping(&u.child)
-                            || u.crashes
-                                .iter()
-                                .any(|t| now.saturating_duration_since(*t) < CRASH_WINDOW)
+                            || recently_crashed(u, now)
                     })
                     && g.idle_since.is_some_and(|t| now >= t + idle_for);
                 if is_idle {
@@ -1529,9 +1528,13 @@ impl Inner {
         };
         match classify(&v) {
             Kind::Request { id: rid, method } if method != "initialize" => {
-                match target(g, c, max_in_flight) {
+                let sub = matches!(
+                    method.as_str(),
+                    "resources/subscribe" | "resources/unsubscribe"
+                );
+                match target(g, c, max_in_flight, sub) {
                     Some(i) => self.to_unit(server, g, i, c, line, now),
-                    None => self.enqueue(server, g, c, rid, line, now),
+                    None => self.enqueue(server, g, c, (rid, sub), line, now),
                 }
             }
             Kind::Notification { method } if method == "notifications/cancelled" => {
@@ -1585,7 +1588,7 @@ impl Inner {
         server: &str,
         g: &mut Inst,
         c: ClientId,
-        rid: Value,
+        (rid, sub): (Value, bool),
         line: &str,
         now: Instant,
     ) {
@@ -1601,6 +1604,7 @@ impl Inner {
         g.queue.push_back(Waiting {
             client: c,
             rid,
+            sub,
             line: line.to_string(),
             since: now,
             deadline: now + self.request_timeout(server),
@@ -1627,7 +1631,7 @@ impl Inner {
         let (_, max_in_flight) = self.limits(server);
         let mut i = 0;
         while i < g.queue.len() {
-            match target(g, g.queue[i].client, max_in_flight) {
+            match target(g, g.queue[i].client, max_in_flight, g.queue[i].sub) {
                 Some(u) => {
                     if let Some(w) = g.queue.remove(i) {
                         self.to_unit_until(server, g, u, (w.client, &w.line), now, w.deadline);
@@ -1852,8 +1856,9 @@ fn unit_of(g: &Inst, generation: u64) -> Option<usize> {
         .position(|u| matches!(&u.child, Child::Running(r) if r.generation == generation))
 }
 
-/// Where a request of client `c` goes now; `None`: it waits in the hub queue.
-fn target(g: &Inst, c: ClientId, max_in_flight: u32) -> Option<usize> {
+/// Where a request of client `c` goes now; `None`: it waits in the hub queue. `sub`: the request
+/// subscribes or unsubscribes.
+fn target(g: &Inst, c: ClientId, max_in_flight: u32, sub: bool) -> Option<usize> {
     let room = |u: &Unit| u.mux.ready() && load(u) < max_in_flight;
     let single = g.units.len() == 1;
     let loads: Vec<u32> = g
@@ -1869,11 +1874,16 @@ fn target(g: &Inst, c: ClientId, max_in_flight: u32) -> Option<usize> {
         .collect();
     // A subscriber stays on the unit that holds its subscription while that one is ready.
     // While it is down (backoff, restart, pause) a ready unit serves it, or it waits for one;
-    // only with none ready does a paused unit answer "keeps crashing".
+    // only with none ready does a paused unit answer "keeps crashing". Its subscription changes
+    // always wait for that unit (or get "keeps crashing" from its pause): another unit would
+    // answer an unsubscribe it never had, and the restarted unit would restore it.
     if let Some(p) = g.units.iter().position(|u| u.mux.holds_subscriptions(c)) {
         let u = &g.units[p];
         if u.mux.ready() {
             return room(u).then_some(p);
+        }
+        if sub {
+            return (single || crash_looping(&u.child)).then_some(p);
         }
         let none_ready = !g.units.iter().any(|u| u.mux.ready());
         return pick_instance(&loads, max_in_flight)
@@ -1887,8 +1897,9 @@ fn target(g: &Inst, c: ClientId, max_in_flight: u32) -> Option<usize> {
 
 /// The pool as `decide` sees it. Requests waiting for a subscriber's unit are left out (a new
 /// unit would not serve them) and that unit never counts as idle. Neither does a unit in its
-/// crash-loop pause or one that came up unsupported: shrinking them would drop the Task 5 state
-/// that stops respawning, and the pool would grow a fresh copy at once. With 0 in flight they
+/// crash-loop pause, one that came up unsupported or one with a crash in the crash window:
+/// shrinking them would drop the Task 5 state that stops respawning, and the pool would grow a
+/// fresh copy at once. With 0 in flight they
 /// also block growth (`wants_to_grow` needs every unit full); unsupported, until its retry.
 fn stats(g: &Inst, now: Instant) -> PoolStats {
     let pinned = |c: ClientId| g.units.iter().any(|u| u.mux.holds_subscriptions(c));
@@ -1905,7 +1916,9 @@ fn stats(g: &Inst, now: Instant) -> PoolStats {
             .iter()
             .map(|u| {
                 let holds = g.clients.keys().any(|c| u.mux.holds_subscriptions(*c));
-                let kept = crash_looping(&u.child) || matches!(u.child, Child::Unsupported { .. });
+                let kept = crash_looping(&u.child)
+                    || matches!(u.child, Child::Unsupported { .. })
+                    || recently_crashed(u, now);
                 match u.quiet_since {
                     Some(t) if !holds && !kept => now.saturating_duration_since(t),
                     _ => Duration::ZERO,
@@ -1914,6 +1927,13 @@ fn stats(g: &Inst, now: Instant) -> PoolStats {
             .collect(),
         instance_rss: g.peak_rss,
     }
+}
+
+/// A crash of `u` still counts towards a crash loop: its history must not be dropped.
+fn recently_crashed(u: &Unit, now: Instant) -> bool {
+    u.crashes
+        .iter()
+        .any(|t| now.saturating_duration_since(*t) < CRASH_WINDOW)
 }
 
 /// Estimated memory of a key's instances that the last snapshot may not show yet: starting,
