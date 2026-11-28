@@ -490,7 +490,8 @@ where
     })
 }
 
-/// One daemon tick: the control loop, then the hub's memory input, the RSS of its children,
+/// One daemon tick: the hub's unmeasured children into the core's admission, the control loop,
+/// then the hub's memory input, the RSS of its children,
 /// the shared services (which only queue work), and their decisions into the shared log. No
 /// core lock is held while the hub or the services run. The hub's deadlines and pool decisions
 /// (`Hub::tick`) run on the hub's own tick thread.
@@ -501,6 +502,7 @@ fn tick<C: Control>(
     m: &mut impl Measure,
     now: Instant,
 ) {
+    core.set_hub_reserved(hub.unmeasured());
     core.tick(m, now);
     if let Some((free, reserve)) = core.memory() {
         hub.set_memory(free, reserve);

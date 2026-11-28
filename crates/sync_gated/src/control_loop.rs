@@ -314,6 +314,12 @@ impl<C: Control> Core<C> {
         })
     }
 
+    /// What the MCP hub's children not measured yet will use (`Hub::unmeasured`): kept out of
+    /// admission until the next call.
+    pub fn set_hub_reserved(&self, bytes: u64) {
+        self.lock().hub_reserved = bytes;
+    }
+
     /// Appends decisions made elsewhere (the MCP hub) to the log `status` shows.
     pub fn record_all(&self, now: Instant, msgs: Vec<String>) {
         if msgs.is_empty() {

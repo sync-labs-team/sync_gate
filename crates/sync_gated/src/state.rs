@@ -73,6 +73,9 @@ pub struct State<T> {
     /// Last time a resume failure was logged, per ticket.
     fail_logged: HashMap<TicketId, Instant>,
     pub snapshot: MachineSnapshot,
+    /// What the MCP hub's unmeasured children will use (`Hub::unmeasured`), set every daemon
+    /// tick: the snapshot does not show it yet, so admission does not hand it out.
+    pub hub_reserved: u64,
     /// Pressure samples for the micro-analysis; empty when not under pressure.
     pub window: Window,
     /// The "admission held" decision was already logged for the current pause.
@@ -111,6 +114,7 @@ impl<T> State<T> {
                 swap_total: 0,
                 vram: None,
             },
+            hub_reserved: 0,
             window: Vec::new(),
             hold_noted: false,
             decisions: VecDeque::new(),
@@ -169,7 +173,7 @@ impl<T> State<T> {
         let reserved = if self.snapshot.total == 0 {
             u64::MAX
         } else {
-            self.running_reserved()
+            self.running_reserved().saturating_add(self.hub_reserved)
         };
         let ids = self.sched.admit(&self.snapshot, reserved, now);
         for &id in &ids {
