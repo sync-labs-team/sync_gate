@@ -19,7 +19,8 @@ const MAX_PARSED_LINE: usize = 1 << 20;
 /// the per-client queue limit, so one stored line never outweighs what the hub holds for a session.
 const MAX_STORED_INITIALIZE: usize = 8 << 20;
 /// Counts requests, not their bytes: an id is as long as the client writes it (up to the 1 MiB
-/// first piece), so this bounds memory only as far as the client's own ids do.
+/// first piece, or 8 MiB for a stored initialize), so this bounds memory only as far as the
+/// client's own ids do.
 const MAX_TRACKED: usize = 4096;
 const LOST: &str = "hub connection lost; request not completed";
 const UNAVAILABLE: &str = "hub connection lost; direct server unavailable";
