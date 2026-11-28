@@ -4,15 +4,18 @@
 //! daemon started itself (its own children, or rows left in the [`Registry`] by a previous
 //! run). Anything else, an agent's or the user's process, is never touched: everywhere else
 //! sync_gate only suspends and resumes. Identity (pid + process start time + executable path)
-//! is verified like this:
+//! is verified like this. The start time is the full creation FILETIME (100 ns ticks) on
+//! Windows and whole seconds on Unix; a Windows row recorded in seconds by an older version
+//! never matches, so it is forgotten without touching the process (children live in a
+//! kill-on-close Job Object, so a leftover is rare):
 //! - own child (kept in the launcher's table with its `Child`): the unreaped zombie (Unix) or
 //!   open handle (Windows) pins the pid, so it cannot belong to anyone else. That held handle
 //!   (and job / process group) IS the identity: the child is stopped through it even when its
 //!   start time could not be read (recorded as 0). The caller's start time must still equal
 //!   the one recorded at spawn, checked while the table lock is held across the signal.
 //! - leftover from disk (no handle): pid + start time + exe path must all equal the recorded
-//!   row (`reap_leftovers` compares the exe; Windows also re-reads the start time from the
-//!   very handle it terminates; Unix has no pidfd, see `kill_foreign`).
+//!   row (`reap_leftovers` compares the exe; Windows also re-reads the start time and the
+//!   liveness from the very handle it terminates; Unix has no pidfd, see `kill_foreign`).
 //!
 //! A leftover whose start time is 0 or unreadable is unverifiable and is never terminated; on
 //! Unix a leftover is also signalled only if it leads its own process group and that group is
@@ -28,7 +31,8 @@ use std::time::{Duration, Instant};
 /// A freshly started child: identity for the registry plus its pipes.
 pub struct Spawned {
     pub pid: u32,
-    /// Process start time from the probe; 0 = unknown (then never terminated by identity).
+    /// Process start time (Windows: FILETIME ticks from the child's handle; Unix: probe
+    /// seconds); 0 = unknown (then never terminated by identity).
     pub start_time: u64,
     pub exe: PathBuf,
     pub stdin: Box<dyn Write + Send>,
@@ -251,8 +255,19 @@ impl OsLauncher {
             return false;
         }
         drop(children);
-        // 0 = unverifiable; an unreadable probe reads as None: both mean "not ours".
-        start_time != 0 && sync_gate_probe::start_time(pid) == Some(start_time)
+        // 0 = unverifiable: never ours.
+        if start_time == 0 {
+            return false;
+        }
+        #[cfg(windows)]
+        {
+            foreign_is_alive(pid, start_time)
+        }
+        // An unreadable probe reads as None: not ours.
+        #[cfg(not(windows))]
+        {
+            sync_gate_probe::start_time(pid) == Some(start_time)
+        }
     }
 }
 
@@ -319,6 +334,13 @@ impl Launcher for OsLauncher {
         // First thing: the probe below is slow and a grandchild started meanwhile escapes the job.
         let job = open_job(&child);
         let pid = child.id();
+        // Windows: the full creation time from the child's own handle; Unix: the probe's seconds.
+        #[cfg(windows)]
+        let start_time = {
+            use std::os::windows::io::AsRawHandle;
+            handle_start_time(child.as_raw_handle()).unwrap_or(0)
+        };
+        #[cfg(not(windows))]
         let start_time = sync_gate_probe::start_time(pid).unwrap_or(0);
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             // Never leave an untracked child running.
@@ -1578,9 +1600,11 @@ fn kill_own(o: &mut Owned, hard: bool) -> io::Result<()> {
     }
 }
 
-/// Start time in seconds since the Unix epoch, read from the process handle itself. Same
-/// conversion as sysinfo (what `sync_gate_probe::start_time` returns): FILETIME is 100 ns
-/// ticks since 1601, and 11_644_473_600 s separate 1601 from 1970.
+/// Windows identity of a process: its creation time as the raw FILETIME (100 ns ticks since
+/// 1601), read from the process handle itself. Unlike the probe's whole seconds
+/// (`sync_gate_probe::start_time`, still what Unix records) two processes that reuse a pid
+/// within one second get different values. Two processes created in the same 100 ns tick
+/// would still collide; the OS makes that practically impossible, but it is not a proof.
 #[cfg(windows)]
 fn handle_start_time(h: windows_sys::Win32::Foundation::HANDLE) -> Option<u64> {
     use windows_sys::Win32::Foundation::FILETIME;
@@ -1594,49 +1618,119 @@ fn handle_start_time(h: windows_sys::Win32::Foundation::HANDLE) -> Option<u64> {
     if unsafe { GetProcessTimes(h, &mut created, &mut b, &mut c, &mut d) } == 0 {
         return None;
     }
-    let ticks = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
-    Some((ticks / 10_000_000).saturating_sub(11_644_473_600))
+    Some((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
 }
 
-/// Leftover from disk: opens the process, reads its start time from THAT handle, and
-/// terminates through the same handle, so a reused pid can never be hit.
+/// What a handle opened on a leftover's pid says about the recorded identity.
+#[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
+enum Seen {
+    /// The process object has terminated.
+    Gone,
+    /// Running, but not the recorded process (a reused pid, or a row from an older version
+    /// that recorded seconds): never touched.
+    Other,
+    /// Running and the recorded process.
+    Same,
+    /// The state or the creation time could not be read: neither gone nor another process.
+    Unreadable,
+}
+
+/// Opens `pid` for the identity check (plus `PROCESS_TERMINATE` when `terminate`). Error 87
+/// (invalid parameter) means no such pid.
+#[cfg(windows)]
+fn open_foreign(pid: u32, terminate: bool) -> io::Result<windows_sys::Win32::Foundation::HANDLE> {
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    };
+    let mut access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE;
+    if terminate {
+        access |= PROCESS_TERMINATE;
+    }
+    // SAFETY: plain Win32 call; the caller closes the handle.
+    let h = unsafe { OpenProcess(access, 0, pid) };
+    if h.is_null() {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(h)
+    }
+}
+
+#[cfg(windows)]
+fn no_such_pid(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(87)
+}
+
+/// Liveness comes from waiting on the handle (signalled once the process ends), not from the
+/// exit code: 259 (`STILL_ACTIVE`) is also a legal exit code.
+#[cfg(windows)]
+fn seen_through(h: windows_sys::Win32::Foundation::HANDLE, start_time: u64) -> Seen {
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    // SAFETY: valid handle.
+    match unsafe { WaitForSingleObject(h, 0) } {
+        WAIT_TIMEOUT => {}
+        WAIT_OBJECT_0 => return Seen::Gone,
+        _ => return Seen::Unreadable,
+    }
+    match handle_start_time(h) {
+        None => Seen::Unreadable,
+        Some(t) if t == start_time => Seen::Same,
+        Some(_) => Seen::Other,
+    }
+}
+
+/// `OsLauncher::is_alive` for a process we hold no handle on. Unreadable counts as alive, so
+/// a row is not dropped on a guess; `kill_foreign` then refuses to signal it.
+#[cfg(windows)]
+fn foreign_is_alive(pid: u32, start_time: u64) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    match open_foreign(pid, false) {
+        Err(e) => !no_such_pid(&e),
+        Ok(h) => {
+            let seen = seen_through(h, start_time);
+            // SAFETY: valid handle, closed once.
+            unsafe { CloseHandle(h) };
+            matches!(seen, Seen::Same | Seen::Unreadable)
+        }
+    }
+}
+
+/// Leftover from disk: opens the process, checks the recorded identity on THAT handle, and
+/// terminates through the same handle, so a reused pid can never be hit. A process that is
+/// gone or is another one is `Ok`; one whose identity cannot be read is an error and is
+/// never signalled (the row stays).
 #[cfg(windows)]
 fn kill_foreign(pid: u32, start_time: u64, hard: bool) -> io::Result<()> {
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-        TerminateProcess,
-    };
-    const STILL_ACTIVE: u32 = 259;
+    use windows_sys::Win32::System::Threading::TerminateProcess;
     let _ = hard;
+    let h = match open_foreign(pid, true) {
+        Ok(h) => h,
+        Err(e) if no_such_pid(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    };
     // SAFETY: plain Win32 calls; the handle is closed on every path.
-    unsafe {
-        let h = OpenProcess(
-            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
-            0,
-            pid,
-        );
-        if h.is_null() {
-            let e = io::Error::last_os_error();
-            // 87 = invalid parameter: no such pid, already gone.
-            return if e.raw_os_error() == Some(87) {
-                Ok(())
-            } else {
-                Err(e)
-            };
+    let result = unsafe {
+        match seen_through(h, start_time) {
+            Seen::Gone | Seen::Other => Ok(()),
+            Seen::Unreadable => Err(io::Error::other(format!(
+                "cannot verify the identity of pid {pid}; not terminated"
+            ))),
+            Seen::Same if TerminateProcess(h, 1) != 0 => Ok(()),
+            Seen::Same => {
+                let e = io::Error::last_os_error();
+                if seen_through(h, start_time) == Seen::Gone {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
         }
-        // Not the process we recorded, or terminated: either way nothing more to do.
-        let result = if handle_start_time(h) != Some(start_time) || TerminateProcess(h, 1) != 0 {
-            Ok(())
-        } else {
-            let e = io::Error::last_os_error();
-            let mut code = 0u32;
-            let gone = GetExitCodeProcess(h, &mut code) != 0 && code != STILL_ACTIVE;
-            if gone { Ok(()) } else { Err(e) }
-        };
-        CloseHandle(h);
-        result
-    }
+    };
+    // SAFETY: valid handle, closed once.
+    unsafe { CloseHandle(h) };
+    result
 }
 
 #[cfg(test)]
@@ -1869,7 +1963,7 @@ mod tests {
     fn real_launcher_never_signals_pid_0_1_or_itself() {
         let l = OsLauncher::default();
         let me = std::process::id();
-        let st = sync_gate_probe::start_time(me).unwrap();
+        let st = identity_of(me).unwrap();
         for pid in [0, 1, me] {
             let e = l.terminate(pid, st).unwrap_err();
             assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "pid {pid}");
@@ -1886,17 +1980,200 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The identity the supervisor records for a live process (None once it has exited, like
+    /// the probe): Windows reads the full FILETIME from the process handle, Unix the probe's
+    /// seconds.
+    #[cfg(windows)]
+    fn identity_of(pid: u32) -> Option<u64> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        let h = open_foreign(pid, false).ok()?;
+        let t = (seen_through(h, 0) != Seen::Gone)
+            .then(|| handle_start_time(h))
+            .flatten();
+        // SAFETY: valid handle, closed once.
+        unsafe { CloseHandle(h) };
+        t
+    }
+    #[cfg(not(windows))]
+    fn identity_of(pid: u32) -> Option<u64> {
+        sync_gate_probe::start_time(pid)
+    }
+
+    /// GetProcessTimes' creation FILETIME, read directly (independent of `handle_start_time`).
+    #[cfg(windows)]
+    fn raw_ticks(h: windows_sys::Win32::Foundation::HANDLE) -> u64 {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::GetProcessTimes;
+        let z = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut c, mut b, mut e, mut d) = (z, z, z, z);
+        // SAFETY: valid handle and out pointers.
+        assert_ne!(
+            unsafe { GetProcessTimes(h, &mut c, &mut b, &mut e, &mut d) },
+            0
+        );
+        (u64::from(c.dwHighDateTime) << 32) | u64::from(c.dwLowDateTime)
+    }
+
+    /// A test child that is killed and reaped even when an assertion fails.
+    #[cfg(windows)]
+    struct Sleeper(Child);
+    #[cfg(windows)]
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    #[cfg(windows)]
+    impl Sleeper {
+        fn start() -> Self {
+            Sleeper(
+                child_command("sleep")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+        /// (full ticks, the same in whole Unix seconds as the old identity)
+        fn identities(&self) -> (u64, u64) {
+            use std::os::windows::io::AsRawHandle;
+            let ticks = raw_ticks(self.0.as_raw_handle());
+            (ticks, ticks / 10_000_000 - 11_644_473_600)
+        }
+        /// Real state of the child, read from its own handle.
+        fn running(&mut self) -> bool {
+            matches!(self.0.try_wait(), Ok(None))
+        }
+    }
+
     #[cfg(windows)]
     #[test]
-    fn handle_start_time_matches_the_probe() {
+    fn handle_start_time_keeps_100ns_resolution() {
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         // SAFETY: GetCurrentProcess returns a pseudo handle that needs no closing.
         let h = unsafe { GetCurrentProcess() };
-        let me = sync_gate_probe::start_time(std::process::id());
-        assert!(me.is_some_and(|t| t > 0));
-        assert_eq!(handle_start_time(h), me);
+        let ticks = raw_ticks(h);
+        assert_eq!(handle_start_time(h), Some(ticks));
+        // The probe (seconds) is only the coarse view of the same instant.
+        let secs = sync_gate_probe::start_time(std::process::id()).unwrap();
+        assert_eq!(ticks / 10_000_000 - 11_644_473_600, secs);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_whole_second_identity_is_not_alive_for_a_foreign_process() {
+        let c = Sleeper::start();
+        let (ticks, secs) = c.identities();
+        let l = OsLauncher::default();
+        assert!(!l.is_alive(c.pid(), secs), "an identity in seconds");
+        assert!(l.is_alive(c.pid(), ticks), "control: the exact identity");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_whole_second_identity_leaves_a_foreign_process_alive() {
+        let mut c = Sleeper::start();
+        let (_, secs) = c.identities();
+        kill_foreign(c.pid(), secs, true).unwrap();
+        let l = OsLauncher::default();
+        assert!(l.terminate(c.pid(), secs).is_ok());
+        assert!(c.running(), "a row in seconds must never kill");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_exact_identity_terminates_a_foreign_process() {
+        let mut c = Sleeper::start();
+        let (ticks, _) = c.identities();
+        let l = OsLauncher::default();
+        l.terminate(c.pid(), ticks).unwrap();
+        let end = Instant::now() + Duration::from_secs(10);
+        while c.running() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!c.running(), "the child must really be gone");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reap_leftovers_forgets_a_row_in_seconds_without_killing() {
+        let mut c = Sleeper::start();
+        let (_, secs) = c.identities();
+        let dir = temp_dir("old-row");
+        let mut reg = Registry::load(&dir.join("services.json"));
+        reg.record("old", c.pid(), secs, &process_exe(c.pid()).unwrap());
+        assert_eq!(reap_leftovers(&OsLauncher::default(), &mut reg), 0);
+        assert!(reg.leftovers().is_empty());
+        let alive = c.running();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(alive, "an old row must be forgotten, not acted on");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_pid_that_cannot_exist_is_gone() {
+        let l = OsLauncher::default();
+        assert!(!l.is_alive(0xFFFF_FFF0, 123));
+        kill_foreign(0xFFFF_FFF0, 123, true).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_exited_process_is_gone_even_when_its_exit_code_is_259() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        };
+        let mut child = child_command("exit259")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // SAFETY: plain Win32 calls; the handle is closed. Held open so the pid stays ours.
+        unsafe {
+            let h = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            );
+            assert!(!h.is_null());
+            let ticks = raw_ticks(h);
+            let _ = child.wait();
+            let mut code = 0u32;
+            assert_ne!(GetExitCodeProcess(h, &mut code), 0);
+            assert_eq!(code, 259, "the trap: an exit code equal to STILL_ACTIVE");
+            assert_eq!(seen_through(h, ticks), Seen::Gone);
+            assert!(!OsLauncher::default().is_alive(pid, ticks));
+            CloseHandle(h);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_unreadable_process_is_neither_gone_nor_another_process() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let c = Sleeper::start();
+        let (ticks, _) = c.identities();
+        // SAFETY: plain Win32 calls; the handle is closed. No SYNCHRONIZE: the wait fails.
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, c.pid());
+            assert!(!h.is_null());
+            let seen = seen_through(h, ticks);
+            CloseHandle(h);
+            assert_eq!(seen, Seen::Unreadable);
+        }
+    }
     /// Re-executed by the tests below; `echo` repeats stdin lines with a prefix, `sleep`
     /// ignores stdin, `tree` starts a `sleep` grandchild and reports both pids, `env` says
     /// whether each variable named on stdin is set.
@@ -1916,6 +2193,8 @@ mod tests {
             // Also the detached descendant of several fixtures: it ends by itself after 60 s,
             // so a guard that rightly refuses to act never leaves it behind for long.
             "sleep" => std::thread::sleep(Duration::from_secs(60)),
+            // Exits with 259, the value of STILL_ACTIVE.
+            "exit259" => std::process::exit(259),
             // Ends by itself after about a second.
             "nap" => std::thread::sleep(Duration::from_secs(1)),
             // Writes a line every 50 ms; ends on the first failed write, or after 30 s.
@@ -1949,7 +2228,7 @@ mod tests {
                     .spawn()
                     .unwrap();
                 // The grandchild's start time is read here, while we hold it unreaped.
-                let start = sync_gate_probe::start_time(grandchild.id()).unwrap_or(0);
+                let start = identity_of(grandchild.id()).unwrap_or(0);
                 println!("pids:{}:{}:{start}", std::process::id(), grandchild.id());
                 std::io::stdout().flush().unwrap();
                 let _ = grandchild.wait();
@@ -2125,7 +2404,7 @@ mod tests {
     /// own, and the grandchild's while we hold it unreaped. A start time of 0 is unknown.
     fn write_pidfile(path: &str, grandchild: &Child) {
         let me = std::process::id();
-        let start = |pid| sync_gate_probe::start_time(pid).unwrap_or(0);
+        let start = |pid| identity_of(pid).unwrap_or(0);
         let line = format!(
             "{me} {} {} {}",
             start(me),
@@ -2227,7 +2506,7 @@ mod tests {
     fn assert_gone(pid: u32, start: Option<u64>, what: &str) {
         let end = Instant::now() + Duration::from_secs(10);
         loop {
-            if (start.is_some() && sync_gate_probe::start_time(pid) != start)
+            if (start.is_some() && identity_of(pid) != start)
                 || sync_gate_probe::process_alive(pid) == Some(false)
             {
                 return;
@@ -2376,7 +2655,7 @@ mod tests {
             &mut |e| {
                 // Just created and unreaped: the start time read now is its own.
                 if let ToolEvent::Spawned(pid) = e {
-                    start = sync_gate_probe::start_time(pid);
+                    start = identity_of(pid);
                 }
             },
         );
@@ -2584,7 +2863,7 @@ mod tests {
                 // Just created and unreaped: the start time read now is its own.
                 ToolEvent::Spawned(pid) => {
                     leader = pid;
-                    start = sync_gate_probe::start_time(pid).unwrap_or(0);
+                    start = identity_of(pid).unwrap_or(0);
                 }
                 ToolEvent::StdinClosed => closed.store(true, Ordering::SeqCst),
                 _ => {}
@@ -2777,7 +3056,7 @@ mod tests {
             &mut |e| {
                 // Just created and unreaped: the start time read now is its own.
                 if let ToolEvent::Spawned(pid) = e {
-                    start = sync_gate_probe::start_time(pid);
+                    start = identity_of(pid);
                 }
             },
         );
@@ -3389,7 +3668,7 @@ mod tests {
     struct GrandchildGuard(u32, u64);
     impl Drop for GrandchildGuard {
         fn drop(&mut self) {
-            if self.1 == 0 || sync_gate_probe::start_time(self.0) != Some(self.1) {
+            if self.1 == 0 || identity_of(self.0) != Some(self.1) {
                 return;
             }
             #[cfg(unix)]
@@ -3612,10 +3891,10 @@ mod tests {
         // The "sleep" child ignores stdin EOF, so only terminate can end it.
         stop_own(&l, s.pid, 0, Some(s.stdin), Duration::from_millis(200)).unwrap();
         let end = Instant::now() + Duration::from_secs(10);
-        while sync_gate_probe::start_time(s.pid) == Some(s.start_time) && Instant::now() < end {
+        while identity_of(s.pid) == Some(s.start_time) && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(50));
         }
-        let gone = sync_gate_probe::start_time(s.pid) != Some(s.start_time);
+        let gone = identity_of(s.pid) != Some(s.start_time);
         close_job(job);
         assert!(gone, "an own child with start time 0 must still be stopped");
     }
