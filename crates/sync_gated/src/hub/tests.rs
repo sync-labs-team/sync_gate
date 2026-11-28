@@ -1016,6 +1016,81 @@ fn slow_client_on_a_real_socket_is_disconnected_and_the_fast_one_keeps_working()
     drop(slow);
 }
 
+/// Issue #2, item 2: a client the hub has spent `WRITE_DEADLINE` writing one message to (its
+/// relay stopped reading) is disconnected by the tick, which does not wait on that write; the
+/// close fails the blocked write, so the client's writer thread ends. The client that reads
+/// keeps working.
+#[test]
+fn a_client_that_stops_reading_is_dropped_after_the_write_deadline() {
+    let l = Arc::new(FakeLauncher::default());
+    let hub = Arc::new(hub(&l));
+    let w = serve_watched(&hub, "hub-write-deadline");
+    let mut fast = dial(&w.name);
+    let fast_rx = lines(Wire(fast.0.clone()));
+    assert_eq!(
+        serde_json::from_value::<HubReply>(recv_json(&fast_rx, "fast hello reply")).unwrap(),
+        HubReply::Ok
+    );
+    // The slow client says hello and initializes, then never reads again.
+    let mut slow = dial(&w.name);
+    let mut child = l.take_child();
+    child.handshake();
+    let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+    writeln!(fast, "{init}").unwrap();
+    writeln!(slow, "{init}").unwrap();
+    assert_eq!(recv_json(&fast_rx, "fast initialize reply")["id"], 1);
+    wait_until("both clients attached", || docs(&hub).clients == 2);
+    let inst = lock(&hub.inner.map)
+        .instances
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    let slow_id = *lock(&inst.st).clients.keys().max().unwrap();
+    wait_until("the slow client's handshake", || {
+        lock(&inst.st).units[0].mux.handshaken(slow_id)
+    });
+    // One broadcast far larger than any socket buffer, well inside the queue bounds: the write
+    // to the slow client blocks, and no queue ever fills.
+    let pad = "x".repeat(4 << 20);
+    child.send(json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed", "params": {"pad": pad}}));
+    assert_eq!(
+        recv_json(&fast_rx, "fast broadcast")["method"],
+        "notifications/tools/list_changed"
+    );
+    let writing = || {
+        let g = lock(&inst.st);
+        g.clients
+            .get(&slow_id)
+            .and_then(|p| *lock(&p.q.gauge.writing))
+    };
+    wait_until("the write to the slow client to start", || {
+        writing().is_some()
+    });
+    hub.tick(Instant::now());
+    assert_eq!(docs(&hub).clients, 2, "disconnected before its deadline");
+    hub.tick(Instant::now() + WRITE_DEADLINE);
+    ended(&w.writer_dropped, "the stalled client's writer thread");
+    wait_until("the stalled client to be detached", || {
+        docs(&hub).clients == 1
+    });
+    let mut seen = Vec::new();
+    assert!(
+        notes_contain(
+            &hub,
+            &mut seen,
+            "client disconnected (stopped reading for 30 s)"
+        ),
+        "{seen:?}"
+    );
+    writeln!(fast, "{}", request(2, "tools/list")).unwrap();
+    child.answer();
+    assert_eq!(recv_json(&fast_rx, "fast reply")["id"], 2);
+    hub.shutdown();
+    assert!(w.server.stop_within(Duration::from_secs(5)));
+    drop(slow);
+}
+
 /// A writer that signals when it is dropped: the reply thread owns it until it ends.
 struct DropSignal(Box<dyn Write + Send>, mpsc::Sender<()>);
 

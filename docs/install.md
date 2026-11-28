@@ -231,6 +231,9 @@ them). When a limit cuts a session, its relay runs the server itself, as when th
   queues) takes nothing more: a session that stopped reading is disconnected and the log says
   `client disconnected (hub queue budget spent)`; messages to a server are dropped and time out.
   An empty queue always takes one message, so a session that keeps reading is not cut.
+- **Write deadline.** A session the hub has spent 30 s writing one message to (its relay stopped
+  reading) is disconnected: `client disconnected (stopped reading for 30 s)`. The largest message
+  (64 MiB) takes well under a second to a relay that reads.
 - **Replay deadline.** A relay that loses the hub replays the session's `initialize` to the server
   it starts and waits up to the server's `request_timeout_secs` (default 300) for the answer: the
   same time the hub gives a server's own `initialize`, so a server that starts slowly (a first
