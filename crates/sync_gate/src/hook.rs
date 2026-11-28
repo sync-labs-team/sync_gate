@@ -138,7 +138,7 @@ fn shims_active(dir: &Path) -> bool {
     ) {
         return false;
     }
-    dir.join(SHIMS_MANIFEST).is_file()
+    dir.join(SHIMS_MANIFEST).is_file() && crate::shims::check_files(dir).is_ok()
 }
 
 /// (stdout JSON, lines to append to the env file)

@@ -1230,6 +1230,60 @@ fn a_junction_where_the_registry_is_written_disables_the_service() {
     assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
 }
 
+/// C5d: a lease registry others can change disables the service with the reason, and is left as
+/// it was.
+#[test]
+fn a_registry_others_can_change_disables_the_service() {
+    let fx = warm("s4d");
+    let leases = fx.root().join("leases.json");
+    let before = std::fs::read(&leases).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&leases, std::fs::Permissions::from_mode(0o666)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("icacls")
+            .arg(&leases)
+            .args(["/grant", "*S-1-1-0:(W)"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+    error(fx.lease_r(""));
+    fx.idle();
+    assert!(fx.state().starts_with("failed:"), "{}", fx.state());
+    assert!(
+        fx.state().contains("writable by other users"),
+        "{}",
+        fx.state()
+    );
+    assert_eq!(std::fs::read(&leases).unwrap(), before);
+}
+
+/// 14.3, Windows: a registry another program holds open (an error of the system, not a refusal)
+/// fails that write only; the service stays on and writes once it is closed.
+#[cfg(windows)]
+#[test]
+fn a_registry_held_open_does_not_disable_the_service() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let fx = warm("s4e");
+    let leases = fx.root().join("leases.json");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&leases)
+        .unwrap();
+    let _ = fx.lease_r("");
+    fx.idle();
+    assert!(!fx.state().starts_with("failed:"), "{}", fx.state());
+    drop(held);
+    fx.tick(5);
+    fx.leased();
+    assert!(!fx.state().starts_with("failed:"), "{}", fx.state());
+}
+
 #[test]
 fn crash_between_any_two_steps_is_reconciled() {
     let mut fx = Fx::bare("s5");

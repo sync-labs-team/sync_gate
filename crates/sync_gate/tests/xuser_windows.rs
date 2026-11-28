@@ -1610,3 +1610,187 @@ fn x11g_a_client_of_another_kind_is_dropped() {
     );
     c.end();
 }
+
+// ---------------------------------------------------------------------------------------------
+// X13: a guest's own config file is read (item 6). Proof by effect: with `max_wait_secs` from the
+// file and no `--max-wait`, the guest's queued command exits 75 after that many seconds (the
+// default would be 90). Round A: 0 s; round B (control): 20 s, between 20 and 60. Neither round
+// may say "ignoring the config".
+// ---------------------------------------------------------------------------------------------
+
+/// `sync_gate run -- cmd /d /c echo late` in the sandbox, with no `--max-wait`, `config` as its
+/// `SYNC_GATE_CONFIG` (None: unset, the account's default): (result, seconds it took).
+fn guest_run_timed(c: &Ctx, config: Option<&Path>) -> (Res, f64) {
+    let mut cmd = c.sbx_fg(&["run", "--", "cmd", "/d", "/c", "echo", "late"]);
+    match config {
+        Some(p) => cmd.env("SYNC_GATE_CONFIG", p),
+        None => cmd.env_remove("SYNC_GATE_CONFIG"),
+    };
+    let argv: Vec<String> = cmd
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(!argv.iter().any(|a| a == "--max-wait"), "{argv:?}");
+    let vars: Vec<String> = cmd
+        .get_envs()
+        .filter(|(k, _)| k.to_string_lossy().starts_with("SYNC_GATE_"))
+        .map(|(k, v)| format!("{}={:?}", k.to_string_lossy(), v))
+        .collect();
+    println!("[{}] guest SYNC_GATE_* set by the test: {vars:?}", c.mode);
+    let t = Instant::now();
+    let r = run(cmd);
+    (r, t.elapsed().as_secs_f64())
+}
+
+/// Round A (`0`, under 10 s) or B (`20`, 20 s to 60 s): exit 75 with the rerun line, and the
+/// config was not ignored.
+fn assert_round(mode: &str, round: &str, r: &Res, secs: f64) {
+    println!(
+        "X13 {mode} round {round}: exit={} after {secs:.1} s stderr={:?}",
+        r.code,
+        r.err.trim()
+    );
+    assert_eq!(r.code, 75, "{round}: {}", r.err);
+    assert!(r.err.contains(RERUN_LINE), "{round}: {}", r.err);
+    assert!(!r.err.contains("ignoring the config"), "{round}: {}", r.err);
+    match round {
+        "A" => assert!(secs < 10.0, "round A took {secs:.1} s"),
+        _ => assert!((20.0..60.0).contains(&secs), "round B took {secs:.1} s"),
+    }
+}
+
+/// X13u, `unelevated` (`@restricted`, this same user): the owner's config in a folder of the owner
+/// that passes the rule is read by the guest.
+#[test]
+#[ignore]
+fn x13u_unelevated_reads_a_config_of_this_user() {
+    let Some(c) = Ctx::begin(UNELEVATED.mode) else {
+        return;
+    };
+    let d = c.start(&[UNELEVATED.entry]);
+    let job = c.owner_job();
+    let dir = c.work.join("cfg");
+    sync_gate_probe::create_private_dir(&dir).unwrap();
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, "max_wait_secs = 0\n").unwrap();
+    let (a, sa) = guest_run_timed(&c, Some(&cfg));
+    std::fs::write(&cfg, "max_wait_secs = 20\n").unwrap();
+    let (b, sb) = guest_run_timed(&c, Some(&cfg));
+    job.release();
+    d.shutdown();
+    assert_round("unelevated", "A", &a, sa);
+    assert_round("unelevated", "B", &b, sb);
+    c.end();
+}
+
+/// X13a, `elevated` (its own account): the guest's own config, created by the guest at its
+/// default place, is read. The file must not exist before (skipped otherwise, nothing touched);
+/// only what this round created is removed, and the test checks it is gone.
+#[test]
+#[ignore]
+fn x13a_elevated_reads_its_own_config() {
+    let Some(c) = Ctx::begin("elevated") else {
+        return;
+    };
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/xuser/guest-config.ps1"),
+        c.tmp.join("guest-config.ps1"),
+    )
+    .unwrap();
+    let marker = format!("sync_gate-x13-{}-{}", std::process::id(), c.socket);
+    let list = c.tmp.join("x13-made.txt");
+    let script = c.tmp.join("guest-config.ps1");
+    let ps = |action: &str, value: &str| {
+        let argv = [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            script.to_str().unwrap(),
+            "-Action",
+            action,
+            "-Value",
+            value,
+            "-Marker",
+            marker.as_str(),
+            "-List",
+            list.to_str().unwrap(),
+        ];
+        let r = run(c.sbx(&argv));
+        println!(
+            "X13a {action}: exit={} {}{}",
+            r.code,
+            r.out.trim(),
+            r.err.trim()
+        );
+        r
+    };
+    let made = ps("create", "0");
+    if made.code == 3 {
+        println!("skipped: guest config exists");
+        c.end();
+        return;
+    }
+    if made.code != 0 {
+        // The sandbox may not let its account write its own profile: a fact of the mode.
+        println!(
+            "skipped: the elevated guest could not create its config: {}",
+            made.err
+        );
+        c.end();
+        return;
+    }
+    let acct = c.account.clone();
+    let d = c.start(&[&acct]);
+    let job = c.owner_job();
+    let (a, sa) = guest_run_timed(&c, None);
+    let rw = ps("rewrite", "20");
+    let (b, sb) = guest_run_timed(&c, None);
+    job.release();
+    d.shutdown();
+    let gone = ps("clean", "0");
+    assert!(
+        gone.out.contains("gone"),
+        "the guest config was left: {}",
+        gone.out
+    );
+    assert_eq!(rw.code, 0, "{}", rw.err);
+    assert_round("elevated", "A", &a, sa);
+    assert_round("elevated", "B", &b, sb);
+    c.end();
+}
+
+/// X13m, `mxc`: a config in the folder the sandbox can write is refused (the folder or the file,
+/// either step) and the queue works with the defaults. Documents the restriction; not a positive.
+#[test]
+#[ignore]
+fn x13m_mxc_refuses_a_config_it_can_change() {
+    let Some(c) = Ctx::begin(MXC.mode) else {
+        return;
+    };
+    let d = c.start(&[MXC.entry]);
+    let job = c.owner_job();
+    let cfg = c.tmp.join("config.toml");
+    std::fs::write(&cfg, "max_wait_secs = 0\n").unwrap();
+    let mut cmd = c.sbx_fg(&[
+        "run",
+        "--max-wait",
+        "0",
+        "--",
+        "cmd",
+        "/d",
+        "/c",
+        "echo",
+        "late",
+    ]);
+    cmd.env("SYNC_GATE_CONFIG", &cfg);
+    let r = run(cmd);
+    job.release();
+    d.shutdown();
+    println!("X13m exit={} stderr={:?}", r.code, r.err.trim());
+    assert!(r.err.contains("ignoring the config"), "{}", r.err);
+    assert_eq!(r.code, 75, "{}", r.err);
+    assert!(r.err.contains(RERUN_LINE), "{}", r.err);
+    c.end();
+}

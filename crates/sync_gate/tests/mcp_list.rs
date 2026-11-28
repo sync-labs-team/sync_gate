@@ -95,3 +95,48 @@ fn a_config_in_a_folder_others_can_write_is_not_read() {
     assert!(stderr.contains("writable by other users"), "{stderr}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// C2, every system: a config file others can change, in a folder that passes, is not read.
+#[test]
+fn a_config_others_can_change_is_not_read() {
+    let id = format!("sync_gate_mcplist-file-{}", std::process::id());
+    let dir = std::env::temp_dir().join(&id);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("config.toml");
+    std::fs::write(&config, TOML).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o666)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let out = Command::new("icacls")
+            .arg(&config)
+            .args(["/grant", "*S-1-1-0:(W)"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "icacls: {out:?}");
+    }
+    let socket = if cfg!(windows) {
+        id.clone()
+    } else {
+        dir.join("s.sock").to_string_lossy().into_owned()
+    };
+    let out = Command::new(env!("CARGO_BIN_EXE_sync_gate"))
+        .args(["mcp", "list"])
+        .env("SYNC_GATE_SOCKET", &socket)
+        .env("SYNC_GATE_CONFIG", &config)
+        .output()
+        .unwrap();
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_ne!(out.status.code(), Some(0), "{stdout}");
+    assert!(!stdout.contains("docs"), "{stdout}");
+    assert!(stderr.contains("writable by other users"), "{stderr}");
+}

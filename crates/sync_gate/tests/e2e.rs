@@ -767,6 +767,127 @@ fn wait_refuses_a_pending_folder_others_can_write() {
     assert_eq!(read_n(&env.file("b")), 3);
 }
 
+/// A file others can change (Unix 0666; Windows: Everyone may write it), not its folder.
+fn file_open_to_others(p: &Path) {
+    #[cfg(unix)]
+    chmod(p, 0o666);
+    #[cfg(windows)]
+    {
+        let out = Command::new("icacls")
+            .arg(p)
+            .args(["/grant", "*S-1-1-0:(W)"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "icacls: {out:?}");
+    }
+}
+
+/// Queues command `b` behind a running `a`: (daemon, a, ticket id of b).
+fn queued_b(env: &Env) -> (DaemonHandle<OsControl>, Proc, String) {
+    let (cfg, m) = one_job();
+    let d = env.start(cfg, m, OsControl);
+    let fa = env.file("a");
+    let a = Proc::spawn(env.run(&[], &env.ticker("a", 400)));
+    wait_for("a ticking", 20, || read_n(&fa) > 0);
+    let b = Proc::spawn(env.run(&["--max-wait", "0"], &env.ticker("b", 3))).finish();
+    assert_eq!(b.code, 75, "{}", b.stderr);
+    (d, a, ticket_id(&b.stderr))
+}
+
+/// C5: a ticket file others can change is refused with the reason; nothing runs, the file stays.
+#[test]
+fn wait_refuses_a_pending_file_others_can_change() {
+    let env = Env::new();
+    let (d, a, id) = queued_b(&env);
+    let pending = env.pending_files().remove(0);
+    let bytes = std::fs::read(&pending).unwrap();
+    file_open_to_others(&pending);
+    let w = Proc::spawn(env.cli(&["wait", &id], Some(&env.ticker("b", 3)))).finish();
+    std::fs::write(env.file("a.stop"), "").unwrap();
+    assert_eq!(a.finish().code, 0);
+    d.shutdown();
+    assert_eq!(w.code, 2, "{}", w.stderr);
+    assert!(w.stderr.contains("refusing ticket"), "{}", w.stderr);
+    assert!(w.stderr.contains("writable by other users"), "{}", w.stderr);
+    assert!(w.stderr.contains("nothing was run"), "{}", w.stderr);
+    assert!(!env.file("b").exists(), "the command ran");
+    assert_eq!(std::fs::read(&pending).unwrap(), bytes);
+}
+
+/// C5c, Windows: a ticket file this user cannot read is refused, never reported as gone.
+#[cfg(windows)]
+#[test]
+fn wait_refuses_a_pending_file_it_cannot_read() {
+    let env = Env::new();
+    let (d, a, id) = queued_b(&env);
+    let pending = env.pending_files().remove(0);
+    let me = format!(
+        "{}\\{}:(R)",
+        std::env::var("USERDOMAIN").unwrap(),
+        std::env::var("USERNAME").unwrap()
+    );
+    let icacls = |args: &[&str]| {
+        let out = Command::new("icacls")
+            .arg(&pending)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "icacls: {out:?}");
+    };
+    icacls(&["/deny", &me]);
+    let w = Proc::spawn(env.cli(&["wait", &id], Some(&env.ticker("b", 3)))).finish();
+    icacls(&["/reset"]);
+    std::fs::write(env.file("a.stop"), "").unwrap();
+    assert_eq!(a.finish().code, 0);
+    d.shutdown();
+    assert_eq!(w.code, 2, "{}", w.stderr);
+    assert!(w.stderr.contains("refusing ticket"), "{}", w.stderr);
+    assert!(!w.stderr.contains("is gone"), "{}", w.stderr);
+    assert!(!env.file("b").exists(), "the command ran");
+}
+
+/// 14.1: a ticket file that cannot be written whole is not left behind, and the command runs
+/// here, once.
+#[test]
+fn a_ticket_that_cannot_be_saved_leaves_no_file_and_runs_directly() {
+    let env = Env::new();
+    let (cfg, m) = one_job();
+    let d = env.start(cfg, m, OsControl);
+    let fa = env.file("a");
+    let a = Proc::spawn(env.run(&[], &env.ticker("a", 400)));
+    wait_for("a ticking", 20, || read_n(&fa) > 0);
+    let mut c = env.run(&["--max-wait", "0"], &env.ticker("b", 3));
+    c.env("SYNC_GATE_TEST_FAIL", "pending-write");
+    let b = Proc::spawn(c).finish();
+    std::fs::write(env.file("a.stop"), "").unwrap();
+    assert_eq!(a.finish().code, 0);
+    d.shutdown();
+    assert_eq!(b.code, 0, "{}", b.stderr);
+    assert!(
+        b.stderr.contains("cannot save pending command"),
+        "{}",
+        b.stderr
+    );
+    assert_eq!(read_n(&env.file("b")), 3);
+    assert!(env.pending_files().is_empty(), "{:?}", env.pending_files());
+}
+
+/// 14.1: an empty ticket file (owner and DACL fine) is refused as unreadable; nothing runs.
+#[test]
+fn wait_refuses_an_empty_ticket_file() {
+    let env = Env::new();
+    let (d, a, id) = queued_b(&env);
+    let pending = env.pending_files().remove(0);
+    std::fs::write(&pending, "").unwrap();
+    let w = Proc::spawn(env.cli(&["wait", &id], Some(&env.ticker("b", 3)))).finish();
+    std::fs::write(env.file("a.stop"), "").unwrap();
+    assert_eq!(a.finish().code, 0);
+    d.shutdown();
+    assert_eq!(w.code, 2, "{}", w.stderr);
+    assert!(w.stderr.contains("unreadable"), "{}", w.stderr);
+    assert!(!env.file("b").exists(), "the command ran");
+}
+
 /// A pending file with two hard links is refused with the real reason and a way forward; the
 /// command does not run. Control: with one link again, the same wait runs it.
 #[cfg(unix)]
@@ -3488,6 +3609,95 @@ fn hook_session_with_the_shims_already_on_path_writes_no_path_line() {
     );
 }
 
+/// C4: a manifest others can change is refused by install and remove; nothing in the folder
+/// changes.
+#[test]
+fn shims_refuse_a_manifest_others_can_change() {
+    let s = Shims::new();
+    s.ok("install");
+    file_open_to_others(&s.path("sync_gate_shims.json"));
+    let before = s.snapshot();
+    for sub in ["install", "remove"] {
+        let (code, out, err) = s.run(sub);
+        assert_ne!(code, 0, "{sub}: {out}{err}");
+        assert!(err.contains("writable by other users"), "{sub}: {err}");
+        assert_eq!(s.snapshot(), before, "{sub}");
+    }
+}
+
+/// C4, Windows: a shim others can change makes install fail naming it and the hook keep the
+/// folder off PATH; deleting the folder and installing again (what the docs say) brings it back.
+#[cfg(windows)]
+#[test]
+fn a_shim_others_can_change_is_refused_by_install_and_the_hook() {
+    let h = Hook::new();
+    h.s.ok("install");
+    file_open_to_others(&h.s.path(&shim_name("npm")));
+    let before = h.s.snapshot();
+    let (code, out, err) = h.s.run("install");
+    assert_ne!(code, 0, "{out}{err}");
+    assert!(
+        err.contains(".exe") && err.contains("writable by other users"),
+        "{err}"
+    );
+    assert_eq!(h.s.snapshot(), before);
+    std::fs::write(&h.file, "").unwrap();
+    let (_, after) = h.start(HOOK_STDIN, Hook::base_path());
+    assert!(!has_path_line(&after), "{after}");
+    std::fs::remove_dir_all(h.s.dir()).unwrap();
+    h.s.ok("install");
+    std::fs::write(&h.file, "").unwrap();
+    let (_, after) = h.start(HOOK_STDIN, Hook::base_path());
+    assert!(has_path_line(&after), "{after}");
+}
+
+/// C4: a remove that leaves a listed shim (changed by another program) says it is partial.
+#[test]
+fn shims_remove_says_when_it_is_partial() {
+    let s = Shims::new();
+    s.ok("install");
+    let npm = shim_name("npm");
+    s.replace(&npm, b"mine");
+    let out = s.ok("remove");
+    assert!(out.contains(&format!("kept: {npm}")), "{out}");
+    assert!(out.contains("not all shims were removed"), "{out}");
+    assert!(s.exists(&npm));
+}
+
+/// 14.4, Windows: an entry remove cannot check is named and makes the removal partial, never
+/// skipped in silence.
+#[cfg(windows)]
+#[test]
+fn shims_remove_names_an_entry_it_cannot_check() {
+    let s = Shims::new();
+    s.ok("install");
+    let npm = s.path(&shim_name("npm"));
+    let me = format!(
+        "{}\\{}:(R)",
+        std::env::var("USERDOMAIN").unwrap(),
+        std::env::var("USERNAME").unwrap()
+    );
+    let icacls = |args: &[&str]| {
+        let out = Command::new("icacls")
+            .arg(&npm)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "icacls: {out:?}");
+    };
+    icacls(&["/deny", &me]);
+    let (code, out, err) = s.run("remove");
+    icacls(&["/reset"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let all = out + &err;
+    assert!(
+        all.contains(&format!("kept: {}: cannot check it", shim_name("npm"))),
+        "{all}"
+    );
+    assert!(all.contains("not all shims were removed"), "{all}");
+    assert!(npm.exists());
+}
+
 #[test]
 fn hook_session_skips_an_unsafe_shims_folder() {
     let h = Hook::new();
@@ -4605,6 +4815,25 @@ fn adopt_restore_refuses_a_record_in_a_folder_others_can_write() {
     assert!(r.err.contains("refusing the adoption record"), "{r:?}");
     assert_eq!(Adopt::read(&a.codex), adopted);
     assert_eq!(bak_files(&a.env.file("codex")).len(), 1);
+}
+
+/// C3, every system: a record others can change is refused by restore; the agent's config and
+/// the record stay as they were.
+#[test]
+fn adopt_restore_refuses_a_record_others_can_change() {
+    let a = Adopt::new();
+    let r = a.run("adopt", &["--agent", "codex", "context7"], &[]);
+    assert_eq!(r.code, 0, "{r:?}");
+    let adopted = Adopt::read(&a.codex);
+    let record = a.env.data_dir().join("mcp-adopted.json");
+    let bytes = std::fs::read(&record).unwrap();
+    file_open_to_others(&record);
+    let r = a.run("restore", &["--agent", "codex"], &[]);
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.err.contains("refusing the adoption record"), "{r:?}");
+    assert!(r.err.contains("writable by other users"), "{r:?}");
+    assert_eq!(Adopt::read(&a.codex), adopted);
+    assert_eq!(std::fs::read(&record).unwrap(), bytes);
 }
 
 #[test]

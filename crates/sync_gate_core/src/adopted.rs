@@ -1,6 +1,6 @@
 //! The adoption record (`mcp-adopted.json` in the data folder): what `sync_gate mcp adopt`
 //! changed in each agent config, so `restore` (and the relay) can find the original launch.
-//! It authorizes running a command, so on Unix it is read only after its folder, the folder's
+//! It authorizes running a command, so it is read only after its folder, the folder's
 //! ancestors and the file itself pass the private checks.
 
 use std::io;

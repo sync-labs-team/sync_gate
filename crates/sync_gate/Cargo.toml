@@ -35,4 +35,4 @@ nix = { workspace = true, features = ["signal"] }
 [target.'cfg(windows)'.dev-dependencies]
 widestring = "1"
 # xuser_windows.rs: read the daemon's own stderr line (SetStdHandle).
-windows-sys = { workspace = true, features = ["Win32_System_Console", "Win32_System_Threading"] }
+windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "Win32_System_Console", "Win32_System_Threading"] }

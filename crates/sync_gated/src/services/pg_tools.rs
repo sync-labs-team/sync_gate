@@ -140,15 +140,26 @@ fn fail(msg: impl Into<String>) -> io::Error {
 }
 
 fn refused(p: &Path) -> io::Error {
-    fail(format!(
-        "link or unexpected file in the cluster path: {}",
-        p.display()
-    ))
+    sync_gate_core::refusal(
+        io::ErrorKind::Other,
+        format!(
+            "link or unexpected file in the cluster path: {}",
+            p.display()
+        ),
+    )
+}
+
+/// A refusal by a rule (link, kind, owner, who can change it), never an error of the system
+/// (a file in use, a failed read), which may pass on a retry. What writes a refused file is
+/// disabled; what meets a system error tries again later.
+pub(crate) fn is_policy_refusal(e: &io::Error) -> bool {
+    sync_gate_core::is_refusal(e)
 }
 
 /// Absent, or of the expected kind and not a link (on Windows, no reparse point either:
-/// junction, mount point, file link). Unix: also nothing another user could have written, so a
-/// file passes `check_private_file` and a folder is ours with no group or other write.
+/// junction, mount point, file link), and nothing another user could have written: a file
+/// passes `check_private_file`; a folder is ours with no group or other write (Unix) or passes
+/// `check_private_dir` (Windows).
 fn check_entry(p: &Path, dir: bool) -> io::Result<()> {
     let m = match std::fs::symlink_metadata(p) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -157,17 +168,106 @@ fn check_entry(p: &Path, dir: bool) -> io::Result<()> {
     if bad_kind(&m, dir) {
         return Err(refused(p));
     }
+    if !dir {
+        return match sync_gate_core::check_private_file(p) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            r => r,
+        };
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if !dir {
-            return sync_gate_core::check_private_file(p);
-        }
         if m.uid() != nix::unistd::geteuid().as_raw() || m.mode() & 0o022 != 0 {
-            return Err(fail(format!(
-                "a folder other users can change in the cluster path: {}",
-                p.display()
-            )));
+            return Err(sync_gate_core::refusal(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "a folder other users can change in the cluster path: {}",
+                    p.display()
+                ),
+            ));
+        }
+    }
+    #[cfg(windows)]
+    sync_gate_core::check_private_dir(p)?;
+    Ok(())
+}
+
+/// A configuration or registry file of the cluster, judged and read from the same handle.
+fn read_checked(p: &Path) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    sync_gate_core::open_private_file(p)?.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// `read_checked` as text.
+fn read_text_checked(p: &Path) -> io::Result<String> {
+    String::from_utf8(read_checked(p)?)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not UTF-8"))
+}
+
+/// A registry file (`leases.json`, `templates.json`) read for loading: a refusal by the rules is
+/// the outer error (the service fails with it and the file is kept, never set aside as
+/// unreadable); any other result is the caller's to judge.
+pub(crate) fn read_registry(p: &Path) -> Result<io::Result<Vec<u8>>, String> {
+    match read_checked(p) {
+        Err(e) if is_policy_refusal(&e) => Err(e.to_string()),
+        r => Ok(r),
+    }
+}
+
+/// A file the running server writes (`postmaster.pid`): judged by owner and DACL only
+/// (`check_private_file`, no probe for writers: the server has it open), then read by path.
+fn read_operational(p: &Path) -> io::Result<String> {
+    sync_gate_core::check_private_file(p)?;
+    std::fs::read_to_string(p)
+}
+
+/// Windows: nothing holds `p` open for writing its data. Opened for DELETE only (it takes part in
+/// the sharing check without reading the data, which a full read would make the virus scanner do
+/// for every file of the cluster), sharing reads and deletes but not writes.
+#[cfg(windows)]
+fn no_writer(p: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const DELETE: u32 = 0x1_0000;
+    const SHARE_READ_DELETE: u32 = 0x1 | 0x4;
+    const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    std::fs::OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(SHARE_READ_DELETE)
+        .custom_flags(OPEN_REPARSE_POINT)
+        .open(p)
+        .map(drop)
+        .map_err(|e| match e.raw_os_error() {
+            Some(32) => io::Error::new(
+                e.kind(),
+                format!(
+                    "{} is in use by another program in a way that conflicts with a safe read (sharing violation); close it and retry",
+                    p.display()
+                ),
+            ),
+            _ => e,
+        })
+}
+
+/// Before a start, with the server stopped: every folder under `root` passes the folder rule,
+/// every file passes `check_private_file` and (Windows) nothing holds it open for writing. Not
+/// `open_private_file`: reading every data file made the start 20 times slower (the scanner).
+/// Links are not followed: one is refused.
+pub(crate) fn check_tree(root: &Path) -> io::Result<()> {
+    // shortcut: check_private_dir walks the ancestors again for each folder; 50 databases (79
+    // folders, 15,892 files) took 2.2 s on Windows. Keep the parent's verdict if starts get slow.
+    let mut folders = vec![root.to_path_buf()];
+    while let Some(d) = folders.pop() {
+        sync_gate_core::check_private_dir(&d)?;
+        for e in std::fs::read_dir(&d)? {
+            let e = e?;
+            if e.file_type()?.is_dir() {
+                folders.push(e.path());
+            } else {
+                sync_gate_core::check_private_file(&e.path())?;
+                #[cfg(windows)]
+                no_writer(&e.path())?;
+            }
         }
     }
     Ok(())
@@ -187,11 +287,13 @@ fn bad_kind(m: &std::fs::Metadata, dir: bool) -> bool {
     m.file_type().is_symlink() || reparse || !kind_ok
 }
 
-/// True when the file `p` or its `.tmp` sibling exists as a link, a reparse point or something
-/// other than a file (ruling PF8): the caller disables what writes it.
-pub(crate) fn write_target_refused(p: &Path) -> bool {
-    let refused = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| bad_kind(&m, false));
-    refused(p) || refused(&tmp_sibling(p))
+/// The refusal, when the file `p` or its `.tmp` sibling is a link, a reparse point, something
+/// other than a file (ruling PF8) or a file another user could change: the caller disables what
+/// writes it. An error of the system is not a refusal (`None`): the write meets it and is retried.
+pub(crate) fn write_target_refused(p: &Path) -> Option<io::Error> {
+    [p.to_path_buf(), tmp_sibling(p)]
+        .iter()
+        .find_map(|q| check_entry(q, false).err().filter(is_policy_refusal))
 }
 
 fn tmp_sibling(path: &Path) -> PathBuf {
@@ -246,7 +348,7 @@ pub fn check_paths(c: &ClusterPaths) -> io::Result<()> {
     }
     // PostgreSQL reads this over postgresql.conf; sync_gate never writes it nor runs ALTER SYSTEM.
     let auto = data.join("postgresql.auto.conf");
-    match std::fs::read_to_string(&auto) {
+    match read_text_checked(&auto) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
         Ok(text) => {
@@ -266,9 +368,10 @@ pub fn check_paths(c: &ClusterPaths) -> io::Result<()> {
     }
 }
 
-/// `write_atomic`, refused when the file or its `.tmp` sibling is a link or of another kind
-/// (ruling PF8). `write_atomic` now writes a fresh exclusive temporary file instead of `.tmp`;
-/// a planted `.tmp` still disables the writer, as before.
+/// `write_atomic`, refused when the file or its `.tmp` sibling is a link, of another kind (ruling
+/// PF8) or another user could change it. `write_atomic` now writes a fresh exclusive temporary
+/// file instead of `.tmp`; a planted `.tmp` still disables the writer, as before.
+/// `is_policy_refusal` tells a refusal from an error of the system.
 pub(crate) fn write_checked(path: &Path, bytes: &[u8]) -> io::Result<()> {
     check_entry(path, false)?;
     check_entry(&tmp_sibling(path), false)?;
@@ -312,6 +415,7 @@ const LOG_TAIL_BYTES: u64 = 64 * 1024;
 /// line of a window that starts mid-file may be cut and is dropped. Unreadable reads as empty.
 fn log_tail(path: &Path) -> String {
     let read = || -> io::Result<String> {
+        sync_gate_core::check_private_file(path)?;
         let mut f = std::fs::File::open(path)?;
         let from = f.metadata()?.len().saturating_sub(LOG_TAIL_BYTES);
         f.seek(SeekFrom::Start(from))?;
@@ -361,7 +465,7 @@ fn controldata(c: &ClusterPaths) -> io::Result<u64> {
 }
 
 fn load_record(c: &ClusterPaths) -> io::Result<ClusterRecord> {
-    let bytes = std::fs::read(&c.record)?;
+    let bytes = read_checked(&c.record)?;
     serde_json::from_slice(&bytes).map_err(|e| fail(format!("unreadable cluster record: {e}")))
 }
 
@@ -389,7 +493,7 @@ fn process_cmd(pid: u32) -> Option<Vec<OsString>> {
 /// (ruling PF1), is `Ok(None)`. The start time returned is the operating system's (PF7).
 pub(crate) fn running_postmaster(data: &Path, bin: &Path) -> Result<Option<ServerId>, String> {
     let file = data.join("postmaster.pid");
-    let text = match std::fs::read_to_string(&file) {
+    let text = match read_operational(&file) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("cannot read {}: {e}", file.display())),
         Ok(t) => t,
@@ -437,8 +541,8 @@ pub(crate) fn running_postmaster(data: &Path, bin: &Path) -> Result<Option<Serve
 /// may have changed since it started (final review P1).
 fn pid_port(data: &Path) -> Result<u16, String> {
     let file = data.join("postmaster.pid");
-    let text = std::fs::read_to_string(&file)
-        .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+    let text =
+        read_operational(&file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
     text.lines()
         .nth(3)
         .and_then(|l| l.trim().parse().ok())
@@ -517,7 +621,7 @@ impl PgTools for OsPgTools {
             cmd.args(["-E", "UTF8", "--no-locale", "--no-instructions"]);
             run_plain(cmd, INITDB_TIMEOUT, "initdb")?;
             check_paths(c)?;
-            let major = std::fs::read_to_string(c.data.join("PG_VERSION"))?
+            let major = read_text_checked(&c.data.join("PG_VERSION"))?
                 .trim()
                 .parse()
                 .map_err(|_| fail("unreadable PG_VERSION"))?;
@@ -543,7 +647,7 @@ impl PgTools for OsPgTools {
         write_checked(&c.data.join("pg_hba.conf"), hba_conf().as_bytes())?;
         write_checked(&c.data.join("sync_gate.conf"), conf.as_bytes())?;
         let main = c.data.join("postgresql.conf");
-        let text = std::fs::read_to_string(&main)?;
+        let text = read_text_checked(&main)?;
         write_checked(&main, with_include(&text).as_bytes())
     }
 
@@ -557,6 +661,9 @@ impl PgTools for OsPgTools {
         // What pg_ctl itself prints (it dies before opening `server.log` in some failures).
         let out = c.log.with_file_name("pg_ctl.out");
         let mut attempt = || {
+            // The server is stopped here (no `server` found just before, in this call or in the
+            // check before the repeat): nothing of the cluster is open for writing.
+            check_tree(&c.root)?;
             let mut cmd = tool_command(&c.bin, "pg_ctl");
             cmd.arg("start")
                 .arg("-D")
@@ -648,7 +755,7 @@ impl PgTools for OsPgTools {
         let Ok(conf) = server_conf(c.port, &c.sock, max_connections) else {
             return false;
         };
-        let read = |name: &str| std::fs::read_to_string(c.data.join(name)).ok();
+        let read = |name: &str| read_text_checked(&c.data.join(name)).ok();
         check_paths(c).is_ok()
             && read("pg_hba.conf").as_deref() == Some(hba_conf())
             && read("sync_gate.conf") == Some(conf)

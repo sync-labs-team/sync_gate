@@ -183,6 +183,50 @@ fn a_config_in_a_folder_others_can_write_is_refused() {
     assert!(err.contains("writable by other users"), "{err}");
 }
 
+/// C1, every system: a config file others can change, in a folder that passes, is not read; the
+/// daemon exits.
+#[test]
+fn a_config_file_others_can_change_is_refused() {
+    let sb = Sandbox::new("opencfgfile");
+    let cfg = sb.dir.join("cfg");
+    std::fs::create_dir(&cfg).unwrap();
+    let file = cfg.join("config.toml");
+    std::fs::write(&file, "").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let out = Command::new("icacls")
+            .arg(&file)
+            .args(["/grant", "*S-1-1-0:(W)"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "icacls: {out:?}");
+    }
+    let mut child = sb
+        .command(&[])
+        .env("SYNC_GATE_CONFIG", &file)
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed() > LIMIT {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the daemon started with that config");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = text(&out.stderr);
+    assert!(err.contains("writable by other users"), "{err}");
+}
+
 /// Waits for the daemon to answer `Status` on the control socket (up to `LIMIT`), as the CLI does.
 fn status(sock: &str) -> Option<Response> {
     let start = Instant::now();

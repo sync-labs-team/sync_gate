@@ -289,6 +289,125 @@ fn a_cluster_file_others_can_write_is_refused() {
     check_paths(&c).unwrap();
 }
 
+/// A file others can change (Linux, macOS: mode 0666; Windows: Everyone may write it).
+fn open_to_others(p: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(p, fs::Permissions::from_mode(0o666)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let out = Command::new("icacls")
+            .arg(p)
+            .args(["/grant", "*S-1-1-0:(W)"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "icacls: {out:?}");
+    }
+}
+
+/// C8: a cluster file others can change is refused on every system, configuration and
+/// operational files alike; the cluster is left as it was.
+#[test]
+fn a_cluster_file_others_can_change_is_refused_everywhere() {
+    for name in [
+        "postgresql.conf",
+        "postgresql.auto.conf",
+        "pg_hba.conf",
+        "postmaster.pid",
+    ] {
+        let (_s, c) = layout(&format!("open-{}", name.len()));
+        registered(&c);
+        let p = c.data.join(name);
+        fs::write(&p, "").unwrap();
+        check_paths(&c).unwrap();
+        open_to_others(&p);
+        let e = err_of(check_paths(&c));
+        assert!(e.contains("writable by other users"), "{name}: {e}");
+        assert_eq!(fs::read(&p).unwrap(), b"", "{name}");
+        fs::remove_file(&p).unwrap();
+    }
+}
+
+/// C8: a `postmaster.pid` others can change is never trusted to name a server.
+#[test]
+fn a_pid_file_others_can_change_names_no_server() {
+    let (_s, c) = layout("open-pid");
+    registered(&c);
+    write_pidfile(&c, 1, 0);
+    open_to_others(&c.data.join("postmaster.pid"));
+    let e = running_postmaster(&c.data, &c.bin).unwrap_err();
+    assert!(e.contains("writable by other users"), "{e}");
+    fs::remove_file(c.data.join("postmaster.pid")).unwrap();
+}
+
+/// C8: the whole tree is judged before a start, data files included.
+#[test]
+fn check_tree_judges_every_file_and_folder() {
+    let (_s, c) = layout("tree");
+    registered(&c);
+    let base = c.data.join("base");
+    fs::create_dir_all(&base).unwrap();
+    let x = base.join("x");
+    fs::write(&x, "x").unwrap();
+    check_tree(&c.root).unwrap();
+    open_to_others(&x);
+    let e = err_of(check_tree(&c.root));
+    assert!(e.contains("writable by other users"), "{e}");
+    assert_eq!(fs::read(&x).unwrap(), b"x");
+}
+
+/// C8, Windows: before a start nothing may hold a cluster file open for writing (the server is
+/// stopped); a running server's own files are judged without that probe (`check_paths`).
+#[cfg(windows)]
+#[test]
+fn check_tree_refuses_a_file_open_for_writing() {
+    let (_s, c) = layout("tree-held");
+    registered(&c);
+    fs::create_dir_all(&c.root).unwrap();
+    fs::write(&c.log, "").unwrap();
+    let held = fs::OpenOptions::new().write(true).open(&c.log).unwrap();
+    let e = err_of(check_tree(&c.root));
+    assert!(e.contains("sharing violation"), "{e}");
+    check_paths(&c).unwrap();
+    write_pidfile(&c, 1, 0);
+    let pid = fs::OpenOptions::new()
+        .write(true)
+        .open(c.data.join("postmaster.pid"))
+        .unwrap();
+    // Read the way a running server's file is read: no probe, so no refusal.
+    let r = running_postmaster(&c.data, &c.bin);
+    assert!(
+        !r.as_ref().is_err_and(|e| e.contains("sharing violation")),
+        "{r:?}"
+    );
+    drop((held, pid));
+    check_tree(&c.root).unwrap();
+    fs::remove_file(c.data.join("postmaster.pid")).unwrap();
+}
+
+/// 14.3: a refusal by the rules is told apart from an error of the system.
+#[test]
+fn a_policy_refusal_is_told_apart_from_a_system_error() {
+    let (_s, c) = layout("policy");
+    registered(&c);
+    fs::write(&c.leases, LEASES_EMPTY).unwrap();
+    assert!(write_target_refused(&c.leases).is_none());
+    open_to_others(&c.leases);
+    let e = write_target_refused(&c.leases).expect("refused");
+    assert!(e.to_string().contains("writable by other users"), "{e}");
+    assert!(is_policy_refusal(
+        &write_checked(&c.leases, b"x").unwrap_err()
+    ));
+    assert_eq!(fs::read(&c.leases).unwrap(), LEASES_EMPTY.as_bytes());
+    assert!(!is_policy_refusal(&io::Error::from_raw_os_error(32)));
+    assert!(!is_policy_refusal(&io::Error::other("injected")));
+    let link = c.root.join("cluster.json.tmp");
+    fs::create_dir(&link).unwrap();
+    assert!(is_policy_refusal(&write_target_refused(&c.record).unwrap()));
+}
+
 /// PF9: one canonical form, used by every identity comparison.
 #[test]
 fn one_canonical_form_for_every_comparison() {
@@ -1029,4 +1148,41 @@ fn a_failed_start_that_left_nothing_is_repeated_once() {
 fn a_start_is_not_repeated_when_it_worked_or_left_a_log_or_a_server() {
     assert_eq!(twice(Some(0), Some(1), true), (Some(0), 1, 0));
     assert_eq!(twice(Some(1), Some(0), false), (Some(1), 1, 0));
+}
+
+/// Item 6: what `check_tree` costs before a start, on a real stopped cluster with 50 databases.
+/// Prints folders, files and milliseconds. `cargo test -p sync_gated -- --ignored check_tree_cost`.
+#[test]
+#[ignore = "measures; needs SYNC_GATE_TEST_PG_BIN"]
+fn check_tree_cost_with_50_databases() {
+    let Some(r) = real("tree-cost") else {
+        println!("skipped: no PostgreSQL");
+        return;
+    };
+    let c = &r.c;
+    for i in 0..50 {
+        let mut cmd = tool_command(&c.bin, "createdb");
+        cmd.arg("-h").arg(&c.sock).args(["-p", &c.port.to_string()]);
+        cmd.args(["-U", ADMIN_ROLE, &format!("db{i}")]);
+        let out = run_tool(cmd, None, Duration::from_secs(60)).unwrap();
+        assert_eq!(out.code, Some(0), "{}", out.stderr);
+    }
+    OsPgTools.stop(c, r.id).unwrap();
+    let (mut dirs, mut files, mut stack) = (0, 0, vec![c.root.clone()]);
+    while let Some(d) = stack.pop() {
+        dirs += 1;
+        for e in fs::read_dir(&d).unwrap().flatten() {
+            if e.file_type().unwrap().is_dir() {
+                stack.push(e.path());
+            } else {
+                files += 1;
+            }
+        }
+    }
+    let t = std::time::Instant::now();
+    check_tree(&c.root).unwrap();
+    println!(
+        "check_tree: {dirs} folders, {files} files, {} ms",
+        t.elapsed().as_millis()
+    );
 }
