@@ -1270,6 +1270,49 @@ Invoke-Scenario '3.16n' {
     Assert-That (-not $r.Text.Contains('your config lists guests')) "warning with no guests: $($r.Text)"
 }
 
+# ---------------------------------------------------------------- item 6: files others can change are refused
+
+function Grant-SgEveryone {
+    # Everyone may change $Path (a file), or everything under it with -Folder.
+    param([string]$Path, [switch]$Folder)
+    $g = if ($Folder) { '*S-1-1-0:(OI)(CI)(M)' } else { '*S-1-1-0:(W)' }
+    $o = & icacls.exe $Path /grant $g 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "icacls $Path failed: $o" }
+}
+function Assert-SgRefused {
+    param($R, [string]$Before, [string]$Nothing)
+    Assert-That ($R.Code -ne 0) "accepted: $($R.Text)"
+    Assert-That ($R.Text -match 'writable by other users') "no reason given: $($R.Text)"
+    Assert-That ($R.Text.Contains($Nothing)) "no '$Nothing': $($R.Text)"
+    Assert-That ((Get-InstallView $B.SYNC_GATE_INSTALL_DIR) -ceq $Before) 'the install folder changed'
+}
+Invoke-Scenario '3.25' {
+    [void](Install-Ok $FromNew)
+    Grant-SgEveryone (Get-TestLayout).StatePath
+    $before = Get-InstallView $B.SYNC_GATE_INSTALL_DIR
+    Assert-SgRefused (Invoke-Inst -From $FromNew) $before 'nothing was changed'
+}
+Invoke-Scenario '3.26' {
+    [void](Install-Ok $FromNew)
+    Grant-SgEveryone (Join-Path (Get-TestLayout).Bin 'sync_gate.exe')
+    $before = Get-InstallView $B.SYNC_GATE_INSTALL_DIR
+    Assert-SgRefused (Invoke-Inst -From $FromNew) $before 'nothing was changed'
+}
+Invoke-Scenario '3.27' {
+    [void](Install-Ok $FromNew)
+    Grant-SgEveryone (Get-TestLayout).Launcher
+    $before = Get-InstallView $B.SYNC_GATE_INSTALL_DIR
+    Assert-SgRefused (Invoke-Inst -Uninstall) $before 'nothing was removed'
+    Assert-That ([bool](Get-ScheduledTask -TaskName $B.SYNC_GATE_TASK_NAME -ErrorAction SilentlyContinue)) 'the task was removed'
+}
+Invoke-Scenario '3.28' {
+    [void](New-Item -ItemType Directory -Force -Path $B.SYNC_GATE_INSTALL_DIR)
+    Grant-SgEveryone $B.SYNC_GATE_INSTALL_DIR -Folder
+    $before = Get-InstallView $B.SYNC_GATE_INSTALL_DIR
+    Assert-SgRefused (Invoke-Inst -From $FromNew) $before 'nothing was changed'
+    Assert-That (-not (Test-Path -LiteralPath (Join-Path $B.SYNC_GATE_INSTALL_DIR 'bin'))) 'bin\ was created'
+}
+
 # ---------------------------------------------------------------- end: clean up and compare
 
 Reset-Area

@@ -240,6 +240,29 @@ function Get-SyncGatePaths {
     $h
 }
 
+# ---------------------------------------------------------------- files the installer trusts (item 6)
+
+function Assert-SgPrivateFiles {
+    # The programs, the launcher the scheduled task runs, the state this script acts on and the rollback copies are
+    # judged by the rule sync_gate uses for its own data (`sync_gate paths --check`): folders only you can change,
+    # files nobody else can change. $Judge is the downloaded, checksum-verified binary when there is one.
+    param($Layout, [Parameter(Mandatory)][string]$Judge, [Parameter(Mandatory)][string]$Nothing)
+    $paths = @($Layout.Root, $Layout.Bin, $Layout.Launcher, $Layout.StatePath, $Layout.Rollback)
+    foreach ($n in $script:SgExes) { $paths += Join-Path $Layout.Bin $n }
+    if (Test-Path -LiteralPath $Layout.Rollback) {
+        $paths += @(Get-ChildItem -LiteralPath $Layout.Rollback -Recurse -Force | ForEach-Object { $_.FullName })
+    }
+    $r = Invoke-SgNative -File $Judge -Arguments (@('paths', '--check') + $paths) -Env @{}
+    if ($r.ExitCode -eq 2 -and $r.Err -match "unexpected argument '--check'") {
+        # A version before 0.1.5 (uninstalling it) has no `paths --check`: nothing judged, said so.
+        Write-SgLine "note: $Judge is older and cannot check these files; they were not checked"
+        return
+    }
+    if ($r.ExitCode -ne 0) {
+        throw "$(($r.Out + $r.Err).Trim())`n$Nothing. Another account can change what sync_gate runs or reads there: check those files, delete what others could change (the whole folder $($Layout.Root) can go), then run this installer again"
+    }
+}
+
 # ---------------------------------------------------------------- release files
 
 function Get-SgRemoteFile {
@@ -1141,18 +1164,20 @@ function Invoke-SgConfigure {
 function Invoke-SyncGateInstall {
     param([string]$Version, [switch]$ClearOverrides)
     $L = Get-SyncGateLayout -ClearOverrides:$ClearOverrides
-    if (Test-Path -LiteralPath (Join-Path $L.Rollback 'in-progress')) {
-        $was = [IO.File]::ReadAllText((Join-Path $L.Rollback 'in-progress')).Trim()
-        Write-SgLine "a previous run stopped at $was; restoring it first"
-        $pr = @(Restore-SyncGateRollback -Layout $L)
-        if ($pr.Count) { throw "could not restore $($pr -join ', '); files kept in $($L.Rollback) (see docs/install.md#recover)" }
-        Complete-SyncGateJournal $L
-        $L = Get-SyncGateLayout -ClearOverrides:$ClearOverrides
-    }
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ('sync_gate-install-' + [Guid]::NewGuid().ToString('N'))
     try {
         $assets = Get-SyncGateAssets -Version $Version -Dest $tmp
         $staged = Join-Path $assets.Dir 'sync_gate.exe'
+        # Before anything acts on what is there (a rollback to resume included).
+        Assert-SgPrivateFiles -Layout $L -Judge $staged -Nothing 'nothing was changed'
+        if (Test-Path -LiteralPath (Join-Path $L.Rollback 'in-progress')) {
+            $was = [IO.File]::ReadAllText((Join-Path $L.Rollback 'in-progress')).Trim()
+            Write-SgLine "a previous run stopped at $was; restoring it first"
+            $pr = @(Restore-SyncGateRollback -Layout $L)
+            if ($pr.Count) { throw "could not restore $($pr -join ', '); files kept in $($L.Rollback) (see docs/install.md#recover)" }
+            Complete-SyncGateJournal $L
+            $L = Get-SyncGateLayout -ClearOverrides:$ClearOverrides
+        }
         $dirs = Get-SyncGatePaths -Bin $staged -Env (Get-SgInstallEnv $L)
         foreach ($v in $dirs.Values) { Assert-SgPlainValue 'a path from sync_gate paths' $v }
         Test-SgPathEntries $L.EnvKey @($dirs.shims, $L.Bin)
@@ -1205,6 +1230,9 @@ function Invoke-SyncGateInstall {
 
 function Invoke-SyncGateUninstall {
     $L = Get-SyncGateLayout
+    # No other binary is at hand: the installed one judges (it runs below anyway).
+    $judge = Join-Path $L.Bin 'sync_gate.exe'
+    if (Test-Path -LiteralPath $judge) { Assert-SgPrivateFiles -Layout $L -Judge $judge -Nothing 'nothing was removed' }
     if (Test-Path -LiteralPath (Join-Path $L.Rollback 'in-progress')) {
         $was = [IO.File]::ReadAllText((Join-Path $L.Rollback 'in-progress')).Trim()
         Write-SgLine "a previous run stopped at $was; restoring it first"
