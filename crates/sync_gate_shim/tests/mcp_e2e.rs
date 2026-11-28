@@ -361,29 +361,58 @@ fn assert_no_canary_in_hub_output(status: &StatusReport, relay_stderr: &str, dae
     );
 }
 
-/// Collects what `pipe` yields; the receiver disconnects once the pipe has ended.
-fn capture(mut pipe: impl Read + Send + 'static) -> (Arc<Mutex<String>>, mpsc::Receiver<()>) {
+/// Collects what `pipe` yields; the receiver disconnects once the pipe has ended, and gets the
+/// error first if a read failed.
+fn capture(
+    mut pipe: impl Read + Send + 'static,
+) -> (Arc<Mutex<String>>, mpsc::Receiver<std::io::Error>) {
     let text = Arc::new(Mutex::new(String::new()));
-    let (t, (ended, done)) = (text.clone(), mpsc::channel::<()>());
+    let (t, (ended, done)) = (text.clone(), mpsc::channel());
     std::thread::spawn(move || {
-        let _ended = ended;
         let mut buf = [0u8; 4096];
-        while let Ok(n @ 1..) = pipe.read(&mut buf) {
-            t.lock()
-                .unwrap()
-                .push_str(&String::from_utf8_lossy(&buf[..n]));
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) => return,
+                Ok(n) => t
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n])),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    let _ = ended.send(e);
+                    return;
+                }
+            }
         }
     });
     (text, done)
 }
 
-/// Waits (until `by`) for a pipe [`capture`] reads to end.
-fn wait_end(done: &mpsc::Receiver<()>, by: Instant) {
-    let r = done.recv_timeout(by.saturating_duration_since(Instant::now()));
-    assert!(
-        matches!(r, Err(mpsc::RecvTimeoutError::Disconnected)),
-        "stderr never ended"
-    );
+/// Waits (until `by`) for a pipe [`capture`] reads to end; a read error is no end.
+fn wait_end(done: &mpsc::Receiver<std::io::Error>, by: Instant) {
+    match done.recv_timeout(by.saturating_duration_since(Instant::now())) {
+        Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        Ok(e) => panic!("reading stderr failed: {e}"),
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!("stderr never ended"),
+    }
+}
+
+/// A pipe that fails mid-way: its capture must not pass for one read to the end.
+#[test]
+#[should_panic(expected = "reading stderr failed")]
+fn a_stderr_read_error_is_not_taken_for_its_end() {
+    struct Broken(bool);
+    impl Read for Broken {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if std::mem::replace(&mut self.0, true) {
+                return Err(std::io::Error::other("broken pipe"));
+            }
+            buf[0] = b'x';
+            Ok(1)
+        }
+    }
+    let (_, done) = capture(Broken(false));
+    wait_end(&done, Instant::now() + Duration::from_secs(5));
 }
 
 /// What a watchdog does when it fires: the message, then the whole test binary ends.
@@ -471,7 +500,7 @@ struct Relay {
     lines: mpsc::Receiver<Value>,
     seen: Vec<Value>,
     err: Arc<Mutex<String>>,
-    err_done: Option<mpsc::Receiver<()>>,
+    err_done: Option<mpsc::Receiver<std::io::Error>>,
     until: Instant,
 }
 
@@ -1017,7 +1046,7 @@ fn a_watchdog_dropped_in_time_stays_quiet() {
 struct DaemonProcess {
     child: Child,
     err: Arc<Mutex<String>>,
-    err_done: mpsc::Receiver<()>,
+    err_done: mpsc::Receiver<std::io::Error>,
 }
 
 impl DaemonProcess {
