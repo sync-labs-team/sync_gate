@@ -1575,20 +1575,6 @@ fn subscriptions_are_refused_on_a_stateless_child_with_one_note() {
 }
 
 #[test]
-fn modern_client_counts_as_handshaken_from_its_first_request() {
-    let now = Instant::now();
-    let mut m = stateless_two(now);
-    m.client_line(1, &modern_line(1, "tools/list", json!({})), now);
-    let out = feed(
-        &mut m,
-        json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"}),
-        now,
-    );
-    assert_eq!(to_client(&out, 1).len(), 1);
-    assert!(to_client(&out, 2).is_empty());
-}
-
-#[test]
 fn a_late_restore_timeout_does_not_drop_a_newer_active_subscription() {
     let now = Instant::now();
     let mut m = two_ready(now);
@@ -1938,4 +1924,225 @@ fn pool_accessors_report_readiness_subscriptions_and_handshake() {
     // Stateless children are ready too.
     let m = stateless_two(now);
     assert!(m.ready());
+}
+
+// ---- #2 item 20 and item 13 (MCP 2026-07-28) ----------------------------
+
+// JSON-RPC 2.0, section 4 (Request object: "jsonrpc" MUST be exactly "2.0") and 5.1 (-32600
+// Invalid Request); MCP 2026-07-28 basic/transports/stdio: the client MUST NOT write anything to
+// the server's stdin that is not a valid MCP message, so the hub forwards none of these.
+#[test]
+fn a_client_request_without_jsonrpc_2_0_is_invalid() {
+    let now = Instant::now();
+    let mut m = two_ready(now);
+    for (i, envelope) in [
+        None,
+        Some(json!("1.0")),
+        Some(json!(2.0)),
+        Some(json!(null)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut line = json!({"id":i,"method":"tools/list"});
+        if let Some(e) = &envelope {
+            line["jsonrpc"] = e.clone();
+        }
+        let out = m.client_line(1, &line.to_string(), now);
+        assert!(to_child(&out).is_empty(), "{envelope:?}");
+        let e = &to_client(&out, 1)[0];
+        assert_eq!(e["error"]["code"], -32600, "{envelope:?}");
+        assert_eq!(e["id"], i, "{envelope:?}");
+    }
+    // an `initialize` without it is no handshake either
+    let out = m.client_line(1, &INIT.replace(r#""jsonrpc":"2.0","#, ""), now);
+    assert_eq!(to_client(&out, 1)[0]["error"]["code"], -32600);
+    assert!(!m.handshaken(1));
+    // queued phases refuse it too: it never waits for the child
+    let mut q = Mux::new("docs", T);
+    q.client_attached(1);
+    let out = q.client_line(1, r#"{"id":4,"method":"tools/list"}"#, now);
+    assert_eq!(to_client(&out, 1)[0]["error"]["code"], -32600);
+    // a well-formed request still goes through
+    let out = req(&mut m, 1, json!(9), "tools/list", now);
+    assert_eq!(to_child(&out).len(), 1);
+}
+
+// JSON-RPC 2.0, section 4.1: the server MUST NOT reply to a notification; without "jsonrpc":"2.0"
+// it is no valid message (section 4), so it has no effect: dropped, with one note.
+#[test]
+fn a_client_notification_without_jsonrpc_is_dropped_with_a_note() {
+    let now = Instant::now();
+    let mut m = two_ready(now);
+    let hub = to_child(&req(&mut m, 1, json!(7), "tools/call", now))[0]["id"].clone();
+    let mut total_notes = 0;
+    for _ in 0..2 {
+        let out = m.client_line(
+            1,
+            r#"{"method":"notifications/cancelled","params":{"requestId":7}}"#,
+            now,
+        );
+        assert!(!any_client(&out));
+        assert!(to_child(&out).is_empty(), "no cancel reaches the child");
+        total_notes += notes(&out);
+    }
+    assert_eq!(total_notes, 1);
+    assert_eq!(m.in_flight(), 1, "the request is still in flight");
+    let out = feed(&mut m, json!({"jsonrpc":"2.0","id":hub,"result":{}}), now);
+    assert_eq!(to_client(&out, 1)[0]["id"], 7);
+}
+
+// MCP 2026-07-28 basic/patterns/subscriptions, "Opening a Stream": the server MUST NOT send
+// notification types the client has not explicitly requested. A modern client never sent
+// `initialize`, so a child's list_changed is not for it; legacy clients still get it.
+#[test]
+fn a_modern_client_gets_no_list_changed_it_did_not_request() {
+    let now = Instant::now();
+    for mut m in [stateless_two(now), two_ready(now)] {
+        m.client_line(1, &modern_line(1, "tools/list", json!({})), now);
+        m.client_line(2, INIT, now);
+        assert!(!m.handshaken(1), "a modern request is no handshake");
+        let out = feed(
+            &mut m,
+            json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"}),
+            now,
+        );
+        assert!(to_client(&out, 1).is_empty());
+        assert_eq!(to_client(&out, 2).len(), 1);
+    }
+}
+
+// MCP 2026-07-28 basic/versioning, "Protocol Version Negotiation": a server that does not
+// implement the requested version MUST respond with UnsupportedProtocolVersionError (-32022)
+// listing the versions it supports in `data.supported`, with `data.requested`.
+#[test]
+fn a_modern_request_in_a_version_the_hub_does_not_serve_gets_32022() {
+    let now = Instant::now();
+    let mut m = stateless_two(now);
+    for method in ["tools/list", "server/discover", "ping"] {
+        let mut line: Value = serde_json::from_str(&modern_line(3, method, json!({}))).unwrap();
+        line["params"]["_meta"][MODERN_META] = json!("2099-01-01");
+        let out = m.client_line(1, &line.to_string(), now);
+        assert!(to_child(&out).is_empty(), "{method}");
+        let e = &to_client(&out, 1)[0];
+        assert_eq!(e["id"], 3);
+        assert_eq!(e["error"]["code"], -32022, "{method}");
+        assert_eq!(e["error"]["data"]["supported"], json!(["2026-07-28"]));
+        assert_eq!(e["error"]["data"]["requested"], "2099-01-01");
+    }
+    assert_eq!(m.in_flight(), 0);
+}
+
+fn unsupported_one(now: Instant, queued: &[String]) -> (Mux, Vec<Out>) {
+    let mut m = Mux::new("docs", T);
+    m.client_attached(1);
+    for line in queued {
+        assert!(m.client_line(1, line, now).is_empty(), "queued");
+    }
+    let id = to_child(&m.child_started(now))[0]["id"].clone();
+    let out = feed(
+        &mut m,
+        json!({"jsonrpc":"2.0","id":id,"result":{"supportedVersions":["2027-01-01"]}}),
+        now,
+    );
+    assert!(m.unsupported());
+    (m, out)
+}
+
+// Same section: through the hub, a child it cannot speak to supports no version at all, so a
+// modern request (queued or new) gets -32022 with an empty `supported`: the client surfaces an
+// error instead of retrying. Legacy requests keep their error.
+#[test]
+fn an_unsupported_child_answers_32022_with_supported_versions() {
+    let now = Instant::now();
+    let (mut m, out) = unsupported_one(
+        now,
+        &[
+            modern_line(1, "tools/list", json!({})),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}).to_string(),
+        ],
+    );
+    let replies = to_client(&out, 1);
+    assert_eq!(replies[0]["id"], 1);
+    assert_eq!(replies[0]["error"]["code"], -32022);
+    assert_eq!(replies[0]["error"]["data"]["supported"], json!([]));
+    assert_eq!(replies[0]["error"]["data"]["requested"], "2026-07-28");
+    assert_eq!(replies[1]["id"], 2);
+    assert_eq!(replies[1]["error"]["message"], NO_VERSION);
+    let out = m.client_line(1, &modern_line(3, "server/discover", json!({})), now);
+    let e = &to_client(&out, 1)[0]["error"];
+    assert_eq!(e["code"], -32022);
+    assert_eq!(e["data"]["supported"], json!([]));
+    let out = req(&mut m, 1, json!(4), "tools/list", now);
+    assert_eq!(to_client(&out, 1)[0]["error"]["message"], NO_VERSION);
+}
+
+// MCP 2026-07-28 basic, "ResultType": the `result` MUST include a `resultType` field. Results the
+// hub makes itself for a modern request say "complete"; a legacy client's stay as they were.
+#[test]
+fn local_results_to_a_modern_request_carry_result_type() {
+    let now = Instant::now();
+    let mut m = stateless_two(now);
+    for method in ["ping", "logging/setLevel"] {
+        let out = m.client_line(1, &modern_line(5, method, json!({})), now);
+        assert!(to_child(&out).is_empty(), "{method}");
+        assert_eq!(
+            to_client(&out, 1)[0]["result"],
+            json!({"resultType":"complete"}),
+            "{method}"
+        );
+        let out = req(&mut m, 2, json!(6), method, now);
+        assert_eq!(to_client(&out, 2)[0]["result"], json!({}), "{method}");
+    }
+}
+
+// MCP 2026-07-28 basic, "_meta" (per-request protocol fields): protocolVersion and
+// clientCapabilities are required; a request missing one is malformed and the server MUST
+// reject it with -32602.
+#[test]
+fn a_modern_request_without_client_capabilities_is_invalid_params() {
+    let now = Instant::now();
+    let mut m = stateless_two(now);
+    for method in ["tools/list", "ping", "server/discover"] {
+        let line = json!({"jsonrpc":"2.0","id":8,"method":method,
+            "params":{"_meta":{MODERN_META:"2026-07-28"}}});
+        let out = m.client_line(1, &line.to_string(), now);
+        assert!(to_child(&out).is_empty(), "{method}");
+        assert_eq!(to_client(&out, 1)[0]["error"]["code"], -32602, "{method}");
+        assert_eq!(to_client(&out, 1)[0]["id"], 8);
+    }
+    assert_eq!(m.in_flight(), 0);
+}
+
+// MCP 2026-07-28 basic/patterns/subscriptions, "Acknowledgment": the server MUST send
+// `notifications/subscriptions/acknowledged` first, carrying the subscription id (the listen
+// request's id) in `_meta`; types it does not support are omitted. The hub opens no stream on
+// the child, so it honors none: an empty filter, nothing sent to the child, no reply until the
+// client cancels (basic/index: all implementations MUST support the message patterns).
+#[test]
+fn subscriptions_listen_is_acknowledged_with_no_notification_types() {
+    let now = Instant::now();
+    let mut m = stateless_two(now);
+    let mut line: Value =
+        serde_json::from_str(&modern_line(11, "subscriptions/listen", json!({}))).unwrap();
+    line["params"]["notifications"] =
+        json!({"toolsListChanged":true,"resourceSubscriptions":["file:///a"]});
+    let out = m.client_line(1, &line.to_string(), now);
+    assert!(to_child(&out).is_empty());
+    let sent = to_client(&out, 1);
+    assert_eq!(sent.len(), 1, "an acknowledgment and no response");
+    assert_eq!(
+        sent[0],
+        json!({"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged",
+            "params":{"_meta":{"io.modelcontextprotocol/subscriptionId":11},"notifications":{}}})
+    );
+    assert_eq!(m.in_flight(), 0);
+    assert!(!m.holds_subscriptions(1));
+    // the child's list_changed still does not reach it
+    let out = feed(
+        &mut m,
+        json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"}),
+        now,
+    );
+    assert!(to_client(&out, 1).is_empty());
 }
