@@ -207,3 +207,80 @@ fn paths_check_judges_files_and_folders() {
     assert!(err.contains("writable by other users"), "{err}");
     assert!(err.contains("launcher.cmd"), "{err}");
 }
+
+/// C-03, Windows: a file another program holds open for writing when it is checked is refused
+/// (a handle opened before its permissions were fixed would keep that access); closed, it passes.
+#[cfg(windows)]
+#[test]
+fn paths_check_refuses_a_file_open_for_writing() {
+    let e = Env::new("check-held");
+    let f = e.dir.join("install-state.json");
+    std::fs::write(&f, "{}").unwrap();
+    let check = || {
+        let o = e.cmd(&["paths", "--check"], None).arg(&f).output().unwrap();
+        (
+            o.status.code(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+        )
+    };
+    let held = std::fs::OpenOptions::new().write(true).open(&f).unwrap();
+    let (code, err) = check();
+    drop(held);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("sharing violation"), "{err}");
+    let (code, err) = check();
+    let _ = std::fs::remove_dir_all(&e.dir);
+    assert_eq!(code, Some(0), "{err}");
+}
+
+/// C-02: an absent path passes only when what gets created there would: the nearest folder above
+/// it that exists passes the folder rule (what is created inherits from it); and its name passes
+/// the file rule (Windows: no stream, final dot or space).
+#[test]
+fn paths_check_judges_where_an_absent_path_would_be_created() {
+    let e = Env::new("check-absent");
+    let open = e.dir.join("open");
+    std::fs::create_dir(&open).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&e.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let out = Command::new("icacls")
+            .arg(&open)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)(M)"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "icacls: {out:?}");
+    }
+    let check = |paths: &[PathBuf]| {
+        let mut c = e.cmd(&["paths", "--check"], None);
+        c.args(paths);
+        let o = c.output().unwrap();
+        (
+            o.status.code(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+        )
+    };
+    // Under a folder of ours: absent passes, a missing folder of a missing folder too.
+    let (code, err) = check(&[e.dir.join("new.json"), e.dir.join("a").join("b").join("c")]);
+    assert_eq!(code, Some(0), "{err}");
+    // Under a folder others can change: refused, for a file and for a whole missing tree.
+    for p in [
+        open.join("install-state.json"),
+        open.join("root").join("bin"),
+    ] {
+        let (code, err) = check(std::slice::from_ref(&p));
+        assert_eq!(code, Some(1), "{}: {err}", p.display());
+        assert!(err.contains("writable by other users"), "{err}");
+    }
+    #[cfg(windows)]
+    for name in ["state.json.", "state.json:x"] {
+        let (code, err) = check(&[e.dir.join(name)]);
+        assert_eq!(code, Some(1), "{name}: {err}");
+    }
+    let _ = std::fs::remove_dir_all(&e.dir);
+}

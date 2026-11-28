@@ -197,12 +197,14 @@ $ver = ((& (Join-Path $BinDir 'sync_gate.exe') --version) -replace '^\S+\s+(\d+\
 if ($ver -notmatch '^\d+\.\d+\.\d+$') { throw "cannot read the version from sync_gate --version: $ver" }
 $zipName = "sync_gate-$ver-$script:SgTarget.zip"
 function New-Release {
-    param([string]$Name, [switch]$Pad)
+    # -Judge: the sync_gate.exe to ship instead of the one in $BinDir (an older one, for 3.31).
+    param([string]$Name, [switch]$Pad, [string]$Judge)
     $dir = Join-Path $assets $Name
     $stage = Join-Path $dir 'stage'
     [void](New-Item -ItemType Directory -Force -Path $stage)
     foreach ($n in $script:SgExes) {
-        Copy-Item -LiteralPath (Join-Path $BinDir $n) -Destination (Join-Path $stage $n)
+        $src = Join-Path $BinDir $n; if ($Judge -and $n -eq 'sync_gate.exe') { $src = $Judge }
+        Copy-Item -LiteralPath $src -Destination (Join-Path $stage $n)
         if ($Pad) { $fs = [IO.File]::Open((Join-Path $stage $n), 'Append'); try { $fs.Write([byte[]](1..16), 0, 16) } finally { $fs.Close() } }
     }
     Set-Content -LiteralPath (Join-Path $stage 'LICENSE-MIT') -Value 'test'
@@ -1311,6 +1313,53 @@ Invoke-Scenario '3.28' {
     $before = Get-InstallView $B.SYNC_GATE_INSTALL_DIR
     Assert-SgRefused (Invoke-Inst -From $FromNew) $before 'nothing was changed'
     Assert-That (-not (Test-Path -LiteralPath (Join-Path $B.SYNC_GATE_INSTALL_DIR 'bin'))) 'bin\ was created'
+}
+
+# C-01: the state is judged before it is read. One others can change that does not even parse: refused with the
+# reason, never a parse error from reading it first. Install and uninstall.
+Invoke-Scenario '3.29' {
+    [void](Install-Ok $FromNew)
+    $st = (Get-TestLayout).StatePath
+    [IO.File]::WriteAllText($st, '{ not json')
+    Grant-SgEveryone $st
+    $before = Get-InstallView $B.SYNC_GATE_INSTALL_DIR
+    Assert-SgRefused (Invoke-Inst -From $FromNew) $before 'nothing was changed'
+    Assert-SgRefused (Invoke-Inst -Uninstall) $before 'nothing was removed'
+}
+# C-06: the rollback folder is judged before it is listed. One others can change, holding a folder this user cannot
+# list: refused with the reason, never a listing error first.
+Invoke-Scenario '3.30' {
+    [void](Install-Ok $FromNew)
+    $rb = Join-Path $B.SYNC_GATE_INSTALL_DIR 'rollback'
+    $locked = Join-Path $rb 'locked'
+    [void](New-Item -ItemType Directory -Force -Path $locked)
+    Grant-SgEveryone $rb -Folder
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $o = & icacls.exe $locked /deny "*${me}:(RD)" 2>&1; if ($LASTEXITCODE -ne 0) { throw "icacls: $o" }
+    try {
+        $before = Get-InstallView $B.SYNC_GATE_INSTALL_DIR
+        Assert-SgRefused (Invoke-Inst -From $FromNew) $before 'nothing was changed'
+    } finally { [void](& icacls.exe $locked /reset 2>&1) }
+}
+# C-05: a judge before 0.1.5 (no `paths --check`) passes, with a note, only where no newer one can exist: uninstalling
+# that version. A release that claims this version but ships such a binary is refused. Needs a 0.1.4 sync_gate.exe:
+# SYNC_GATE_TEST_OLD_EXE, else the one installed for this user, if it is 0.1.4.
+$script:Old014 = $env:SYNC_GATE_TEST_OLD_EXE
+if (-not $script:Old014) { $script:Old014 = Join-Path $env:LOCALAPPDATA 'sync_labs\sync_gate\bin\sync_gate.exe' }
+Invoke-Scenario '3.31' {
+    if (-not (Test-Path -LiteralPath $script:Old014) -or (& $script:Old014 --version) -ne 'sync_gate 0.1.4') {
+        Write-Host "  3.31: SKIPPED, no sync_gate 0.1.4 at $script:Old014"; return
+    }
+    $fromOld = New-Release 'judge014' -Judge $script:Old014
+    [void](Install-Ok $FromNew)
+    $before = Get-InstallView $B.SYNC_GATE_INSTALL_DIR
+    $r = Invoke-Inst -From $fromOld
+    Assert-That ($r.Code -ne 0 -and $r.Text.Contains('predates 0.1.5') -and $r.Text.Contains('nothing was changed')) "an old judge in a new release: exit $($r.Code): $($r.Text)"
+    Assert-That ((Get-InstallView $B.SYNC_GATE_INSTALL_DIR) -ceq $before) 'the install folder changed'
+    Copy-Item -LiteralPath $script:Old014 -Destination (Join-Path (Get-TestLayout).Bin 'sync_gate.exe') -Force
+    $u = Invoke-Inst -Uninstall
+    Assert-That ($u.Code -eq 0 -and $u.Text.Contains('is older and cannot check these files')) "uninstall with a 0.1.4 judge: exit $($u.Code): $($u.Text)"
+    Assert-That (-not (Test-Path -LiteralPath (Get-TestLayout).StatePath)) 'not uninstalled'
 }
 
 # ---------------------------------------------------------------- end: clean up and compare
