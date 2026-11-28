@@ -143,13 +143,13 @@ impl Budget {
     }
 }
 
-/// One queue's bytes, queued and not written yet, and since when its writer is writing the
-/// current message. Dropped once its queue and its writer are both gone: then nothing can push
+/// One queue's bytes, queued and not written yet, and the message its writer is writing (since
+/// when, and its size). Dropped once its queue and its writer are both gone: then nothing can push
 /// or write, and what was never written leaves the budget.
 struct Gauge {
     bytes: AtomicUsize,
     /// A leaf lock.
-    writing: Mutex<Option<Instant>>,
+    writing: Mutex<Option<(Instant, usize)>>,
     budget: Arc<Budget>,
 }
 
@@ -206,13 +206,17 @@ impl Queue {
         if queued > 0 && queued.saturating_add(n) > self.max_bytes {
             return Err(Spill::Full);
         }
-        // Over the budget, only a queue past its share is refused: the one that fills it (a
-        // client that stopped reading), not one that keeps up and holds a message or two.
+        // Over the budget, only a queue with more than its share waiting behind the message its
+        // writer is writing is refused: the one that fills it (a client that stopped reading),
+        // not one that keeps up, even with a large reply on the wire (the write deadline covers
+        // a write that never ends).
         let b = &g.budget;
         let share = b.max / b.queues.load(Ordering::SeqCst).max(1);
-        if queued > 0
+        let current = lock(&g.writing).map_or(0, |(_, size)| size);
+        let behind = queued.saturating_sub(current);
+        if behind > 0
             && b.bytes.load(Ordering::SeqCst).saturating_add(n) > b.max
-            && queued.saturating_add(n) > share
+            && behind.saturating_add(n) > share
         {
             return Err(Spill::Budget);
         }
@@ -236,11 +240,12 @@ fn drain(rx: Receiver<Vec<u8>>, gauge: Arc<Gauge>, mut w: Box<dyn Write + Send>)
     for mut line in rx {
         let n = line.len();
         line.push(b'\n');
-        *lock(&gauge.writing) = Some(Instant::now());
+        *lock(&gauge.writing) = Some((Instant::now(), n));
         let r = w.write_all(&line);
-        *lock(&gauge.writing) = None;
         gauge.bytes.fetch_sub(n, Ordering::SeqCst);
         gauge.budget.bytes.fetch_sub(n, Ordering::SeqCst);
+        // After the bytes: a push in between sees at most the message twice, never less.
+        *lock(&gauge.writing) = None;
         if r.is_err() {
             return;
         }
@@ -874,7 +879,7 @@ impl Hub {
                     .clients
                     .iter()
                     .filter(|(_, p)| {
-                        lock(&p.q.gauge.writing).is_some_and(|t| now >= t + WRITE_DEADLINE)
+                        lock(&p.q.gauge.writing).is_some_and(|(t, _)| now >= t + WRITE_DEADLINE)
                     })
                     .map(|(c, _)| *c)
                     .collect();

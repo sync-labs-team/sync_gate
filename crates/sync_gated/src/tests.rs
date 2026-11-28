@@ -2339,10 +2339,23 @@ fn core_admission_counts_an_unmeasured_hub_unit() {
         hub.report().iter().all(|r| r.instances == 0)
     });
     hub.tick(Instant::now() + Duration::from_secs(5));
-    let _restarted = l.take_child();
+    let restarted = l.take_child();
     crate::tick(&core, &hub, &services, &mut m, Instant::now());
     let r = acquire(&core, "cargo build", Instant::now());
-    assert!(matches!(r, Response::Queued { .. }), "{r:?}");
+    let Response::Queued { id, .. } = r else {
+        panic!("admitted into the hub's unmeasured memory: {r:?}");
+    };
+    // Measured (this tick still counts it, then measures it), it is in the snapshot from then
+    // on, so the next tick no longer counts it: the job is admitted (8 GiB still free here).
+    m.rss.insert(restarted.pid, 7 * GIB);
+    crate::tick(&core, &hub, &services, &mut m, Instant::now());
+    crate::tick(&core, &hub, &services, &mut m, Instant::now());
+    let admitted = format!("admitted #{id}");
+    assert!(
+        decisions(&core).iter().any(|d| d.ends_with(&admitted)),
+        "{:?}",
+        decisions(&core)
+    );
     hub.shutdown();
 }
 

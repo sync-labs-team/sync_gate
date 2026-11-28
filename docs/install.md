@@ -227,13 +227,15 @@ them). When a limit cuts a session, its relay runs the server itself, as when th
 - **Connections.** The hub accepts 256 connections at once, one per session and shared server.
   One more is closed before anything is read from it.
 - **Queue memory.** Messages waiting to be written to sessions and to servers share a budget of
-  256 MiB. Past it, a queue that holds more than its share (the budget divided by the open
-  queues) takes nothing more: a session that stopped reading is disconnected and the log says
-  `client disconnected (hub queue budget spent)`; messages to a server are dropped and time out.
-  An empty queue always takes one message, so a session that keeps reading is not cut.
-- **Write deadline.** A session the hub has spent 30 s writing one message to (its relay stopped
-  reading) is disconnected: `client disconnected (stopped reading for 30 s)`. The largest message
-  (64 MiB) takes well under a second to a relay that reads.
+  256 MiB. Past it, a queue with more than its share (the budget divided by the open queues)
+  waiting behind the message being written takes nothing more: a session that stopped reading is
+  disconnected and the log says `client disconnected (hub queue budget spent)`; messages to a
+  server are dropped and time out. A queue that holds nothing besides the message on the wire
+  always takes the next one, so a session that keeps reading is not cut.
+- **Write deadline.** Writing one message to a session may take at most 30 s; past that the hub
+  takes it as a relay that stopped reading and disconnects it:
+  `client disconnected (stopped reading for 30 s)`. The largest message (64 MiB) takes well under a
+  second to a relay that reads.
 - **Replay deadline.** A relay that loses the hub replays the session's `initialize` to the server
   it starts and waits up to the server's `request_timeout_secs` (default 300) for the answer: the
   same time the hub gives a server's own `initialize`, so a server that starts slowly (a first

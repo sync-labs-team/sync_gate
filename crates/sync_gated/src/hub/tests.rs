@@ -414,10 +414,34 @@ fn queues_stop_at_the_global_budget() {
     );
     // Nothing is queued any more: what the cut clients held left the budget.
     wait_until("the budget to empty", || hub.queued_bytes() == 0);
+    // Their queues are closed too: the fast client's and the child's stdin are left.
+    wait_until("the cut clients' queues to close", || {
+        hub.inner.budget.queues.load(Ordering::SeqCst) == 2
+    });
     fast.send(request(2, "tools/list"));
     child.answer();
     assert_eq!(fast.recv()["id"], 2);
     hub.shutdown();
+}
+
+/// Review r2 of item 1: over the budget, a queue whose only bytes are the message its writer is
+/// writing counts as empty (a client that keeps reading a large reply); a queue with bytes
+/// waiting behind its write is the one refused.
+#[test]
+fn a_queue_holding_only_its_current_write_is_not_refused_by_the_budget() {
+    let budget = Budget::new(100);
+    let (busy, _busy_rx, busy_gauge) = Queue::new(1000, usize::MAX, &budget);
+    let (hog, _hog_rx, _) = Queue::new(1000, usize::MAX, &budget);
+    // Share: 100 / 2 queues = 50. `busy` is writing a 60-byte reply.
+    assert!(busy.push(vec![b'r'; 60]).is_ok());
+    *lock(&busy_gauge.writing) = Some((Instant::now(), 60));
+    assert!(hog.push(vec![b'h'; 45]).is_ok());
+    // 105 held: the budget is spent.
+    assert!(
+        busy.push(vec![b'n'; 5]).is_ok(),
+        "a client reading a large reply was refused"
+    );
+    assert!(matches!(hog.push(vec![b'h'; 10]), Err(Spill::Budget)));
 }
 
 /// Review F08 (r5):the hub stops a child and forgets its registry row by the launch id the
@@ -1058,18 +1082,21 @@ fn a_client_that_stops_reading_is_dropped_after_the_write_deadline() {
         recv_json(&fast_rx, "fast broadcast")["method"],
         "notifications/tools/list_changed"
     );
-    let writing = || {
+    // When the writer started the broadcast (not the small `initialize` reply before it).
+    let mut started = None;
+    wait_until("the write of the broadcast to the slow client", || {
         let g = lock(&inst.st);
-        g.clients
+        let writing = g
+            .clients
             .get(&slow_id)
-            .and_then(|p| *lock(&p.q.gauge.writing))
-    };
-    wait_until("the write to the slow client to start", || {
-        writing().is_some()
+            .and_then(|p| *lock(&p.q.gauge.writing));
+        started = writing.filter(|(_, size)| *size >= 4 << 20).map(|(t, _)| t);
+        started.is_some()
     });
-    hub.tick(Instant::now());
+    let started = started.unwrap();
+    hub.tick(started + WRITE_DEADLINE - Duration::from_millis(1));
     assert_eq!(docs(&hub).clients, 2, "disconnected before its deadline");
-    hub.tick(Instant::now() + WRITE_DEADLINE);
+    hub.tick(started + WRITE_DEADLINE);
     ended(&w.writer_dropped, "the stalled client's writer thread");
     wait_until("the stalled client to be detached", || {
         docs(&hub).clients == 1
