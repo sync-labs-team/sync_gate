@@ -90,8 +90,9 @@ and what happened.
 - **An uninstall trusts the installed `sync_gate.exe` to check.** No other copy is at hand, so a
   `sync_gate.exe` another account already replaced is not caught by the uninstall; it would run
   anyway, as it does every time your shell runs `sync_gate`. Without an installed `sync_gate.exe`
-  the uninstall reads neither the state nor the rollback copies and stops: reinstall (which checks
-  them and finishes an interrupted run), then uninstall. An install or update checks with the
+  the uninstall reads neither the state nor the rollback copies. If either is there, it stops:
+  reinstall (which checks them and finishes an interrupted run), then uninstall. If neither is,
+  it says there is nothing to do. An install or update checks with the
   downloaded binary, verified against `SHA256SUMS`. A version before 0.1.5 cannot check: the
   installer says so and goes on only when you uninstall it or pin it with `-Version`.
 - **A shims folder already on your `PATH`.** The session hook never adds a refused shims folder,
