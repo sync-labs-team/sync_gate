@@ -270,7 +270,8 @@ impl Drop for Owned {
 #[derive(Default)]
 pub struct OsLauncher {
     children: Mutex<std::collections::HashMap<u32, Owned>>,
-    /// Exit codes of children `is_alive` saw exit and dropped, until `reap` takes them.
+    /// Exit codes of children `is_alive` saw exit and dropped, until `reap` takes them or a
+    /// new child takes the pid.
     exits: Mutex<std::collections::HashMap<u32, i32>>,
 }
 
@@ -295,6 +296,23 @@ impl OsLauncher {
 }
 
 impl OsLauncher {
+    /// Holds a new child under `pid`. A code kept for an older child on the same pid is
+    /// dropped first: it is not this child's.
+    fn track(&self, pid: u32, owned: Owned) {
+        self.note_exit(pid, None);
+        lock(&self.children).insert(pid, owned);
+    }
+
+    /// Keeps `code` as the exit of the child just dropped under `pid`; `None` (no code, as
+    /// after a signal on Unix) forgets any code kept for an older child on that pid.
+    fn note_exit(&self, pid: u32, code: Option<i32>) {
+        let mut exits = lock(&self.exits);
+        match code {
+            Some(code) => exits.insert(pid, code),
+            None => exits.remove(&pid),
+        };
+    }
+
     /// `is_alive`, with the exit observation (`observe`) and the group signal for a leader
     /// that has gone (`on_gone`) injectable.
     fn is_alive_with(
@@ -321,9 +339,8 @@ impl OsLauncher {
                 }
             }
             // Reaped last; nothing is signalled after this.
-            if let Ok(Some(code)) = o.child.try_wait().map(|s| s.and_then(|s| s.code())) {
-                lock(&self.exits).insert(pid, code);
-            }
+            let code = o.child.try_wait().ok().flatten().and_then(|s| s.code());
+            self.note_exit(pid, code);
             children.remove(&pid);
             return false;
         }
@@ -426,7 +443,7 @@ impl Launcher for OsLauncher {
             let _ = o.child.wait();
             return Err(io::ErrorKind::BrokenPipe.into());
         };
-        lock(&self.children).insert(
+        self.track(
             pid,
             Owned {
                 child,
@@ -4183,6 +4200,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(code, Some(3));
+    }
+
+    /// Review F08: a new child that reuses a pid never reports the exit code kept for the
+    /// child that had the pid before it.
+    #[test]
+    fn a_new_child_on_a_reused_pid_drops_the_old_exit_code() {
+        let l = OsLauncher::default();
+        let mut c = child_command("exit3").spawn().unwrap();
+        c.wait().unwrap();
+        let pid = c.id();
+        l.exits.lock().unwrap().insert(pid, 7);
+        l.track(
+            pid,
+            Owned {
+                child: c,
+                start_time: 0,
+                job: 0,
+            },
+        );
+        assert_eq!(l.exits.lock().unwrap().get(&pid), None, "old code kept");
+        assert_eq!(l.reap(pid), Some(3));
+    }
+
+    /// Review F08: a child dropped without a code (killed by a signal on Unix) forgets the
+    /// code kept for an older child on the same pid.
+    #[test]
+    fn a_child_gone_without_a_code_forgets_the_old_one() {
+        let l = OsLauncher::default();
+        l.note_exit(4242, Some(7));
+        l.note_exit(4242, None);
+        assert_eq!(l.reap(4242), None);
     }
 
     #[test]
