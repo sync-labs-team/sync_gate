@@ -830,19 +830,29 @@ mod tests {
         let first = held.recv_timeout(wait).expect("first connection served");
         let _b = Stream::connect(to_name(&name).unwrap()).unwrap();
         let _second = held.recv_timeout(wait).expect("second connection served");
-        let mut over = Stream::connect(to_name(&name).unwrap()).unwrap();
-        let (done, read) = mpsc::channel();
-        thread::spawn(move || {
-            let _ = done.send(over.read(&mut [0u8; 1]));
-        });
-        // Dropped: end of file or an error. Served, its halves would be held open: a timeout.
-        assert!(
-            matches!(read.recv_timeout(wait), Ok(Ok(0) | Err(_))),
-            "the connection over the cap was not dropped"
-        );
-        assert!(held.try_recv().is_err(), "the handler ran over the cap");
-        // Both halves of one connection go: its slot frees and the next one is served.
-        drop(first);
+        let over_is_dropped = |what: &str| {
+            let mut over = Stream::connect(to_name(&name).unwrap()).unwrap();
+            let (done, read) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = done.send(over.read(&mut [0u8; 1]));
+            });
+            // Dropped: end of file or an error. Served, its halves would be held open: a timeout.
+            assert!(
+                matches!(read.recv_timeout(wait), Ok(Ok(0) | Err(_))),
+                "the connection over the cap was not dropped ({what})"
+            );
+            assert!(
+                held.try_recv().is_err(),
+                "the handler ran over the cap ({what})"
+            );
+        };
+        over_is_dropped("both slots held");
+        // One half alone keeps its slot: the hub may keep a writer after its reader ended.
+        let (first_reader, first_writer) = first;
+        drop(first_reader);
+        over_is_dropped("one half of a connection still held");
+        // Both halves of one connection gone: its slot frees and the next one is served.
+        drop(first_writer);
         let mut next = Stream::connect(to_name(&name).unwrap()).unwrap();
         next.write_all(b"x").unwrap();
         let (mut r, _w) = held.recv_timeout(wait).expect("a freed slot serves again");
