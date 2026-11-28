@@ -202,7 +202,12 @@ impl Queue {
     fn push(&self, line: Vec<u8>) -> Result<(), Spill> {
         let n = line.len();
         let g = &self.gauge;
-        let queued = g.bytes.load(Ordering::SeqCst);
+        // Read together: the writer changes both under this lock when a message is done.
+        let (queued, current) = {
+            let writing = lock(&g.writing);
+            let size = writing.map_or(0, |(_, size)| size);
+            (g.bytes.load(Ordering::SeqCst), size)
+        };
         if queued > 0 && queued.saturating_add(n) > self.max_bytes {
             return Err(Spill::Full);
         }
@@ -212,7 +217,6 @@ impl Queue {
         // a write that never ends).
         let b = &g.budget;
         let share = b.max / b.queues.load(Ordering::SeqCst).max(1);
-        let current = lock(&g.writing).map_or(0, |(_, size)| size);
         let behind = queued.saturating_sub(current);
         if behind > 0
             && b.bytes.load(Ordering::SeqCst).saturating_add(n) > b.max
@@ -242,10 +246,13 @@ fn drain(rx: Receiver<Vec<u8>>, gauge: Arc<Gauge>, mut w: Box<dyn Write + Send>)
         line.push(b'\n');
         *lock(&gauge.writing) = Some((Instant::now(), n));
         let r = w.write_all(&line);
-        gauge.bytes.fetch_sub(n, Ordering::SeqCst);
-        gauge.budget.bytes.fetch_sub(n, Ordering::SeqCst);
-        // After the bytes: a push in between sees at most the message twice, never less.
-        *lock(&gauge.writing) = None;
+        {
+            // One step for `push`: the bytes go and the mark clears together.
+            let mut writing = lock(&gauge.writing);
+            gauge.bytes.fetch_sub(n, Ordering::SeqCst);
+            gauge.budget.bytes.fetch_sub(n, Ordering::SeqCst);
+            *writing = None;
+        }
         if r.is_err() {
             return;
         }
