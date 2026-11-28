@@ -661,7 +661,6 @@ fn short_options() -> sync_gate_shim::RunOptions {
     // The hello deadline stays at its default: a short one makes every hub test depend on the
     // machine's load. Only the hello-timeout test shortens it.
     sync_gate_shim::RunOptions {
-        replay_timeout: Duration::from_millis(80),
         exit_grace: Duration::from_millis(80),
         write_timeout: Duration::from_millis(80),
         ..Default::default()
@@ -775,6 +774,8 @@ fn replay_failure(spec: &str) {
         .unwrap()
         .env
         .insert("SYNC_GATE_TEST_CHILD".into(), spec.into());
+    // The replayed `initialize` gets the server's request timeout, as the hub gives a child's.
+    cfg.mcp.get_mut("docs").unwrap().request_timeout_secs = 1;
     let mut s = Session::with_options(cfg, &name, "docs", short_options());
     s.send(request(0, "initialize"));
     s.out.reply(0);
