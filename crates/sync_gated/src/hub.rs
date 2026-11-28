@@ -33,8 +33,8 @@
 //! (`Instance::st`) guards every unit's `Mux` together with everything they route to (client
 //! queues, the hub queue, the child queues, the child states). Under it the code only does
 //! non-blocking queue pushes and closer calls; every blocking write happens on a writer thread.
-//! `servers`, `restarts`, `notes`, `memory`, `registry` and the fake/real launcher's own locks
-//! are leaves. `reloaded` is taken only on a connection thread holding no other lock.
+//! `servers`, `restarts`, `notes`, `memory`, `registry`, each queue's `Gauge::writing` and the
+//! fake/real launcher's own locks are leaves. `reloaded` is taken only on a connection thread holding no other lock.
 //!
 //! Secrets: the `env_from` values of a `HubHello` live only in [`Key`] (memory), which has no
 //! `Debug`. Everything shown or persisted (notes, report, registry, errors) names the server only.
@@ -76,6 +76,9 @@ pub const CHILD_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 /// a queue holding more than its share (the budget over the live queues) is full; an empty
 /// queue still takes one message.
 pub const QUEUE_BUDGET: usize = 256 * 1024 * 1024;
+/// A client the hub has spent this long writing one message to is disconnected (at the next
+/// tick): its relay stopped reading. The largest message takes well under a second.
+pub const WRITE_DEADLINE: Duration = Duration::from_secs(30);
 /// Longest `HubHello` line.
 pub const MAX_HELLO_BYTES: usize = 1024 * 1024;
 /// A connection that has not sent its hello by then is closed (at the next tick).
@@ -140,10 +143,13 @@ impl Budget {
     }
 }
 
-/// One queue's bytes, queued and not written yet. Dropped once its queue and its writer are both
-/// gone: then nothing can push or write, and what was never written leaves the budget.
+/// One queue's bytes, queued and not written yet, and since when its writer is writing the
+/// current message. Dropped once its queue and its writer are both gone: then nothing can push
+/// or write, and what was never written leaves the budget.
 struct Gauge {
     bytes: AtomicUsize,
+    /// A leaf lock.
+    writing: Mutex<Option<Instant>>,
     budget: Arc<Budget>,
 }
 
@@ -181,6 +187,7 @@ impl Queue {
         budget.queues.fetch_add(1, Ordering::SeqCst);
         let gauge = Arc::new(Gauge {
             bytes: AtomicUsize::new(0),
+            writing: Mutex::new(None),
             budget: budget.clone(),
         });
         let q = Queue {
@@ -229,7 +236,9 @@ fn drain(rx: Receiver<Vec<u8>>, gauge: Arc<Gauge>, mut w: Box<dyn Write + Send>)
     for mut line in rx {
         let n = line.len();
         line.push(b'\n');
+        *lock(&gauge.writing) = Some(Instant::now());
         let r = w.write_all(&line);
+        *lock(&gauge.writing) = None;
         gauge.bytes.fetch_sub(n, Ordering::SeqCst);
         gauge.budget.bytes.fetch_sub(n, Ordering::SeqCst);
         if r.is_err() {
@@ -849,6 +858,21 @@ impl Hub {
                 let server = &key.server;
                 let mut guard = lock(&inst.st);
                 let g = &mut *guard;
+                // Closing fails the blocked write: the writer thread ends on its own.
+                let stalled: Vec<ClientId> = g
+                    .clients
+                    .iter()
+                    .filter(|(_, p)| {
+                        lock(&p.q.gauge.writing).is_some_and(|t| now >= t + WRITE_DEADLINE)
+                    })
+                    .map(|(c, _)| *c)
+                    .collect();
+                for c in stalled {
+                    let why = format!("stopped reading for {} s", WRITE_DEADLINE.as_secs());
+                    for (j, out) in inner.cut(server, g, c, &why) {
+                        inner.dispatch(server, g, j, vec![out], now);
+                    }
+                }
                 for i in 0..g.units.len() {
                     let outs = g.units[i].mux.tick(now);
                     // A key this event makes unavailable drops its clients before they get
