@@ -159,6 +159,9 @@ fn save_and_sweep(
     Ok(())
 }
 
+/// Writes a new ticket file: created exclusively (an existing file with that id, whoever made
+/// it, is never truncated nor replaced: `AlreadyExists`), and removed again when it cannot be
+/// written whole, so a torn ticket is never left behind.
 fn save_in(store: &Option<Store>, id: TicketId, p: &Pending) -> std::io::Result<()> {
     use std::io::Write;
     // In-process store: nothing is written anywhere; the ticket lives and dies with this process.
@@ -168,24 +171,24 @@ fn save_in(store: &Option<Store>, id: TicketId, p: &Pending) -> std::io::Result<
     let path = pending_in(store, id).ok_or_else(|| {
         std::io::Error::other("no per-user data directory (set SYNC_GATE_DATA_DIR)")
     })?;
+    let bytes = serde_json::to_vec(p).map_err(std::io::Error::other)?;
     sync_gate_probe::create_private_dir(path.parent().expect("has parent"))?;
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    opts.open(path)?
-        .write_all(&serde_json::to_vec(p).map_err(std::io::Error::other)?)
-}
-
-/// Unix: only a file of ours, with one link, that nobody else can write may be run later.
-#[cfg(unix)]
-fn pending_is_trusted(path: &Path) -> std::io::Result<()> {
-    sync_gate_core::check_private_file(path).map(|_| ())
-}
-
-#[cfg(not(unix))]
-fn pending_is_trusted(_: &Path) -> std::io::Result<()> {
-    Ok(())
+    let mut f = opts.open(&path)?;
+    let done = if crate::shims::injected("pending-write") {
+        Err(std::io::Error::other("injected failure"))
+    } else {
+        f.write_all(&bytes)
+    };
+    drop(f);
+    if done.is_err() {
+        // This call created it (exclusively), in a folder nobody else can change.
+        let _ = std::fs::remove_file(&path);
+    }
+    done
 }
 
 /// Where this process is, for the Ctrl+C handler (installed once, at the start of `main`).
@@ -1207,16 +1210,24 @@ pub fn wait(id: TicketId, max_wait: Option<u64>) -> i32 {
             Ok(DirState::Private) => {}
         }
     }
-    let path = pending_path(id).filter(|p| p.exists());
-    let Some(path) = path else {
+    let Some(path) = pending_path(id) else {
         eprintln!("{}", gone_message(id));
         return 2;
     };
-    if let Err(e) = pending_is_trusted(&path) {
-        eprintln!(
-            "sync_gate: refusing ticket {id}: {e}; nothing was run (run the original command again)"
-        );
-        return 2;
+    // Only a file of ours that nobody else can change may be run later; absent is gone, any other
+    // failure (unreadable included) is a refusal.
+    match sync_gate_core::open_private_file(&path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("{}", gone_message(id));
+            return 2;
+        }
+        Err(e) => {
+            eprintln!(
+                "sync_gate: refusing ticket {id}: {e}; nothing was run (run the original command again)"
+            );
+            return 2;
+        }
     }
     // The retention restarts before the queue, under the claim marker, so the stored command
     // cannot expire while this wait is on it; a wait that cannot renew never queues.
@@ -1245,10 +1256,15 @@ pub fn wait(id: TicketId, max_wait: Option<u64>) -> i32 {
             return 2;
         }
     }
-    let stored = std::fs::read(&path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Pending>(&b).ok());
-    let Some(p) = stored else {
+    // Read from the handle that was judged, after the renewal.
+    let mut bytes = Vec::new();
+    let read = sync_gate_core::open_private_file(&path)
+        .and_then(|mut f| std::io::Read::read_to_end(&mut f, &mut bytes));
+    if let Err(e) = read {
+        eprintln!("sync_gate: refusing ticket {id}: {e}; nothing was run");
+        return 2;
+    }
+    let Some(p) = serde_json::from_slice::<Pending>(&bytes).ok() else {
         eprintln!("sync_gate: no pending command for ticket {id} (unreadable ticket file)");
         return 2;
     };
@@ -1879,6 +1895,26 @@ mod tests {
             .unwrap()
             .set_modified(std::time::SystemTime::now() - age)
             .unwrap();
+    }
+
+    /// C5b: a ticket file that already exists under the new id is never truncated nor replaced;
+    /// the save fails (the caller then runs the command directly).
+    #[test]
+    fn a_save_never_replaces_an_existing_ticket_file() {
+        let d = pending_test_dir("exists");
+        let f = d.join("pending").join("9.json");
+        std::fs::write(&f, "theirs").unwrap();
+        let when = std::fs::metadata(&f).unwrap().modified().unwrap();
+        let p = Pending {
+            argv: vec!["x".into()],
+            cwd: d.clone(),
+            session: "s".into(),
+        };
+        let e = save_in(&Some(Store::Disk(d.clone())), 9, &p).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists, "{e}");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "theirs");
+        assert_eq!(std::fs::metadata(&f).unwrap().modified().unwrap(), when);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// T3.5

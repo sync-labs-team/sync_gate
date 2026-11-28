@@ -29,13 +29,27 @@ thread_local! {
     pub(crate) static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Reads `path`; `None` when missing or unreadable (the latter is reported).
-fn read(path: &Path) -> Option<String> {
+/// Reads `path` from the handle `open_private_file` judged; `None` when missing, refused or
+/// unreadable (the last two are reported, a refusal with its `consequence`). A refused file is
+/// left as it is: the daemon rebuilds these records whole, and the next save replaces it.
+fn read(path: &Path, consequence: &str) -> Option<String> {
+    use std::io::Read;
+    let mut f = match sync_gate_core::open_private_file(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            eprintln!(
+                "sync_gated: ignoring {}: {e}; {consequence} (delete it; sync_gate writes a new one)",
+                path.display()
+            );
+            return None;
+        }
+    };
     #[cfg(test)]
     READS.with(|n| n.set(n.get() + 1));
-    match std::fs::read_to_string(path) {
-        Ok(t) => Some(t),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+    let mut text = String::new();
+    match f.read_to_string(&mut text) {
+        Ok(_) => Some(text),
         Err(e) => {
             eprintln!("sync_gated: cannot read {}: {e}", path.display());
             None
@@ -56,7 +70,7 @@ pub(crate) fn quarantine(path: &Path, why: &dyn std::fmt::Display) {
 
 /// A missing file gives the default model; a corrupt one is moved to `cost.json.bad` first.
 pub fn load(path: &Path) -> CostModel {
-    let Some(text) = read(path) else {
+    let Some(text) = read(path, "using the default cost model") else {
         return CostModel::default();
     };
     // The key format changed (only subcommand-shaped words now): an older file's keys may hold
@@ -90,22 +104,10 @@ pub fn save(path: &Path, model: &CostModel) -> io::Result<()> {
 }
 
 /// Own-process registry rows as `(name, pid, start_time, exe)`; missing or corrupt reads as empty.
-/// Unix: a file another user could have written is never read (it names what gets terminated);
-/// it reads as empty and is left in place, and the next save replaces it.
+/// A file another user could have written is never read (it names what gets terminated): it
+/// reads as empty and is left in place, and the next save replaces it.
 pub fn load_services(path: &Path) -> Vec<(String, u32, u64, String)> {
-    #[cfg(unix)]
-    match sync_gate_core::check_private_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Vec::new(),
-        Err(e) => {
-            eprintln!(
-                "sync_gated: ignoring {}: {e}; leftovers it names are not stopped",
-                path.display()
-            );
-            return Vec::new();
-        }
-    }
-    let Some(text) = read(path) else {
+    let Some(text) = read(path, "leftovers it names are not stopped") else {
         return Vec::new();
     };
     serde_json::from_str(&text).unwrap_or_else(|e| {
@@ -149,5 +151,68 @@ pub fn lock_instance_within(dir: &Path, wait: Duration) -> io::Result<InstanceLo
             return Err(io::ErrorKind::AddrInUse.into());
         }
         std::thread::sleep(left.min(Duration::from_millis(50)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_to_others(p: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o666)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let out = std::process::Command::new("icacls")
+                .arg(p)
+                .args(["/grant", "*S-1-1-0:(W)"])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "icacls: {out:?}");
+        }
+    }
+
+    /// C6: `services.json` and `cost.json` that others can change are never read: empty and
+    /// the default model, the files left as they were (the next save replaces them).
+    #[test]
+    fn a_record_others_can_change_is_ignored_and_kept() {
+        let dir = std::env::temp_dir().join(format!("fg-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        create_private_dir(&dir).unwrap();
+        let reads = || READS.with(std::cell::Cell::get);
+        let services = dir.join("services.json");
+        let row = r#"[["srv",4242,1,"/bin/victim"]]"#;
+        std::fs::write(&services, row).unwrap();
+        let before = reads();
+        assert_eq!(load_services(&services).len(), 1, "control");
+        assert_eq!(reads(), before + 1);
+        open_to_others(&services);
+        assert!(load_services(&services).is_empty());
+        assert_eq!(reads(), before + 1, "the refused file was read");
+        assert_eq!(std::fs::read_to_string(&services).unwrap(), row);
+
+        let cost = dir.join("cost.json");
+        let mut m = CostModel::default();
+        let sig =
+            sync_gate_core::signature(&["cargo".into(), "build".into()], Path::new("/r")).unwrap();
+        m.record(&sig, 900 * sync_gate_core::MIB);
+        save(&cost, &m).unwrap();
+        let text = std::fs::read(&cost).unwrap();
+        assert_eq!(
+            load(&cost).estimate(&sig, true).peak_bytes,
+            900 * sync_gate_core::MIB
+        );
+        open_to_others(&cost);
+        let before = reads();
+        assert_eq!(
+            load(&cost).estimate(&sig, true).peak_bytes,
+            sync_gate_core::PRIOR_HEAVY
+        );
+        assert_eq!(reads(), before);
+        assert_eq!(std::fs::read(&cost).unwrap(), text);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -44,14 +44,26 @@ fn parse_record(bytes: &[u8]) -> io::Result<PausedRecord> {
     )
 }
 
-/// Reads the record. Unix: a file another user could have written is refused before it is read
-/// (`PermissionDenied`, the same path as any unreadable record).
+/// Reads the record from the handle `open_private_file` judged: a file another user could have
+/// written is refused before it is read (`PermissionDenied`, the same path as any unreadable
+/// record).
 fn read_record(path: &Path) -> io::Result<Vec<u8>> {
-    #[cfg(unix)]
-    sync_gate_core::check_private_file(path)?;
+    use std::io::Read;
+    let mut f = sync_gate_core::open_private_file(path)?;
     #[cfg(test)]
     RECORD_READS.with(|n| n.set(n.get() + 1));
-    std::fs::read(path)
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// A record may be replaced or removed only when absent or one of ours: one another user could
+/// have written lists paused processes nobody has checked, and is never discarded here.
+fn replaceable(path: &Path) -> io::Result<()> {
+    match sync_gate_core::check_private_file(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        r => r,
+    }
 }
 
 #[cfg(test)]
@@ -80,6 +92,7 @@ pub fn load_paused(path: &Path) -> io::Result<Vec<FrozenUnit>> {
 }
 
 pub fn save_record(path: &Path, record: &PausedRecord) -> io::Result<()> {
+    replaceable(path)?;
     write_atomic(path, &serde_json::to_vec(record).map_err(io::Error::other)?)
 }
 
@@ -97,6 +110,7 @@ pub struct GuestRecord {
 /// one is fine).
 pub fn save_guest_record(dir: &Path, r: &GuestRecord) -> io::Result<()> {
     let path = dir.join(GUEST_PAUSED_FILE);
+    replaceable(&path)?;
     if r.units.is_empty() {
         return match std::fs::remove_file(&path) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
@@ -848,6 +862,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A file others can change (Unix 0666; Windows: Everyone may write it).
+    fn file_open_to_others(p: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o666)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let out = std::process::Command::new("icacls")
+                .arg(p)
+                .args(["/grant", "*S-1-1-0:(W)"])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "icacls: {out:?}");
+        }
+    }
+
+    /// C7, every system: a record others can change is never opened for reading, never
+    /// resumed, and left as it is.
+    #[test]
+    fn a_record_others_can_change_is_never_read() {
+        let dir = rdir("open-record");
+        let path = dir.join(PAUSED_FILE);
+        let text = r#"{"units":[[10,11,100]],"intents":[]}"#;
+        std::fs::write(&path, text).unwrap();
+        file_open_to_others(&path);
+        let reads = || RECORD_READS.with(std::cell::Cell::get);
+        let before = reads();
+        let e = load_record(&path).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        let mut fake = Fake {
+            starts: [(10, 100)].into(),
+            ..Fake::default()
+        };
+        let outcome = recover_as_owner_with(&dir, &mut fake);
+        assert!(
+            matches!(outcome, RecoveryOutcome::Unavailable(_)),
+            "{outcome:?}"
+        );
+        assert!(fake.resumed.is_empty());
+        assert_eq!(reads(), before, "the refused record was read");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 14.2: a record others can change is not replaced by a save either (the flags that stop
+    /// pausing reflect an earlier read; the write checks again). Absent is fine.
+    #[test]
+    fn a_record_others_can_change_is_not_replaced() {
+        let dir = rdir("open-save");
+        let path = dir.join(PAUSED_FILE);
+        let rec = PausedRecord {
+            units: vec![(1, 2, 3)],
+            intents: Vec::new(),
+        };
+        save_record(&path, &rec).unwrap();
+        let text = std::fs::read(&path).unwrap();
+        file_open_to_others(&path);
+        let e = save_record(&path, &PausedRecord::default()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        assert_eq!(std::fs::read(&path).unwrap(), text);
+        let guest = GuestRecord {
+            units: vec![GuestUnit {
+                pid: 1,
+                tid: 2,
+                created: 3,
+                ident: "x".into(),
+            }],
+        };
+        save_guest_record(&dir, &guest).unwrap();
+        let gpath = dir.join(GUEST_PAUSED_FILE);
+        let gtext = std::fs::read(&gpath).unwrap();
+        file_open_to_others(&gpath);
+        assert!(save_guest_record(&dir, &guest).is_err());
+        assert!(save_guest_record(&dir, &GuestRecord::default()).is_err());
+        assert_eq!(std::fs::read(&gpath).unwrap(), gtext);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A folder others can write is never trusted, even with a legitimate 0600 record in it:
     /// nothing is read, resumed or written. Control: the same with the folder 0700.
     #[test]
@@ -879,11 +973,7 @@ mod tests {
         others_write(&dir, false);
         recover_as_owner_with(&dir, &mut fake);
         assert_eq!(fake.resumed, vec![fu(10, 100)]);
-        #[cfg(unix)]
         assert_eq!(reads(), before + 1);
-        // Windows also counts the absent guest record (no file check refuses it first).
-        #[cfg(windows)]
-        assert!(reads() > before, "the record was not read");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

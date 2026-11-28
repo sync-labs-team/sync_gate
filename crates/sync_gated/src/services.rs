@@ -20,7 +20,8 @@ use pg_sql::{
     template_rename_db, template_rename_role, template_seal, template_state,
 };
 use pg_tools::{
-    ClusterPaths, OsPgTools, PG_MIN_MAJOR, PgTools, ServerId, write_checked, write_target_refused,
+    ClusterPaths, OsPgTools, PG_MIN_MAJOR, PgTools, ServerId, is_policy_refusal, write_checked,
+    write_target_refused,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -574,11 +575,8 @@ impl State {
         let Some(c) = &self.paths else {
             return Err(io::Error::other("the cluster folder is not known yet"));
         };
-        if write_target_refused(&c.leases) {
-            let why = format!(
-                "link or unexpected file where the lease registry is written: {}",
-                c.leases.display()
-            );
+        if let Some(e) = write_target_refused(&c.leases) {
+            let why = e.to_string();
             self.disabled = Some(why.clone());
             return Err(io::Error::other(why));
         }
@@ -588,7 +586,12 @@ impl State {
             leases: self.rows.iter().map(|r| &r.disk).collect(),
         };
         let bytes = serde_json::to_vec_pretty(&out)?;
-        write_checked(&c.leases, &bytes)?;
+        if let Err(e) = write_checked(&c.leases, &bytes) {
+            if is_policy_refusal(&e) {
+                self.disabled = Some(e.to_string());
+            }
+            return Err(e);
+        }
         #[cfg(any(test, feature = "testkit"))]
         {
             let line = self
@@ -637,11 +640,8 @@ impl State {
         let Some(c) = &self.paths else {
             return Err(io::Error::other("the cluster folder is not known yet"));
         };
-        if write_target_refused(&c.templates) {
-            let why = format!(
-                "link or unexpected file where the template registry is written: {}",
-                c.templates.display()
-            );
+        if let Some(e) = write_target_refused(&c.templates) {
+            let why = e.to_string();
             self.disabled = Some(why.clone());
             return Err(io::Error::other(why));
         }
@@ -651,7 +651,11 @@ impl State {
             next_seq: self.next_seq,
             templates: &self.templates,
         };
-        write_checked(&c.templates, &serde_json::to_vec_pretty(&out)?)
+        write_checked(&c.templates, &serde_json::to_vec_pretty(&out)?).inspect_err(|e| {
+            if is_policy_refusal(e) {
+                self.disabled = Some(e.to_string());
+            }
+        })
     }
 
     /// Queues a release, a sample or a decision unless one for the lease waits or runs.
@@ -2600,7 +2604,7 @@ impl Inner {
 /// Loads `leases.json` (R12): readable = known; absent or unreadable in an existing cluster =
 /// unknown (the unreadable file is set aside), and leftover cleanup stays off for good.
 fn load_registry(st: &mut State, c: &ClusterPaths) -> Result<(), String> {
-    let unknown = match std::fs::read(&c.leases) {
+    let unknown = match pg_tools::read_registry(&c.leases)? {
         Ok(bytes) => match parse_registry(&bytes) {
             Some(d) => {
                 st.unknown_before = d.unknown_before;
@@ -2635,7 +2639,7 @@ fn load_registry(st: &mut State, c: &ClusterPaths) -> Result<(), String> {
 /// Loads `templates.json` like [`load_registry`], on its own: absent or unreadable in an
 /// existing cluster = unknown for templates only (the unreadable file is set aside).
 fn load_templates(st: &mut State, c: &ClusterPaths) -> Result<(), String> {
-    let unknown = match std::fs::read(&c.templates) {
+    let unknown = match pg_tools::read_registry(&c.templates)? {
         Ok(bytes) => match parse_templates(&bytes) {
             Some(d) => {
                 st.tpl_unknown = d.unknown_before;

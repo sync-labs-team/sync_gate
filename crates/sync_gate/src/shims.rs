@@ -111,31 +111,37 @@ fn exists(path: &Path) -> io::Result<bool> {
     }
 }
 
-/// Windows: is this file's content the recorded base or a pending one?
+/// Windows: is this file's content the recorded base or a pending one? An error when it
+/// cannot be read.
 #[cfg(windows)]
-fn ours(m: &Manifest, p: &Path) -> bool {
-    fp_of(p)
-        .ok()
-        .is_some_and(|f| m.base.as_ref() == Some(&f) || m.pending.contains(&f))
+fn ours_checked(m: &Manifest, p: &Path) -> io::Result<bool> {
+    fp_of(p).map(|f| m.base.as_ref() == Some(&f) || m.pending.contains(&f))
 }
 
+/// `ours_checked`, an unreadable file counting as not ours (it is then left alone).
+#[cfg(windows)]
+fn ours(m: &Manifest, p: &Path) -> bool {
+    ours_checked(m, p).unwrap_or(false)
+}
+
+/// The manifest, read from the handle `open_private_file` judged (its folder is checked by
+/// every caller first). Absent: `None`.
 fn load(dir: &Path) -> io::Result<Option<Manifest>> {
+    use std::io::Read;
     let p = dir.join(SHIMS_MANIFEST);
-    if !exists(&p)? {
-        return Ok(None);
-    }
     let bad = |why: String| {
         io::Error::other(format!(
-            "cannot read {}: {why}; remove the folder by hand",
+            "cannot read {}: {why}; delete the shims folder, then run `sync_gate shims install`",
             p.display()
         ))
     };
-    // Windows: the folder is the check (`check_private_dir` by both callers); nobody else can
-    // add or replace a file in it.
-    #[cfg(unix)]
-    sync_gate_core::check_private_file(&p).map_err(|e| bad(e.to_string()))?;
-    let m: Manifest =
-        serde_json::from_slice(&std::fs::read(&p)?).map_err(|e| bad(e.to_string()))?;
+    let mut bytes = Vec::new();
+    match sync_gate_core::open_private_file(&p) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(bad(e.to_string())),
+        Ok(mut f) => f.read_to_end(&mut bytes)?,
+    };
+    let m: Manifest = serde_json::from_slice(&bytes).map_err(|e| bad(e.to_string()))?;
     if m.version != 2 {
         return Err(bad(format!("unknown version {}", m.version)));
     }
@@ -149,16 +155,39 @@ fn save(dir: &Path, m: &Manifest) -> io::Result<()> {
     )
 }
 
+/// Windows: every file in the shims folder is one the system may run from PATH, so each passes
+/// `open_private_file` (nobody else can change it, nothing holds it open for writing): the
+/// state at this moment, not afterwards. Unix: the shims are links to the installed binary and
+/// the folder is the check.
+pub(crate) fn check_files(dir: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    for e in std::fs::read_dir(dir)? {
+        let e = e?;
+        if !e.file_type()?.is_dir() {
+            sync_gate_core::open_private_file(&e.path()).map_err(|x| {
+                io::Error::new(
+                    x.kind(),
+                    format!("{x}; delete the shims folder, then run `sync_gate shims install`"),
+                )
+            })?;
+        }
+    }
+    #[cfg(unix)]
+    let _ = dir;
+    Ok(())
+}
+
 /// Creates or refreshes the shims; idempotent. Files not in the manifest are never touched.
 pub fn install(dir: &Path, exe: &Path) -> io::Result<Installed> {
     create_private_dir(dir)?;
+    check_files(dir)?;
     let old = load(dir)?;
     install_os(dir, exe, old)
 }
 
 /// Debug builds only (a test seam; release builds have no such switch): `SYNC_GATE_TEST_FAIL=<point>`
 /// makes the named steps (comma separated) fail so the tests can prove the folder ends consistent.
-fn injected(point: &str) -> bool {
+pub(crate) fn injected(point: &str) -> bool {
     cfg!(debug_assertions)
         && std::env::var("SYNC_GATE_TEST_FAIL").is_ok_and(|v| v.split(',').any(|p| p == point))
 }
@@ -750,37 +779,44 @@ fn install_os(dir: &Path, exe: &Path, old: Option<Manifest>) -> io::Result<Insta
 }
 
 /// Removes only what the manifest lists and that is still what sync_gate made; the rest is kept
-/// and named on stderr. Returns how many files were deleted. A file of ours that could not be
-/// deleted keeps the manifest (it is what makes the folder skipped when a real program is
-/// looked up) and makes this an error naming what is left.
-pub fn remove(dir: &Path) -> io::Result<usize> {
+/// and named on stderr, an entry that cannot be checked too. Returns (deleted, kept). A file of
+/// ours that could not be deleted keeps the manifest (it is what makes the folder skipped when a
+/// real program is looked up) and makes this an error naming what is left.
+pub fn remove(dir: &Path) -> io::Result<(usize, usize)> {
     // The manifest names what gets deleted: trusted only in a folder nobody else can change.
     sync_gate_core::check_private_dir(dir)?;
     let Some(m) = load(dir)? else {
-        return Ok(0);
+        return Ok((0, 0));
     };
-    let (mut n, mut left) = (0, Vec::new());
-    let mut take = |name: &str, ours: &dyn Fn(&Path) -> bool| {
+    let (mut n, mut kept, mut left) = (0, 0, Vec::new());
+    let mut take = |name: &str, ours: &dyn Fn(&Path) -> io::Result<bool>| {
         let p = dir.join(name);
-        if !exists(&p).unwrap_or(false) {
-            return;
-        }
-        if !ours(&p) {
-            eprintln!("kept: {name}: changed by another program");
-        } else if let Err(e) = std::fs::remove_file(&p) {
-            eprintln!("kept: {name}: {e}");
-            left.push(name.to_owned());
-        } else {
-            n += 1;
+        match exists(&p).and_then(|e| if e { ours(&p).map(Some) } else { Ok(None) }) {
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("kept: {name}: cannot check it: {e}");
+                kept += 1;
+            }
+            Ok(Some(false)) => {
+                eprintln!("kept: {name}: changed by another program");
+                kept += 1;
+            }
+            Ok(Some(true)) => match std::fs::remove_file(&p) {
+                Err(e) => {
+                    eprintln!("kept: {name}: {e}");
+                    left.push(name.to_owned());
+                }
+                Ok(()) => n += 1,
+            },
         }
     };
     #[cfg(windows)]
     {
         let same = |want: &Fp| {
             let want = want.clone();
-            move |p: &Path| fp_of(p).ok().as_ref() == Some(&want)
+            move |p: &Path| fp_of(p).map(|f| f == want)
         };
-        let mine = |p: &Path| ours(&m, p);
+        let mine = |p: &Path| ours_checked(&m, p);
         for name in &m.files {
             take(name, &mine);
         }
@@ -791,7 +827,7 @@ pub fn remove(dir: &Path) -> io::Result<usize> {
     }
     #[cfg(unix)]
     for e in &m.files {
-        take(&e.name, &|p| is_ours(p, e));
+        take(&e.name, &|p| Ok(is_ours(p, e)));
     }
     if !left.is_empty() {
         return Err(io::Error::other(format!(
@@ -801,7 +837,7 @@ pub fn remove(dir: &Path) -> io::Result<usize> {
     }
     std::fs::remove_file(dir.join(SHIMS_MANIFEST))?;
     let _ = std::fs::remove_dir(dir); // only when empty
-    Ok(n)
+    Ok((n, kept))
 }
 
 fn folder() -> Result<std::path::PathBuf, String> {
@@ -839,9 +875,19 @@ pub fn cli_install() -> i32 {
 }
 
 pub fn cli_remove() -> i32 {
-    match folder().map_err(io::Error::other).and_then(|d| remove(&d)) {
-        Ok(n) => {
+    let done = folder()
+        .map_err(io::Error::other)
+        .and_then(|d| remove(&d).map(|r| (d, r)));
+    match done {
+        Ok((_, (n, 0))) => {
             println!("Removed {n} file(s).");
+            0
+        }
+        Ok((d, (n, kept))) => {
+            println!(
+                "Removed {n} file(s), kept {kept}: not all shims were removed: delete {} by hand and open new sessions (running ones keep the old PATH).",
+                d.display()
+            );
             0
         }
         Err(e) => {
