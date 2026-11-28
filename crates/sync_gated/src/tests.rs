@@ -2308,6 +2308,44 @@ fn hub_memory_excludes_what_a_just_admitted_job_reserved() {
     assert_eq!(c.memory().unwrap().0, before - reserved);
 }
 
+/// Issue #2, item 9, the other direction: a hub unit that is starting or not measured since it
+/// started will use memory no snapshot shows yet (the key's largest unit so far). The daemon
+/// tick hands that to the core, which does not admit a job into it.
+#[test]
+fn core_admission_counts_an_unmeasured_hub_unit() {
+    let cfg = hub_config();
+    let core = Core::new(
+        cfg.clone(),
+        CostModel::default(),
+        FakeControl::default(),
+        None,
+    );
+    let l = Arc::new(FakeLauncher::default());
+    let hub = crate::Hub::new(&cfg, l.clone(), None, None);
+    let services = crate::Services::new(&cfg, None, crate::Deps::os());
+    let mut m = FakeMeasure {
+        snap: free(8 * GIB),
+        ..Default::default()
+    };
+    let _session = connect(&hub, hello("docs", &[], "/r"));
+    let mut child = l.take_child();
+    // Measured once at 7 GiB: from then on the snapshot shows it.
+    m.rss.insert(child.pid, 7 * GIB);
+    crate::tick(&core, &hub, &services, &mut m, Instant::now());
+    // It exits; its restart is a new process nobody has measured, which the snapshot (8 GiB
+    // free) does not show.
+    l.kill(&mut child);
+    wait_until("the exit to be seen", || {
+        hub.report().iter().all(|r| r.instances == 0)
+    });
+    hub.tick(Instant::now() + Duration::from_secs(5));
+    let _restarted = l.take_child();
+    crate::tick(&core, &hub, &services, &mut m, Instant::now());
+    let r = acquire(&core, "cargo build", Instant::now());
+    assert!(matches!(r, Response::Queued { .. }), "{r:?}");
+    hub.shutdown();
+}
+
 /// Records, at each leftover check, how many `Control` calls had already happened.
 struct OrderLauncher {
     ctl: FakeControl,

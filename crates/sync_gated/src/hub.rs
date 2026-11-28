@@ -820,6 +820,17 @@ impl Hub {
         *lock(&self.inner.memory) = Some((free_bytes, reserve_bytes));
     }
 
+    /// Memory the hub's children will use that no snapshot shows yet: units starting, or running
+    /// but not measured since they started, at the key's largest unit so far. For the core's
+    /// admission (the hub takes it off its own pool budget in `tick`).
+    pub fn unmeasured(&self) -> u64 {
+        lock(&self.inner.map)
+            .instances
+            .values()
+            .map(|i| unmeasured(&lock(&i.st)))
+            .fold(0, u64::saturating_add)
+    }
+
     /// Time-based work: hello deadlines, mux deadlines, restarts after backoff, idle stop.
     pub fn tick(&self, now: Instant) {
         let inner = &self.inner;
