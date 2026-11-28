@@ -172,6 +172,10 @@ static POISONINGS: AtomicU64 = AtomicU64::new(0);
 /// A panic on another thread must not take the daemon down with it: a poisoned lock is
 /// recovered (and cleared, so it counts once) and counted for the hub to note.
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    #[cfg(test)]
+    if let Some(f) = tests::BEFORE_LOCK.with(|h| h.borrow_mut().take()) {
+        f();
+    }
     m.lock().unwrap_or_else(|e| {
         POISONINGS.fetch_add(1, Ordering::SeqCst);
         m.clear_poison();
@@ -355,9 +359,13 @@ impl OsLauncher {
     ) -> bool {
         let mut children = lock(&self.children);
         if let Some(o) = children.live.get_mut(&pid) {
+            // The held handle is the identity, named by its launch: another launch's call (an
+            // older child's, or 0) is answered before anything observes, signals or reaps it.
+            if o.launch != launch {
+                return false;
+            }
             match observe(&mut o.child) {
-                // The held handle is the identity; the caller's launch must be this child's.
-                Ok(false) => return o.launch == launch,
+                Ok(false) => return true,
                 // Leader gone but still unreaped, so its pid and group id are still ours:
                 // take the rest of its tree down now. Windows: dropping the entry closes the
                 // job, same effect.
@@ -365,7 +373,7 @@ impl OsLauncher {
                 // Not observable (Unix): signal nothing. A child still running is still ours.
                 Err(_) => {
                     if let Ok(None) = o.child.try_wait() {
-                        return o.launch == launch;
+                        return true;
                     }
                 }
             }
@@ -4302,6 +4310,92 @@ mod tests {
         /// recording its exit code.
         pub(super) static AFTER_REAP: std::cell::RefCell<Option<Hook>> =
             const { std::cell::RefCell::new(None) };
+        /// Seam: runs once, on this thread, at the next `lock` call, before the lock is taken.
+        pub(super) static BEFORE_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Review F08 (r6): a call for another launch (an older child's, or 0 for a foreign
+    /// process) never observes, signals or reaps the child that has the pid now, even one that
+    /// has already exited: the launch is compared before anything touches the child.
+    #[test]
+    fn a_wrong_launch_never_observes_signals_or_reaps_an_exited_child() {
+        const PID: u32 = u32::MAX - 11;
+        let l = OsLauncher::default();
+        let mut c = child_command("exit3").spawn().unwrap();
+        c.wait().unwrap();
+        let owned = Owned {
+            child: c,
+            launch: 2,
+            job: 0,
+        };
+        l.track(PID, owned);
+        let (mut observed, mut signalled) = (0, 0);
+        for launch in [1, 0] {
+            for exited in [true, false] {
+                let alive = l.is_alive_with(
+                    PID,
+                    1,
+                    launch,
+                    &mut |_| {
+                        observed += 1;
+                        if exited {
+                            Ok(true)
+                        } else {
+                            Err(io::Error::other("not observable"))
+                        }
+                    },
+                    &mut |_| signalled += 1,
+                );
+                assert!(!alive, "launch {launch} is alive");
+            }
+        }
+        let held = l.children.lock().unwrap().live.get(&PID).map(|o| o.launch);
+        assert_eq!(held, Some(2), "a wrong launch reaped the child");
+        assert_eq!(observed, 0, "a wrong launch observed the child");
+        assert_eq!(signalled, 0, "a wrong launch signalled the child's tree");
+        assert_eq!(l.reap(PID, 2), Some(3), "the child lost its code");
+    }
+
+    /// Review F08 (r6, M1'a): the table lock is held from the reap of a child to the record of
+    /// its code. Were it let go in between, a new child could take the pid, exit and have its
+    /// code recorded, and the old child's code would then overwrite it. The hook runs that new
+    /// child at the next lock taken, i.e. inside any such gap; with no gap it runs after.
+    #[test]
+    fn the_code_of_a_new_child_is_never_overwritten_by_the_old_one() {
+        const PID: u32 = u32::MAX - 12;
+        let l = Arc::new(OsLauncher::default());
+        let exited = |launch| {
+            let mut c = child_command("exit3").spawn().unwrap();
+            c.wait().unwrap();
+            Owned {
+                child: c,
+                launch,
+                job: 0,
+            }
+        };
+        l.track(PID, exited(1));
+        let new: Box<dyn FnOnce()> = {
+            let (l, owned) = (l.clone(), exited(2));
+            Box::new(move || {
+                l.track(PID, owned);
+                assert!(!l.is_alive_with(PID, 1, 2, &mut |_| Ok(true), &mut |_| {}));
+            })
+        };
+        let mut arm = Some(new);
+        AFTER_REAP.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |_: &mut Table| {
+                if let Some(new) = arm.take() {
+                    BEFORE_LOCK.with(|b| *b.borrow_mut() = Some(new));
+                }
+            }));
+        });
+        assert!(!l.is_alive_with(PID, 1, 1, &mut |_| Ok(true), &mut |_| {}));
+        AFTER_REAP.with(|h| *h.borrow_mut() = None);
+        if let Some(new) = BEFORE_LOCK.with(|b| b.borrow_mut().take()) {
+            new();
+        }
+        assert_eq!(l.reap(PID, 2), Some(3), "the new child's code was lost");
     }
 
     /// Review F08 (r5): a new child with the same pid AND the same start time (unknown, or the
