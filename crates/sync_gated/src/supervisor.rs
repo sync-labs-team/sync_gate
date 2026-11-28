@@ -24,8 +24,8 @@ use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant};
 
 /// A freshly started child: identity for the registry plus its pipes.
@@ -80,8 +80,11 @@ pub trait Launcher: Send + Sync {
     fn resolve(&self, command: &str, _env: &BTreeMap<String, String>) -> Option<PathBuf> {
         Some(PathBuf::from(command))
     }
-    /// Drops what the launcher still holds for a stopped child (reaps it).
-    fn reap(&self, _pid: u32) {}
+    /// Drops what the launcher still holds for a stopped child (reaps it); its exit code when
+    /// known.
+    fn reap(&self, _pid: u32) -> Option<i32> {
+        None
+    }
 }
 
 /// Restart delay: 1 s, 2 s, 4 s ... capped at 30 s. The caller resets it after 60 s of uptime.
@@ -143,29 +146,45 @@ impl Registry {
     }
 }
 
+static POISONINGS: AtomicU64 = AtomicU64::new(0);
+
+/// A panic on another thread must not take the daemon down with it: a poisoned lock is
+/// recovered (and cleared, so it counts once) and counted for the hub to note.
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| {
+        POISONINGS.fetch_add(1, Ordering::SeqCst);
+        m.clear_poison();
+        e.into_inner()
+    })
+}
+
+/// Locks recovered by [`lock`] since the daemon started.
+pub(crate) fn poisonings() -> u64 {
+    POISONINGS.load(Ordering::SeqCst)
+}
+
 /// Graceful stop of a child this daemon started: close its stdin (a well-behaved MCP server
 /// exits on EOF), wait up to `grace` for it to go, then, if the identity still matches,
-/// terminate it. On success the launcher releases (reaps) the child.
+/// terminate it. On success the launcher releases (reaps) the child and its exit code, when
+/// known, is returned.
 pub fn stop_own(
     l: &dyn Launcher,
     pid: u32,
     start_time: u64,
     stdin: Option<Box<dyn Write + Send>>,
     grace: Duration,
-) -> io::Result<()> {
+) -> io::Result<Option<i32>> {
     drop(stdin);
     let deadline = Instant::now() + grace;
     loop {
         // This check doubles as the identity verification right before `terminate`.
         if !l.is_alive(pid, start_time) {
-            l.reap(pid);
-            return Ok(());
+            return Ok(l.reap(pid));
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             l.terminate(pid, start_time)?;
-            l.reap(pid);
-            return Ok(());
+            return Ok(l.reap(pid));
         }
         std::thread::sleep(left.min(Duration::from_millis(50)));
     }
@@ -231,13 +250,15 @@ impl Drop for Owned {
 #[derive(Default)]
 pub struct OsLauncher {
     children: Mutex<std::collections::HashMap<u32, Owned>>,
+    /// Exit codes of children `is_alive` saw exit and dropped, until `reap` takes them.
+    exits: Mutex<std::collections::HashMap<u32, i32>>,
 }
 
 impl OsLauncher {
     /// One signal round. Own children are signalled with the table lock held, so nobody can
     /// reap them (and free the pid) between the check and the signal.
     fn kill_once(&self, pid: u32, start_time: u64, hard: bool) -> io::Result<()> {
-        let mut children = self.children.lock().unwrap();
+        let mut children = lock(&self.children);
         if let Some(o) = children.get_mut(&pid) {
             return if o.start_time == start_time {
                 kill_own(o, hard)
@@ -263,7 +284,7 @@ impl OsLauncher {
         observe: &mut dyn FnMut(&mut Child) -> io::Result<bool>,
         on_gone: &mut dyn FnMut(&mut Owned),
     ) -> bool {
-        let mut children = self.children.lock().unwrap();
+        let mut children = lock(&self.children);
         if let Some(o) = children.get_mut(&pid) {
             match observe(&mut o.child) {
                 // The held handle is the identity; the recorded start time (even 0) must match.
@@ -280,7 +301,9 @@ impl OsLauncher {
                 }
             }
             // Reaped last; nothing is signalled after this.
-            let _ = o.child.try_wait();
+            if let Ok(Some(code)) = o.child.try_wait().map(|s| s.and_then(|s| s.code())) {
+                lock(&self.exits).insert(pid, code);
+            }
             children.remove(&pid);
             return false;
         }
@@ -383,7 +406,7 @@ impl Launcher for OsLauncher {
             let _ = o.child.wait();
             return Err(io::ErrorKind::BrokenPipe.into());
         };
-        self.children.lock().unwrap().insert(
+        lock(&self.children).insert(
             pid,
             Owned {
                 child,
@@ -459,10 +482,11 @@ impl Launcher for OsLauncher {
         process_exe(pid)
     }
 
-    fn reap(&self, pid: u32) {
-        if let Some(mut o) = self.children.lock().unwrap().remove(&pid) {
-            let _ = o.child.try_wait();
-        }
+    fn reap(&self, pid: u32) -> Option<i32> {
+        let held = lock(&self.children).remove(&pid);
+        let seen = lock(&self.exits).remove(&pid);
+        let code = held.and_then(|mut o| o.child.try_wait().ok().flatten()?.code());
+        code.or(seen)
     }
 }
 
@@ -699,7 +723,7 @@ impl StdinWriter {
             .spawn(move || {
                 let pipe = write_input(pipe, &bytes, &flag);
                 #[cfg(windows)]
-                let mut guard = still_open.lock().unwrap_or_else(|e| e.into_inner());
+                let mut guard = lock(&still_open);
                 // The tool sees end of input here.
                 drop(pipe);
                 #[cfg(windows)]
@@ -720,7 +744,7 @@ impl StdinWriter {
         self.stop.store(true, Ordering::SeqCst);
         #[cfg(windows)]
         while !self.thread.is_finished() {
-            if let Some(h) = *self.open.lock().unwrap_or_else(|e| e.into_inner()) {
+            if let Some(h) = *lock(&self.open) {
                 // SAFETY: while the lock is held and the value is Some, the pipe handle is
                 // open (the writer closes it only under this lock); cancelling only fails
                 // its pending write.
@@ -1012,7 +1036,7 @@ fn run_starter_out(cmd: Command, timeout: Duration, out: Option<&Path>) -> io::R
     return start_detached(
         cmd,
         &mut expired,
-        &|s| s.in_jobs(&own_jobs().lock().unwrap_or_else(|e| e.into_inner())),
+        &|s| s.in_jobs(&lock(own_jobs())),
         &Suspended::end,
         out,
     );
@@ -1595,10 +1619,7 @@ fn try_open_job(child: &Child) -> io::Result<Job> {
             return Err(e);
         }
         let job = job as usize;
-        own_jobs()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(job);
+        lock(own_jobs()).push(job);
         Ok(job)
     }
 }
@@ -1606,7 +1627,7 @@ fn try_open_job(child: &Child) -> io::Result<Job> {
 #[cfg(windows)]
 fn close_job(job: Job) {
     if job != 0 {
-        let mut own = own_jobs().lock().unwrap_or_else(|e| e.into_inner());
+        let mut own = lock(own_jobs());
         own.retain(|&j| j != job);
         // SAFETY: the handle came from `open_job` and is closed exactly once (Owned::drop),
         // with the registry lock held so no starter check is reading it.
@@ -1879,8 +1900,9 @@ mod tests {
         fn exe_of(&self, pid: u32) -> Option<PathBuf> {
             self.exes.get(&pid).cloned()
         }
-        fn reap(&self, pid: u32) {
+        fn reap(&self, pid: u32) -> Option<i32> {
             self.log.lock().unwrap().push(format!("reap {pid}"));
+            None
         }
     }
 
@@ -2368,6 +2390,7 @@ mod tests {
             // Also the detached descendant of several fixtures: it ends by itself after 60 s,
             // so a guard that rightly refuses to act never leaves it behind for long.
             "sleep" => std::thread::sleep(Duration::from_secs(60)),
+            "exit3" => std::process::exit(3),
             // Exits with 259, the value of STILL_ACTIVE.
             "exit259" => std::process::exit(259),
             // Ends by itself after about a second.
@@ -4120,5 +4143,39 @@ mod tests {
             "the grandchild outlived stop_own"
         );
         assert_not_alive(&l, s.pid, s.start_time);
+    }
+
+    #[test]
+    fn stop_own_reports_the_exit_code_of_an_own_child() {
+        let l = OsLauncher::default();
+        let s = spawn_child(&l, "exit3");
+        let _g = Guard(&l, s.pid, s.start_time);
+        let code = stop_own(
+            &l,
+            s.pid,
+            s.start_time,
+            Some(s.stdin),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(code, Some(3));
+    }
+
+    #[test]
+    fn an_os_launcher_survives_a_poisoned_table() {
+        let l = Arc::new(OsLauncher::default());
+        let before = poisonings();
+        let held = l.clone();
+        let _ = std::thread::spawn(move || {
+            let _t = held.children.lock().unwrap();
+            panic!("poison the table");
+        })
+        .join();
+        assert!(l.children.is_poisoned());
+        // Neither panics; the poisoning is counted for the hub to note.
+        assert!(!l.is_alive(u32::MAX - 1, 1));
+        assert_eq!(l.reap(u32::MAX - 1), None);
+        assert!(!l.children.is_poisoned(), "not recovered");
+        assert!(poisonings() > before);
     }
 }

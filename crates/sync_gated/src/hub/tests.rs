@@ -155,7 +155,7 @@ fn child_crash_restarts_and_clients_keep_working() {
     assert!(
         notes
             .iter()
-            .any(|n| n == "mcp docs: restarted (child exited)"),
+            .any(|n| n == "mcp docs: restarted (child exited, code unknown)"),
         "{notes:?}"
     );
     // The dead child went through the supervisor.
@@ -572,7 +572,7 @@ fn failed_child_is_restarted() {
     assert!(notes_contain(
         &hub,
         &mut notes,
-        "mcp docs: restarted (initialize failed)"
+        "mcp docs: restarted (initialize failed, code unknown)"
     ));
     assert!(notes_contain(
         &hub,
@@ -2164,7 +2164,7 @@ impl crate::supervisor::Launcher for RemovesBeforeSpawn {
     fn resolve(&self, command: &str, env: &BTreeMap<String, String>) -> Option<PathBuf> {
         self.os.resolve(command, env)
     }
-    fn reap(&self, pid: u32) {
+    fn reap(&self, pid: u32) -> Option<i32> {
         self.os.reap(pid)
     }
 }
@@ -2239,4 +2239,62 @@ fn hubreload_the_hub_starts_the_file_it_compared_or_nothing() {
         "no second search"
     );
     let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_restart_note_names_the_exit_code() {
+    let l = Arc::new(FakeLauncher::default());
+    let hub = hub(&l);
+    let c = connect(&hub, hello("docs", &[], "/r"));
+    assert_eq!(c.reply(), HubReply::Ok);
+    let mut child = l.take_child();
+    child.handshake();
+    l.exit_codes.lock().unwrap().insert(100, 3);
+    l.kill(&mut child);
+    wait_until("the crash to be seen", || docs(&hub).instances == 0);
+    wait_until("stop_own", || l.calls().contains(&"reap 100".to_string()));
+    hub.tick(Instant::now() + Duration::from_secs(2));
+    assert_eq!(l.spawns(), 2);
+    // No code known for the second child.
+    let mut child = l.take_child();
+    child.handshake();
+    l.kill(&mut child);
+    wait_until("stop_own", || l.calls().contains(&"reap 101".to_string()));
+    hub.tick(Instant::now() + Duration::from_secs(5));
+    assert_eq!(l.spawns(), 3);
+    let notes = hub.take_notes();
+    for want in [
+        "mcp docs: restarted (child exited, code 3)",
+        "mcp docs: restarted (child exited, code unknown)",
+    ] {
+        assert_eq!(count_notes(&notes, want), 1, "{want}: {notes:?}");
+    }
+    hub.shutdown();
+}
+
+#[test]
+fn a_poisoned_hub_lock_is_noted_once() {
+    let l = Arc::new(FakeLauncher::default());
+    let hub = hub(&l);
+    let inner = hub.inner.clone();
+    // A thread that panics while it holds the lock leaves it poisoned.
+    let _ = std::thread::spawn(move || {
+        let _g = inner.restarts.lock().unwrap();
+        panic!("poison the lock");
+    })
+    .join();
+    assert!(hub.inner.restarts.is_poisoned());
+    let _ = hub.report();
+    let _ = hub.report();
+    let notes = hub.take_notes();
+    assert_eq!(count_notes(&notes, "poisoned"), 1, "{notes:?}");
+    assert!(!hub.inner.restarts.is_poisoned(), "not recovered");
+    let seen = crate::supervisor::poisonings();
+    let _ = hub.report();
+    let again = hub.take_notes();
+    // Another test of this binary may poison a lock of its own meanwhile.
+    if crate::supervisor::poisonings() == seen {
+        assert_eq!(count_notes(&again, "poisoned"), 0, "{again:?}");
+    }
+    hub.shutdown();
 }

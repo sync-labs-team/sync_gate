@@ -43,7 +43,8 @@
 
 use crate::ipc::{Closer, PARSE_THREAD_STACK, STREAM_THREAD_STACK};
 use crate::supervisor::{
-    Backoff, Launcher, Registry, Spawned, is_bare, path_has_relative_entry, stop_own,
+    Backoff, Launcher, Registry, Spawned, is_bare, lock, path_has_relative_entry, poisonings,
+    stop_own,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -51,7 +52,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sync_gate_core::{
     Config, ConfigLoadError, HubHello, HubReply, Kind, McpMode, McpServer, McpStatus, classify,
@@ -206,6 +207,8 @@ struct Unit {
     crashes: VecDeque<Instant>,
     /// Why the next start is a restart; `None` for a start on demand.
     restarting: Option<&'static str>,
+    /// Generation of the child whose exit is pending a restart, with its exit code once known.
+    exit: Option<(u64, Option<i32>)>,
     rss: u64,
     /// Since when nothing is in flight here (for shrinking).
     quiet_since: Option<Instant>,
@@ -270,17 +273,14 @@ struct Inner {
     stopped: AtomicBool,
     next_generation: AtomicU64,
     stop_grace: Duration,
+    /// `supervisor::poisonings()` when the hub last noted it.
+    poisonings_seen: AtomicU64,
     /// Free and reserve bytes from the daemon's last snapshot; `None`: the pool does not grow.
     memory: Mutex<Option<(u64, u64)>>,
 }
 
 pub struct Hub {
     inner: Arc<Inner>,
-}
-
-/// A panic on another thread must not take the hub down with it.
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A hub thread that only moves bytes (stoppers, refusal replies): small stack. A failure to
@@ -468,6 +468,7 @@ impl Hub {
                 stopped: AtomicBool::new(false),
                 next_generation: AtomicU64::new(1),
                 stop_grace: STOP_GRACE,
+                poisonings_seen: AtomicU64::new(poisonings()),
                 memory: Mutex::new(None),
             }),
         }
@@ -837,6 +838,11 @@ impl Hub {
 
     /// Decisions made since the last call, for the daemon's decision log.
     pub fn take_notes(&self) -> Vec<String> {
+        let now = poisonings();
+        if self.inner.poisonings_seen.swap(now, Ordering::SeqCst) < now {
+            self.inner
+                .note("mcp hub: a panicked thread left a lock poisoned; recovered".into());
+        }
         lock(&self.inner.notes).drain(..).collect()
     }
 
@@ -982,6 +988,7 @@ impl Unit {
             backoff: Backoff::default(),
             crashes: VecDeque::new(),
             restarting: None,
+            exit: None,
             rss: 0,
             quiet_since: None,
         }
@@ -1298,7 +1305,8 @@ impl Inner {
             _ => {
                 drop(guard);
                 drop((stdin, stdout));
-                return self.stop_now(server, run);
+                self.stop_now(server, run);
+                return;
             }
         };
         // Threads start under the lock so the reader cannot see the child before it is Running.
@@ -1310,22 +1318,26 @@ impl Inner {
             self.note(format!("mcp {server}: cannot serve the child: {e}"));
             self.crashed(server, g, i, now, "start failed");
             drop(guard);
-            return self.stop_now(server, run);
+            self.stop_now(server, run);
+            return;
         }
         let u = &mut g.units[i];
         u.child = Child::Running(run);
         // A new process: not measured yet.
         u.rss = 0;
+        let code = u.exit.take().and_then(|(_, c)| c);
         if let Some(why) = u.restarting.take() {
             *lock(&self.restarts).entry(server.clone()).or_default() += 1;
-            self.note(format!("mcp {server}: restarted ({why})"));
+            let code = code.map_or("unknown".into(), |c| c.to_string());
+            self.note(format!("mcp {server}: restarted ({why}, code {code})"));
         }
         let outs = u.mux.child_started(now);
         self.dispatch(server, g, i, outs, now);
     }
 
-    /// Stops an own child through the supervisor and forgets its registry row. Blocking.
-    fn stop_now(&self, server: &str, run: Run) {
+    /// Stops an own child through the supervisor and forgets its registry row; its exit code
+    /// when known. Blocking.
+    fn stop_now(&self, server: &str, run: Run) -> Option<i32> {
         let Run {
             pid,
             start_time,
@@ -1334,18 +1346,24 @@ impl Inner {
         } = run;
         // Dropping the queue ends the writer thread, which closes the child's stdin.
         drop(stdin);
-        if let Err(e) = stop_own(&*self.launcher, pid, start_time, None, self.stop_grace) {
-            self.note(format!("mcp {server}: cannot stop pid {pid}: {e}"));
-            return;
-        }
+        let code = match stop_own(&*self.launcher, pid, start_time, None, self.stop_grace) {
+            Ok(code) => code,
+            Err(e) => {
+                self.note(format!("mcp {server}: cannot stop pid {pid}: {e}"));
+                return None;
+            }
+        };
         if let Some(reg) = &self.registry {
             lock(reg).forget(pid);
         }
+        code
     }
 
     fn stop_later(self: &Arc<Self>, server: String, run: Run) {
         let me = self.clone();
-        spawn_or_inline(move || me.stop_now(&server, run));
+        spawn_or_inline(move || {
+            me.stop_now(&server, run);
+        });
     }
 
     fn client_reader(
@@ -1707,14 +1725,25 @@ impl Inner {
                 return;
             };
             let old = std::mem::replace(&mut g.units[i].child, Child::Stopped);
+            g.units[i].exit = Some((generation, None));
             let outs = g.units[i].mux.child_exited();
             self.crashed(server, g, i, now, "child exited");
             // After a fall-back the clients are gone: nobody is answered.
             self.dispatch(server, g, i, outs, now);
             running(old)
         };
-        if let Some(run) = run {
-            self.stop_now(server, run);
+        let Some(run) = run else {
+            return;
+        };
+        let code = self.stop_now(server, run);
+        // Unless the restart already happened: its note then says "code unknown".
+        let mut g = lock(&inst.st);
+        let pending = g.units.iter_mut().find_map(|u| match &mut u.exit {
+            Some((gen_, c)) if *gen_ == generation => Some(c),
+            _ => None,
+        });
+        if let Some(c) = pending {
+            *c = code;
         }
     }
 }

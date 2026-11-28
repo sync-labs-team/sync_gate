@@ -244,6 +244,8 @@ pub struct FakeLauncher {
     pub resolved: Mutex<Option<PathBuf>>,
     /// `resolve` finds nothing (a bare name on no safe folder of the PATH).
     pub unresolvable: AtomicBool,
+    /// Exit code `reap` reports per pid; absent = unknown.
+    pub exit_codes: Mutex<HashMap<u32, i32>>,
 }
 
 impl FakeLauncher {
@@ -342,8 +344,9 @@ impl Launcher for FakeLauncher {
         self.alive.lock().unwrap().remove(&pid);
         Ok(())
     }
-    fn reap(&self, pid: u32) {
+    fn reap(&self, pid: u32) -> Option<i32> {
         self.log.lock().unwrap().push(format!("reap {pid}"));
+        self.exit_codes.lock().unwrap().get(&pid).copied()
     }
     fn resolve(&self, command: &str, _env: &BTreeMap<String, String>) -> Option<PathBuf> {
         if self.unresolvable.load(Ordering::SeqCst) {
