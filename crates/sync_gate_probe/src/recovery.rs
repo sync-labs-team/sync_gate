@@ -879,7 +879,10 @@ mod tests {
         others_write(&dir, false);
         recover_as_owner_with(&dir, &mut fake);
         assert_eq!(fake.resumed, vec![fu(10, 100)]);
+        #[cfg(unix)]
+        assert_eq!(reads(), before + 1);
         // Windows also counts the absent guest record (no file check refuses it first).
+        #[cfg(windows)]
         assert!(reads() > before, "the record was not read");
         let _ = std::fs::remove_dir_all(&dir);
     }

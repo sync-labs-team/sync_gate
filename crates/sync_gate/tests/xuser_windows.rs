@@ -457,6 +457,10 @@ struct Ctx {
     /// The owner's folder for this test: data dir, a project with a `.git`, the owner's job.
     work: PathBuf,
     socket: String,
+    /// `SYNC_GATE_CONFIG` for the sandbox: in a folder that does not exist, at the system drive's
+    /// root (under `tmp` the sandbox can change the parent, refused; under the profile the
+    /// sandbox account cannot even open it, `Access is denied`), so the defaults apply.
+    no_config: PathBuf,
     /// The local part of the account that runs commands in the sandbox, lower case.
     account: String,
     acl_warm: BTreeSet<String>,
@@ -520,6 +524,8 @@ impl Ctx {
         }
         let acl_before = acl_capture();
         let pid = std::process::id();
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let drive = std::env::var("SystemDrive").expect("SystemDrive");
         // The folder guard first: whatever fails below, `Drop` removes both folders (bounded,
         // and a folder that stays is reported).
         let mut c = Ctx {
@@ -530,13 +536,19 @@ impl Ctx {
             work: PathBuf::from(std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA"))
                 .join("sync_gate-xw")
                 .join(format!("data-{pid}")),
-            socket: format!(
-                "sync_gate-xw-{pid}-{}",
-                COUNTER.fetch_add(1, Ordering::SeqCst)
-            ),
+            socket: format!("sync_gate-xw-{pid}-{n}"),
+            no_config: PathBuf::from(format!(r"{drive}\sync_gate-xw-none-{pid}-{n}"))
+                .join("config.toml"),
             account: String::new(),
             acl_warm: BTreeSet::new(),
         };
+        let none = c.no_config.parent().unwrap();
+        assert!(
+            std::fs::symlink_metadata(none)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+            "{} must not exist",
+            none.display()
+        );
         reset_dir(&c.tmp);
         reset_dir(&c.work.join("data"));
         std::fs::create_dir_all(c.work.join("proj").join(".git")).unwrap();
@@ -622,10 +634,7 @@ impl Ctx {
             .arg("--")
             .args(argv)
             .env("SYNC_GATE_SOCKET", &self.socket)
-            // In a folder that does not exist: the defaults, with nothing to check. At the drive
-            // root: under `tmp` the sandbox can change the parent (refused), and under the
-            // profile the sandbox account cannot even open it (`Access is denied`).
-            .env("SYNC_GATE_CONFIG", r"C:\sync_gate-xw-none\config.toml")
+            .env("SYNC_GATE_CONFIG", &self.no_config)
             .env("SYNC_GATE_FORCE_HEAVY", "1")
             .env_remove("SYNC_GATE_DATA_DIR")
             .env_remove("SYNC_GATE_JOB")
