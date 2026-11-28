@@ -1193,6 +1193,22 @@ fn gone_message(id: TicketId) -> String {
     )
 }
 
+/// `open_private_file` on a stored command, retried for up to 1 s while another process holds it
+/// open for writing (Windows: another wait renewing it, as `renew_at` retries the other way). The
+/// opening still refuses to share writing: what is judged is what is read.
+fn open_pending(path: &Path) -> std::io::Result<std::fs::File> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let r = sync_gate_core::open_private_file(path);
+        match &r {
+            Err(e) if sync_gate_core::is_in_use(e) && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            _ => return r,
+        }
+    }
+}
+
 pub fn wait(id: TicketId, max_wait: Option<u64>) -> i32 {
     // First, the folder: the file read below is the one that passed the check only if nobody
     // else could have swapped it.
@@ -1228,12 +1244,21 @@ pub fn wait(id: TicketId, max_wait: Option<u64>) -> i32 {
     };
     // Only a file of ours that nobody else can change may be run later; absent is gone, any other
     // failure (unreadable included) is a refusal.
-    match sync_gate_core::open_private_file(&path) {
+    let busy = || {
+        eprintln!(
+            "sync_gate: ticket {id} is being run or expired by another process right now; nothing was run here{}",
+            claim_hint(id)
+        );
+        1
+    };
+    match open_pending(&path) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             eprintln!("{}", gone_message(id));
             return 2;
         }
+        // Another wait renewing it: that one goes on with the command; never "run it again".
+        Err(e) if sync_gate_core::is_in_use(&e) => return busy(),
         Err(e) => {
             eprintln!(
                 "sync_gate: refusing ticket {id}: {e}; nothing was run (run the original command again)"
@@ -1250,13 +1275,7 @@ pub fn wait(id: TicketId, max_wait: Option<u64>) -> i32 {
     );
     match renewed {
         Renewal::Renewed => {}
-        Renewal::Busy => {
-            eprintln!(
-                "sync_gate: ticket {id} is being run or expired by another process right now; nothing was run here{}",
-                claim_hint(id)
-            );
-            return 1;
-        }
+        Renewal::Busy => return busy(),
         Renewal::Gone => {
             eprintln!("{}", gone_message(id));
             return 2;
@@ -1270,9 +1289,11 @@ pub fn wait(id: TicketId, max_wait: Option<u64>) -> i32 {
     }
     // Read from the handle that was judged, after the renewal.
     let mut bytes = Vec::new();
-    let read = sync_gate_core::open_private_file(&path)
-        .and_then(|mut f| std::io::Read::read_to_end(&mut f, &mut bytes));
+    let read = open_pending(&path).and_then(|mut f| std::io::Read::read_to_end(&mut f, &mut bytes));
     if let Err(e) = read {
+        if sync_gate_core::is_in_use(&e) {
+            return busy();
+        }
         eprintln!("sync_gate: refusing ticket {id}: {e}; nothing was run");
         return 2;
     }

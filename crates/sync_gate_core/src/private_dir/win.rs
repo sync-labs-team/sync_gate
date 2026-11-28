@@ -494,7 +494,7 @@ fn open_file(path: &Path, read: bool) -> io::Result<std::fs::File> {
     };
     let (e, f) = open_with(path, access, share).map_err(|e| {
         if e.raw_os_error() == Some(32) {
-            io::Error::new(
+            super::in_use(
                 e.kind(),
                 format!(
                     "{} is in use by another program in a way that conflicts with a safe read (sharing violation); close it and retry",
