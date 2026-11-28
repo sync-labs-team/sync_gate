@@ -1414,9 +1414,9 @@ fn legacy_client_on_stateless_child_gets_synthetic_initialize_and_meta_injection
         assert!(to_child(&out).is_empty());
         assert_eq!(to_client(&out, 1)[0]["result"], json!({}));
     }
-    // a legacy client's discover is still method-not-found
+    // discover is modern only: without its required `_meta` it is malformed (-32602)
     let out = req(&mut m, 1, json!(7), "server/discover", now);
-    assert_eq!(to_client(&out, 1)[0]["error"]["code"], -32601);
+    assert_eq!(to_client(&out, 1)[0]["error"]["code"], -32602);
 }
 
 #[test]
@@ -1747,9 +1747,12 @@ fn only_a_non_legacy_string_version_makes_a_request_modern() {
         let sent = to_child(&m.client_line(1, &line.to_string(), now));
         // legacy: the hub's own meta replaces the client's value
         assert_eq!(sent[0]["params"]["_meta"][MODERN_META], "2026-07-28", "{v}");
+        // discover is modern only: a legacy version is one the hub does not serve there
         let line = json!({"jsonrpc":"2.0","id":2,"method":"server/discover","params":{"_meta":{MODERN_META: v}}});
         let out = m.client_line(1, &line.to_string(), now);
-        assert_eq!(to_client(&out, 1)[0]["error"]["code"], -32601, "{v}");
+        let e = &to_client(&out, 1)[0]["error"];
+        assert_eq!(e["code"], -32022, "{v}");
+        assert_eq!(e["data"]["requested"], v);
     }
     let out = m.client_line(1, &modern_line(3, "server/discover", json!({})), now);
     assert!(to_client(&out, 1)[0].get("result").is_some());
@@ -2192,6 +2195,13 @@ fn a_malformed_modern_request_is_invalid_params_not_legacy() {
     let now = Instant::now();
     let mut m = stateless_two(now);
     let caps = "io.modelcontextprotocol/clientCapabilities";
+    // `server/discover` exists only in the modern revision: even an empty `_meta` makes it one
+    for meta in [json!({}), json!(null)] {
+        let line =
+            json!({"jsonrpc":"2.0","id":8,"method":"server/discover","params":{"_meta":meta}});
+        let out = m.client_line(1, &line.to_string(), now);
+        assert_eq!(to_client(&out, 1)[0]["error"]["code"], -32602, "{meta}");
+    }
     for meta in [
         json!({caps: {}}),
         json!({MODERN_META: null, caps: {}}),
