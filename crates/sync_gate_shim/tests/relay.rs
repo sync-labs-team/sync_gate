@@ -81,6 +81,9 @@ fn child_entry() {
     if let Ok(ms) = std::env::var("SYNC_GATE_TEST_START_DELAY_MS") {
         std::thread::sleep(Duration::from_millis(ms.parse().unwrap()));
     }
+    // `SYNC_GATE_TEST_NEED_INIT`: a strict server that refuses every request before `initialize`.
+    let strict = std::env::var_os("SYNC_GATE_TEST_NEED_INIT").is_some();
+    let mut initialized = false;
     for line in std::io::stdin().lock().lines() {
         let line = line.unwrap();
         if let Ok(file) = std::env::var("SYNC_GATE_TEST_LINES") {
@@ -96,7 +99,12 @@ fn child_entry() {
         };
         let method = v["method"].as_str().unwrap_or_default().to_string();
         writeln!(log, "{method}").unwrap();
-        if v.get("id").is_some() {
+        initialized |= method == "initialize";
+        if v.get("id").is_some() && strict && !initialized {
+            let reply = json!({"jsonrpc":"2.0","id":v["id"],"error":{"code":-32002,"message":"not initialized"}});
+            println!("{reply}");
+            std::io::stdout().flush().unwrap();
+        } else if v.get("id").is_some() {
             if method == "initialize" && std::env::var_os("SYNC_GATE_TEST_ROOTS").is_some() {
                 println!(
                     "{}",
@@ -1517,25 +1525,49 @@ fn large_client_response_is_not_tracked_as_a_request() {
     hub.shutdown();
 }
 
-#[test]
-fn oversized_initialize_is_not_replayed_and_is_noted_once() {
-    let (name, file) = (tmp_name("big-init"), methods_file("big-init"));
+/// A strict direct server (refuses every request before `initialize`) behind a hub that drops
+/// the connection at id 5, with a first `initialize` of `padding` bytes.
+fn strict_fallback(tag: &str, padding: usize) -> (Session, std::path::PathBuf, impl FnOnce()) {
+    let (name, file) = (tmp_name(tag), methods_file(tag));
     let (hub, _) = test_hub(&name, HubReply::Ok, true);
-    let mut s = Session::start(config(McpMode::Shared, 0, &file), &name, "docs");
-    s.send(json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"padding":"x".repeat(2 << 20)}}));
+    let mut cfg = config(McpMode::Shared, 0, &file);
+    cfg.mcp
+        .get_mut("docs")
+        .unwrap()
+        .env
+        .insert("SYNC_GATE_TEST_NEED_INIT".into(), "1".into());
+    let s = Session::start(cfg, &name, "docs");
+    s.send(json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"padding":"x".repeat(padding)}}));
     s.out.reply(0);
     s.send(request(5, "tools/call"));
+    (s, file, move || hub.shutdown())
+}
+
+#[test]
+fn a_large_initialize_is_replayed_to_the_direct_server() {
+    let (mut s, file, stop) = strict_fallback("mid-init", 3 << 19); // 1.5 MiB
     wait_for("fallback never started", || {
         s.err.text().contains("hub connection lost")
     });
     s.send(request(6, "tools/list"));
-    s.out.reply(6);
+    let reply = s.out.reply(6);
+    assert_eq!(reply["result"], json!({"echo":"tools/list"}), "{reply}");
     assert_eq!(s.finish(), 0);
-    assert_eq!(methods(&file), ["tools/list"], "nothing was replayed");
-    let note = "sync_gate_mcp: initialize too large to replay; the direct server starts without it";
-    assert_eq!(s.err.text().matches(note).count(), 1, "{}", s.err.text());
+    assert_eq!(methods(&file)[0], "initialize", "{:?}", methods(&file));
     assert_eq!(s.out.json().iter().filter(|v| v["id"] == 5).count(), 1);
-    hub.shutdown();
+    stop();
+}
+
+#[test]
+fn an_initialize_over_the_limit_ends_the_session_with_an_error() {
+    let (s, file, stop) = strict_fallback("big-init", 9 << 20);
+    let code = s.done.recv_timeout(BOUND).expect("session did not end");
+    assert_ne!(code, 0);
+    let text = s.err.text();
+    assert!(text.contains("initialize too large to replay"), "{text}");
+    assert!(methods(&file).is_empty(), "a direct server ran without initialize");
+    assert_eq!(s.out.json().iter().filter(|v| v["id"] == 5).count(), 1);
+    stop();
 }
 
 // ---- Task 11: the relay runs the adopted server when the config cannot ----
