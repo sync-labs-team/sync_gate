@@ -1727,8 +1727,8 @@ fn x13a_elevated_reads_its_own_config() {
         r
     };
     // From `create` on, every way out (a failed create, a panic, one inside `create` included)
-    // removes what this round made: `clean` touches only a file with this round's marker and the
-    // folders it listed. The normal way checks it below.
+    // tries to remove what this round made and prints what it got: `clean` touches only a file
+    // with this round's marker and the folders it listed. The normal way checks it below.
     struct Clean<F: Fn() -> Res>(F, bool);
     impl<F: Fn() -> Res> Drop for Clean<F> {
         fn drop(&mut self) {
