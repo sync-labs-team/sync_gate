@@ -194,15 +194,19 @@ pub fn stop_own(
 /// time + exe path are terminated (their stdin pipe died with the old daemon); one that is gone
 /// or is another process (start time or exe differs) is forgotten. The row is kept, for the
 /// next start, when something could not be read (the exe, the identity; `terminate` checks the
-/// identity again) or the stop failed. No row is started after `LEFTOVER_DEADLINE`: the rest
+/// identity again) or the stop failed. No row is begun after `LEFTOVER_DEADLINE`: the rest
 /// stay for the next start. Returns how many were terminated.
 pub fn reap_leftovers(l: &dyn Launcher, reg: &mut Registry) -> usize {
     reap_leftovers_until(l, reg, Instant::now() + LEFTOVER_DEADLINE)
 }
 
-/// How long the daemon start keeps stopping leftovers. One stop already begun may still add
-/// its two terminate rounds (about 4 s).
-const LEFTOVER_DEADLINE: Duration = Duration::from_secs(10);
+/// Each of `OsLauncher::terminate`'s two rounds waits up to this long for the process to go.
+const KILL_WAIT_SECS: u64 = 2;
+
+/// The daemon start spends at most about 10 s stopping leftovers: no stop begins later than
+/// 10 s minus the longest one (two terminate rounds), so one begun at the deadline still ends
+/// by then, give or take the OS queries.
+const LEFTOVER_DEADLINE: Duration = Duration::from_secs(10 - 2 * KILL_WAIT_SECS);
 
 fn reap_leftovers_until(l: &dyn Launcher, reg: &mut Registry, deadline: Instant) -> usize {
     let mut stopped = 0;
@@ -476,11 +480,11 @@ impl Launcher for OsLauncher {
             return Ok(());
         }
         self.kill_once(pid, start_time, false)?;
-        if wait_gone(Duration::from_secs(2)) {
+        if wait_gone(Duration::from_secs(KILL_WAIT_SECS)) {
             return Ok(());
         }
         self.kill_once(pid, start_time, true)?;
-        if wait_gone(Duration::from_secs(2)) {
+        if wait_gone(Duration::from_secs(KILL_WAIT_SECS)) {
             Ok(())
         } else {
             Err(io::Error::other(format!(

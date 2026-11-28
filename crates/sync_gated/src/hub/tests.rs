@@ -2252,7 +2252,10 @@ fn a_restart_note_names_the_exit_code() {
     l.exit_codes.lock().unwrap().insert(100, 3);
     l.kill(&mut child);
     wait_until("the crash to be seen", || docs(&hub).instances == 0);
-    wait_until("stop_own", || l.calls().contains(&"reap 100".to_string()));
+    // `reap` returns before the hub records the code: wait for the record itself.
+    wait_until("the exit code to be recorded", || {
+        unit_exits(&hub).contains(&Some((1, Some(3))))
+    });
     hub.tick(Instant::now() + Duration::from_secs(2));
     assert_eq!(l.spawns(), 2);
     // No code known for the second child.
@@ -2382,4 +2385,64 @@ fn a_child_spawned_while_the_hub_stops_is_stopped() {
     });
     assert!(fake.calls().contains(&"terminate 100".to_string()));
     assert!(!fake.is_alive_quiet(100));
+}
+
+/// `exit` of every unit of every instance.
+fn unit_exits(hub: &Hub) -> Vec<Option<(u64, Option<i32>)>> {
+    let map = lock(&hub.inner.map);
+    map.instances
+        .values()
+        .flat_map(|i| lock(&i.st).units.iter().map(|u| u.exit).collect::<Vec<_>>())
+        .collect()
+}
+
+/// A later failure of the same unit (a start that failed) is not that exit: its restart note
+/// must not carry the older child's code.
+#[test]
+fn a_new_crash_forgets_an_older_exit_code() {
+    let l = Arc::new(FakeLauncher::default());
+    let hub = hub(&l);
+    let c = connect(&hub, hello("docs", &[], "/r"));
+    assert_eq!(c.reply(), HubReply::Ok);
+    let mut child = l.take_child();
+    child.handshake();
+    let inst = lock(&hub.inner.map)
+        .instances
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    {
+        let mut g = lock(&inst.st);
+        // An older child exited with 3; then this unit failed again before any restart.
+        g.units[0].exit = Some((0, Some(3)));
+        hub.inner
+            .crashed("docs", &mut g, 0, Instant::now(), "start failed");
+        assert_eq!(g.units[0].exit, None);
+    }
+    hub.shutdown();
+}
+
+#[test]
+fn a_stopper_thread_that_cannot_start_is_noted() {
+    let l = Arc::new(FakeLauncher::default());
+    let hub = hub(&l);
+    let mut c = connect(&hub, hello("docs", &[], "/r"));
+    assert_eq!(c.reply(), HubReply::Ok);
+    let _child = l.take_child();
+    c.hang_up();
+    wait_until("the client to leave", || docs(&hub).clients == 0);
+    // The idle stop runs on this (the ticking) thread: its stopper thread fails to start.
+    fail_next_threads(1);
+    hub.tick(Instant::now() + Duration::from_secs(11));
+    fail_next_threads(0);
+    // Stopped anyway, inline, and said.
+    assert!(l.calls().contains(&"reap 100".to_string()));
+    let notes = hub.take_notes();
+    assert_eq!(
+        count_notes(&notes, "mcp docs: cannot start a stopper thread"),
+        1,
+        "{notes:?}"
+    );
+    hub.shutdown();
 }
