@@ -75,7 +75,10 @@ enum Phase {
     Stateless,
     /// Child answered the probe but speaks no version the hub supports.
     Unsupported,
-    Failed,
+    /// `rejected`: the child answered `initialize` with an error (else it never answered).
+    Failed {
+        rejected: bool,
+    },
 }
 
 struct Queued {
@@ -166,7 +169,12 @@ impl Mux {
     /// True when the child is alive but unusable (initialize failed or timed out):
     /// restarting it may help, so the host should restart it.
     pub fn failed(&self) -> bool {
-        matches!(self.phase, Phase::Failed)
+        matches!(self.phase, Phase::Failed { .. })
+    }
+    /// True when the child answered `initialize` with an error: it would likely refuse the
+    /// next one too, so the host may let the sessions run the server themselves.
+    pub fn rejected(&self) -> bool {
+        matches!(self.phase, Phase::Failed { rejected: true })
     }
     /// True when the child speaks no protocol version the hub supports: restarting
     /// will not help, so the host should stop the child and leave the server
@@ -320,8 +328,8 @@ impl Mux {
         self.fail_queued(-32000, NO_VERSION, out);
     }
 
-    fn set_failed(&mut self, why: &str, out: &mut Vec<Out>) {
-        self.phase = Phase::Failed;
+    fn set_failed(&mut self, why: &str, rejected: bool, out: &mut Vec<Out>) {
+        self.phase = Phase::Failed { rejected };
         out.push(Out::Note(format!("{}: {why}", self.server)));
         self.fail_queued(-32000, "mcp server failed to initialize", out);
     }
@@ -403,7 +411,7 @@ impl Mux {
                 self.start_initialize(now, &mut out)
             }
             Phase::Initializing { deadline, .. } if now >= deadline => {
-                self.set_failed("child did not answer initialize in time", &mut out);
+                self.set_failed("child did not answer initialize in time", false, &mut out);
             }
             _ => {}
         }
@@ -606,7 +614,7 @@ impl Mux {
         match self.phase {
             Phase::Ready | Phase::Stateless => self.serve(c, rid, method, v, deadline, out),
             Phase::Unsupported => push_client(out, c, error_response(&rid, -32000, NO_VERSION)),
-            Phase::Failed => push_client(
+            Phase::Failed { .. } => push_client(
                 out,
                 c,
                 error_response(&rid, -32000, "mcp server failed to initialize"),
@@ -955,7 +963,7 @@ impl Mux {
                     let result = r.take();
                     self.set_ready(result, now, out);
                 }
-                _ => self.set_failed("child rejected initialize", out),
+                _ => self.set_failed("child rejected initialize", true, out),
             },
             _ => {
                 // Unknown ids (cancelled, detached, timed out) are dropped silently.

@@ -902,35 +902,37 @@ fn a_server_with_no_supported_version_falls_back_end_to_end() {
     assert_eq!(r.close(), 0);
 }
 
-/// The hub's server (a legacy one) receives the hub's `initialize` and rejects it. The hub does
-/// not let go of the key for that: it answers the session's `initialize` with an error and
-/// restarts the server through its backoff (only a crash loop or an unsupported version make the
-/// relay run it directly).
+/// The hub's server (a legacy one) receives the hub's `initialize` and rejects it. The hub lets
+/// go of the key without answering the session, and the relay runs its own copy, which answers.
 #[test]
-fn a_server_that_rejects_initialize_answers_the_session_with_an_error() {
+fn a_server_that_rejects_initialize_falls_back_end_to_end() {
     let sb = shared("mcp-reject-init-first");
     let mut r = sb.relay("docs", &[]);
-    r.send(initialize());
-    let e = r.reply(0);
+    r.open();
+    let pid = r.call(1)["pid"].as_u64().unwrap();
+    let pids = sb.pids("docs");
     assert_eq!(
-        e["error"]["message"], "mcp server failed to initialize",
-        "{e}"
+        pids.len(),
+        2,
+        "the hub's server and the relay's own: {pids:?}"
     );
-    let first = sb.pids("docs")[0];
-    assert_eq!(
-        sb.inits_of("docs", first),
-        1,
-        "the hub's server never received the initialize it rejected"
-    );
+    assert_eq!(pid, pids[1], "the session was not served by its own server");
+    // The cause is the rejection: the hub's server got (and refused) one initialize.
+    assert_eq!(sb.inits_of("docs", pids[0]), 1);
+    assert_eq!(sb.inits_of("docs", pids[1]), 1);
     assert!(
         sb.status()
             .decisions
             .iter()
-            .any(|d| d.contains("child rejected initialize")),
+            .any(|d| d.contains("unavailable through the hub (initialize rejected)")),
         "{:?}",
         sb.status().decisions
     );
-    assert!(!r.stderr().contains("directly"), "{}", r.stderr());
+    assert!(
+        r.stderr().contains("running 'docs' directly"),
+        "{}",
+        r.stderr()
+    );
     assert_eq!(r.close(), 0);
 }
 

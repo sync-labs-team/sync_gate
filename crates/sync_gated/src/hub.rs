@@ -9,12 +9,13 @@
 //! Every client of the key is a client of every unit's mux.
 //!
 //! Fail open (ruling P22): a key is UNAVAILABLE THROUGH THE HUB while its first unit could not
-//! be spawned or is in its crash-loop pause (both end with the pause), or came up unsupported
-//! (for the daemon's life). Becoming unavailable closes every client of the key at once without
-//! answering any of their requests, and a hello for the key is refused meanwhile: the relay
-//! then runs the server directly (the hub runs it with the daemon's PATH, environment and
-//! directory, where it may fail while the session's own copy would work). Extra units never
-//! make a key unavailable.
+//! be spawned, rejected the hub's `initialize` or is in its crash-loop pause (all three end with
+//! the pause), or came up unsupported (until `UNSUPPORTED_RETRY`). Becoming unavailable closes
+//! every client of the key at once without answering any of their requests, and a hello for the
+//! key is refused meanwhile: the relay then runs the server directly (the hub runs it with the
+//! daemon's PATH, environment and directory, where it may fail while the session's own copy
+//! would work). Extra units never make a key unavailable; a subscriber whose extra unit is down
+//! is served by a ready unit meanwhile.
 //!
 //! Servers added later: a hello for a name the hub does not know rereads the config's `[mcp]`
 //! (at most once every `RELOAD_EVERY`) and adds the names it does not have yet; a server it
@@ -84,6 +85,8 @@ const STOP_SLACK: Duration = Duration::from_secs(5);
 pub(crate) const CRASH_WINDOW: Duration = Duration::from_secs(60);
 pub(crate) const CRASH_LIMIT: usize = 5;
 pub(crate) const CRASH_PAUSE: Duration = Duration::from_secs(300);
+/// An unsupported unit is probed again after this long (the server may have been updated).
+pub(crate) const UNSUPPORTED_RETRY: Duration = Duration::from_secs(600);
 /// Uptime after which the restart backoff starts over.
 const STABLE_UPTIME: Duration = Duration::from_secs(60);
 /// Notes kept until the daemon tick moves them to the decision log.
@@ -178,8 +181,10 @@ enum Child {
         until: Instant,
         crash_loop: bool,
     },
-    /// Speaks no supported protocol version: stopped and never restarted by this instance.
-    Unsupported,
+    /// Speaks no supported protocol version: stopped, and not started again before `until`.
+    Unsupported {
+        until: Instant,
+    },
 }
 
 struct Run {
@@ -769,14 +774,23 @@ impl Hub {
                         .map(|r| (server.clone(), r)),
                 );
                 let has_clients = !g.clients.is_empty();
-                for u in &mut g.units {
+                for i in 0..g.units.len() {
+                    let u = &mut g.units[i];
                     let due = match &u.child {
                         Child::Running(r) => {
                             now.saturating_duration_since(r.started) >= STABLE_UPTIME
                         }
-                        Child::Waiting { until, .. } => now >= *until,
+                        Child::Waiting { until, .. } | Child::Unsupported { until } => {
+                            now >= *until
+                        }
                         _ => false,
                     };
+                    if due && matches!(u.child, Child::Unsupported { .. }) {
+                        // The verdict expires: the next start probes the server again.
+                        let outs = u.mux.child_exited();
+                        inner.dispatch(server, g, i, outs, now);
+                    }
+                    let u = &mut g.units[i];
                     if due {
                         if matches!(u.child, Child::Running(_)) {
                             u.backoff.reset();
@@ -791,14 +805,18 @@ impl Hub {
                 }
                 let idle_for =
                     Duration::from_secs(inner.server(server).map_or(0, |s| s.idle_stop_secs));
-                // A crash-loop pause keeps the crash history: no idle retirement until it ends.
-                // An unsupported first unit keeps the key refused for the daemon's life.
+                // A crash-loop pause keeps the crash history: no idle retirement until it ends,
+                // nor while a crash still counts towards one. An unsupported first unit keeps
+                // the key refused until its retry.
                 let is_idle = g.clients.is_empty()
                     && !unavailable(g)
-                    && !g
-                        .units
-                        .iter()
-                        .any(|u| matches!(u.child, Child::Starting) || crash_looping(&u.child))
+                    && !g.units.iter().any(|u| {
+                        matches!(u.child, Child::Starting)
+                            || crash_looping(&u.child)
+                            || u.crashes
+                                .iter()
+                                .any(|t| now.saturating_duration_since(*t) < CRASH_WINDOW)
+                    })
                     && g.idle_since.is_some_and(|t| now >= t + idle_for);
                 if is_idle {
                     g.retired = true;
@@ -1167,21 +1185,32 @@ impl Inner {
         for i in 0..g.units.len() {
             let u = &mut g.units[i];
             if u.mux.unsupported() {
-                if matches!(u.child, Child::Unsupported) {
+                if matches!(u.child, Child::Unsupported { .. }) {
                     continue;
                 }
-                let old = std::mem::replace(&mut u.child, Child::Unsupported);
+                let until = now + UNSUPPORTED_RETRY;
+                let old = std::mem::replace(&mut u.child, Child::Unsupported { until });
                 self.note(format!(
-                    "mcp {server}: no supported protocol version; not restarting"
+                    "mcp {server}: no supported protocol version; not restarting for 10 min"
                 ));
                 stops.extend(running(old));
                 if i == 0 {
                     self.fall_back(server, g, "unsupported protocol version", now);
                 }
             } else if u.mux.failed() && matches!(u.child, Child::Running(_)) {
+                let rejected = u.mux.rejected();
                 let old = std::mem::replace(&mut u.child, Child::Stopped);
                 let outs = u.mux.child_exited();
-                self.crashed(server, g, i, now, "initialize failed");
+                if i == 0 && rejected {
+                    // It would refuse the next `initialize` too: the sessions run it directly
+                    // (with their own environment) until the pause ends, never a restart loop.
+                    u.restarting = None;
+                    u.exit = None;
+                    pause(u, now);
+                    self.fall_back(server, g, "initialize rejected", now);
+                } else {
+                    self.crashed(server, g, i, now, "initialize failed");
+                }
                 // After a fall-back the clients are gone: nobody is answered.
                 self.dispatch(server, g, i, outs, now);
                 stops.extend(running(old));
@@ -1827,12 +1856,6 @@ fn unit_of(g: &Inst, generation: u64) -> Option<usize> {
 fn target(g: &Inst, c: ClientId, max_in_flight: u32) -> Option<usize> {
     let room = |u: &Unit| u.mux.ready() && load(u) < max_in_flight;
     let single = g.units.len() == 1;
-    // A subscriber stays on the unit that holds its subscription.
-    if let Some(p) = g.units.iter().position(|u| u.mux.holds_subscriptions(c)) {
-        let u = &g.units[p];
-        let fallback = !u.mux.ready() && (single || crash_looping(&u.child));
-        return (room(u) || fallback).then_some(p);
-    }
     let loads: Vec<u32> = g
         .units
         .iter()
@@ -1844,6 +1867,18 @@ fn target(g: &Inst, c: ClientId, max_in_flight: u32) -> Option<usize> {
             }
         })
         .collect();
+    // A subscriber stays on the unit that holds its subscription while that one is ready.
+    // While it is down (backoff, restart, pause) a ready unit serves it, or it waits for one;
+    // only with none ready does a paused unit answer "keeps crashing".
+    if let Some(p) = g.units.iter().position(|u| u.mux.holds_subscriptions(c)) {
+        let u = &g.units[p];
+        if u.mux.ready() {
+            return room(u).then_some(p);
+        }
+        let none_ready = !g.units.iter().any(|u| u.mux.ready());
+        return pick_instance(&loads, max_in_flight)
+            .or_else(|| (single || (none_ready && crash_looping(&u.child))).then_some(p));
+    }
     // Nothing ready with one unit: it queues in its mux as before pools. (Every unit dead
     // means the first one is, and then the key has no clients: see `fall_back`.)
     pick_instance(&loads, max_in_flight)
@@ -1854,7 +1889,7 @@ fn target(g: &Inst, c: ClientId, max_in_flight: u32) -> Option<usize> {
 /// unit would not serve them) and that unit never counts as idle. Neither does a unit in its
 /// crash-loop pause or one that came up unsupported: shrinking them would drop the Task 5 state
 /// that stops respawning, and the pool would grow a fresh copy at once. With 0 in flight they
-/// also block growth (`wants_to_grow` needs every unit full); unsupported, for good.
+/// also block growth (`wants_to_grow` needs every unit full); unsupported, until its retry.
 fn stats(g: &Inst, now: Instant) -> PoolStats {
     let pinned = |c: ClientId| g.units.iter().any(|u| u.mux.holds_subscriptions(c));
     let free: Vec<&Waiting> = g.queue.iter().filter(|w| !pinned(w.client)).collect();
@@ -1870,7 +1905,7 @@ fn stats(g: &Inst, now: Instant) -> PoolStats {
             .iter()
             .map(|u| {
                 let holds = g.clients.keys().any(|c| u.mux.holds_subscriptions(*c));
-                let kept = crash_looping(&u.child) || matches!(u.child, Child::Unsupported);
+                let kept = crash_looping(&u.child) || matches!(u.child, Child::Unsupported { .. });
                 match u.quiet_since {
                     Some(t) if !holds && !kept => now.saturating_duration_since(t),
                     _ => Duration::ZERO,
@@ -1897,11 +1932,11 @@ fn unmeasured(g: &Inst) -> u64 {
 }
 
 /// True while the key cannot run through the hub: its first unit is in its crash-loop pause
-/// (also after a spawn error) or came up unsupported.
+/// (also after a spawn error or a rejected `initialize`) or came up unsupported.
 fn unavailable(g: &Inst) -> bool {
     g.units
         .first()
-        .is_some_and(|u| crash_looping(&u.child) || matches!(u.child, Child::Unsupported))
+        .is_some_and(|u| crash_looping(&u.child) || matches!(u.child, Child::Unsupported { .. }))
 }
 
 /// The crash-loop pause: no restart until it ends.
