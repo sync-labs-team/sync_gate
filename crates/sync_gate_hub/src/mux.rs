@@ -721,8 +721,10 @@ impl Mux {
         let legacy = version
             .and_then(Value::as_str)
             .is_some_and(|ver| LEGACY_VERSIONS.contains(&ver));
-        // Per-request protocol fields make a request modern, even a malformed one.
-        let modern = !legacy && (version.is_some() || field(META_CAPS).is_some());
+        // Per-request protocol fields make a request modern, even a malformed one; on a stateless
+        // child `server/discover` is modern whatever it carries (legacy revisions have none).
+        let modern = (stateless && method == "server/discover")
+            || (!legacy && (version.is_some() || field(META_CAPS).is_some()));
         // A stateless child is served in the one modern version the hub speaks, and only to a
         // request that carries every required `_meta` field (basic/index, "_meta").
         if stateless && modern {
