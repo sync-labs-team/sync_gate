@@ -1789,6 +1789,8 @@ fn x13a_elevated_reads_its_own_config() {
 
 /// X13m, `mxc`: a config in the folder the sandbox can write is refused (the folder or the file,
 /// either step) and the queue works with the defaults. Documents the restriction; not a positive.
+/// No `--max-wait`: with one the config is never read. Proof by effect: the file says 0, the wait
+/// is the default 90 s.
 #[test]
 #[ignore]
 fn x13m_mxc_refuses_a_config_it_can_change() {
@@ -1799,24 +1801,22 @@ fn x13m_mxc_refuses_a_config_it_can_change() {
     let job = c.owner_job();
     let cfg = c.tmp.join("config.toml");
     std::fs::write(&cfg, "max_wait_secs = 0\n").unwrap();
-    let mut cmd = c.sbx_fg(&[
-        "run",
-        "--max-wait",
-        "0",
-        "--",
-        "cmd",
-        "/d",
-        "/c",
-        "echo",
-        "late",
-    ]);
-    cmd.env("SYNC_GATE_CONFIG", &cfg);
-    let r = run(cmd);
+    // The premise: the sandbox can change the file.
+    let w = run(c.sbx(&["cmd", "/d", "/c", &format!("echo # mxc>>{}", cfg.display())]));
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    println!("X13m sandbox append exit={} file={text:?}", w.code);
+    assert!(w.code == 0 && text.contains("# mxc"), "{}", w.err);
+    let (r, secs) = guest_run_timed(&c, Some(&cfg));
     job.release();
     d.shutdown();
-    println!("X13m exit={} stderr={:?}", r.code, r.err.trim());
+    println!(
+        "X13m exit={} after {secs:.1} s stderr={:?}",
+        r.code,
+        r.err.trim()
+    );
     assert!(r.err.contains("ignoring the config"), "{}", r.err);
     assert_eq!(r.code, 75, "{}", r.err);
     assert!(r.err.contains(RERUN_LINE), "{}", r.err);
+    assert!(secs >= 80.0, "the file's 0 s was used: {secs:.1} s");
     c.end();
 }
