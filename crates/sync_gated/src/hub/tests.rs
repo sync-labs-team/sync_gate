@@ -2298,3 +2298,88 @@ fn a_poisoned_hub_lock_is_noted_once() {
     }
     hub.shutdown();
 }
+
+#[test]
+fn stop_grace_secs_is_honored() {
+    let l = Arc::new(FakeLauncher::default());
+    l.ignore_eof.store(true, Ordering::SeqCst);
+    let mut cfg = config();
+    cfg.mcp.get_mut("docs").unwrap().stop_grace_secs = 1;
+    let hub = Hub::new(&cfg, l.clone(), None, None);
+    let c = connect(&hub, hello("docs", &[], "/r"));
+    assert_eq!(c.reply(), HubReply::Ok);
+    let _child = l.take_child();
+    let t0 = Instant::now();
+    hub.shutdown();
+    let took = t0.elapsed();
+    // 1 s of grace, then the (instant) fake terminate; the default would be 5 s.
+    assert!(
+        took >= Duration::from_secs(1) && took < Duration::from_secs(4),
+        "{took:?}"
+    );
+    assert!(l.calls().contains(&"terminate 100".to_string()));
+}
+
+/// A fake launcher whose spawn reports `entered`, then waits for `go`: the hub can be told to
+/// stop while a child is being started.
+struct GatedSpawn {
+    fake: Arc<FakeLauncher>,
+    entered: Mutex<mpsc::Sender<()>>,
+    go: Mutex<mpsc::Receiver<()>>,
+}
+
+impl crate::supervisor::Launcher for GatedSpawn {
+    fn spawn(
+        &self,
+        command: &str,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+        env_remove: &[String],
+        cwd: Option<&Path>,
+    ) -> std::io::Result<crate::supervisor::Spawned> {
+        let _ = lock(&self.entered).send(());
+        let _ = lock(&self.go).recv();
+        self.fake.spawn(command, args, env, env_remove, cwd)
+    }
+    fn is_alive(&self, pid: u32, start_time: u64) -> bool {
+        self.fake.is_alive(pid, start_time)
+    }
+    fn terminate(&self, pid: u32, start_time: u64) -> std::io::Result<()> {
+        self.fake.terminate(pid, start_time)
+    }
+    fn reap(&self, pid: u32) -> Option<i32> {
+        self.fake.reap(pid)
+    }
+}
+
+#[test]
+fn a_child_spawned_while_the_hub_stops_is_stopped() {
+    let fake = Arc::new(FakeLauncher::default());
+    // Only `terminate` ends it: proves the hub stopped it, not its stdin EOF.
+    fake.ignore_eof.store(true, Ordering::SeqCst);
+    let (entered, started) = mpsc::channel();
+    let (go, wait) = mpsc::channel();
+    let l = Arc::new(GatedSpawn {
+        fake: fake.clone(),
+        entered: Mutex::new(entered),
+        go: Mutex::new(wait),
+    });
+    let hub =
+        Arc::new(Hub::new(&config(), l, None, None).with_stop_grace(Duration::from_millis(50)));
+    // `attach` starts the child on the calling thread: not on the test's.
+    let attaching = {
+        let hub = hub.clone();
+        std::thread::spawn(move || connect(&hub, hello("docs", &[], "/r")))
+    };
+    started
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the spawn to begin");
+    hub.shutdown();
+    go.send(()).unwrap();
+    let _c = attaching.join().unwrap();
+    wait_until("the late child to be stopped", || {
+        fake.calls().contains(&"reap 100".to_string())
+    });
+    assert!(fake.calls().contains(&"terminate 100".to_string()));
+    assert!(!fake.is_alive_quiet(100));
+}
