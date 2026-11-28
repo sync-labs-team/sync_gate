@@ -1008,6 +1008,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// F7: `write_atomic` replaces a record while a handle from `open_private_file` reads it
+    /// (Windows: the handle shares deletes, not writes): the handle reads the old bytes whole, the
+    /// next open the new ones.
+    #[test]
+    fn write_atomic_replaces_a_record_that_is_being_read() {
+        use std::io::Read;
+        let dir = rdir("swap");
+        let path = dir.join(PAUSED_FILE);
+        write_atomic(&path, b"old").unwrap();
+        let mut h = sync_gate_core::open_private_file(&path).unwrap();
+        write_atomic(&path, b"new").unwrap();
+        let mut s = String::new();
+        h.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "old");
+        drop(h);
+        let mut s = String::new();
+        sync_gate_core::open_private_file(&path)
+            .unwrap()
+            .read_to_string(&mut s)
+            .unwrap();
+        assert_eq!(s, "new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_live_intent_is_resumed_by_tree_and_a_stale_one_is_dropped() {
         let dir = rdir("intents");
