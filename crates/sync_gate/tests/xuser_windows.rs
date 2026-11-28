@@ -622,11 +622,10 @@ impl Ctx {
             .arg("--")
             .args(argv)
             .env("SYNC_GATE_SOCKET", &self.socket)
-            // In a folder that does not exist: the defaults, with nothing to check.
-            .env(
-                "SYNC_GATE_CONFIG",
-                self.tmp.join("none").join("config.toml"),
-            )
+            // In a folder that does not exist: the defaults, with nothing to check. At the drive
+            // root: under `tmp` the sandbox can change the parent (refused), and under the
+            // profile the sandbox account cannot even open it (`Access is denied`).
+            .env("SYNC_GATE_CONFIG", r"C:\sync_gate-xw-none\config.toml")
             .env("SYNC_GATE_FORCE_HEAVY", "1")
             .env_remove("SYNC_GATE_DATA_DIR")
             .env_remove("SYNC_GATE_JOB")
