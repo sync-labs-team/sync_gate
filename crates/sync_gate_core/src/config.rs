@@ -375,6 +375,8 @@ pub struct McpServer {
     pub max_in_flight: u32,
     pub request_timeout_secs: u64,
     pub idle_stop_secs: u64,
+    /// Time a child gets to exit after its stdin closes, before it is terminated.
+    pub stop_grace_secs: u64,
 }
 
 impl Default for McpServer {
@@ -390,6 +392,7 @@ impl Default for McpServer {
             max_in_flight: 8,
             request_timeout_secs: 300,
             idle_stop_secs: 600,
+            stop_grace_secs: 5,
         }
     }
 }
@@ -425,6 +428,8 @@ fn mcp_error(name: &str, s: &McpServer) -> Option<String> {
         Some("request_timeout_secs must be in 1..=86400")
     } else if s.idle_stop_secs > MAX_WAIT_SECS {
         Some("idle_stop_secs must be <= 86400")
+    } else if !(1..=300).contains(&s.stop_grace_secs) {
+        Some("stop_grace_secs must be in 1..=300")
     } else {
         None
     };
@@ -1137,5 +1142,21 @@ command=\"  \t\""
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn stop_grace_secs_out_of_range_is_refused() {
+        let with = |v: &str| Config::from_toml(&format!("[mcp.a]\ncommand=\"x\"\n{v}"));
+        assert_eq!(with("").unwrap().mcp["a"].stop_grace_secs, 5);
+        for ok in ["stop_grace_secs=1", "stop_grace_secs=300"] {
+            assert!(with(ok).is_ok(), "{ok}");
+        }
+        for bad in ["stop_grace_secs=0", "stop_grace_secs=301"] {
+            let e = with(bad).unwrap_err().to_string();
+            assert!(
+                e.contains("stop_grace_secs must be in 1..=300"),
+                "{bad}: {e}"
+            );
+        }
     }
 }

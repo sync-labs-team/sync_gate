@@ -194,10 +194,26 @@ pub fn stop_own(
 /// time + exe path are terminated (their stdin pipe died with the old daemon); one that is gone
 /// or is another process (start time or exe differs) is forgotten. The row is kept, for the
 /// next start, when something could not be read (the exe, the identity; `terminate` checks the
-/// identity again) or the stop failed. Returns how many were terminated.
+/// identity again) or the stop failed. No row is started after `LEFTOVER_DEADLINE`: the rest
+/// stay for the next start. Returns how many were terminated.
 pub fn reap_leftovers(l: &dyn Launcher, reg: &mut Registry) -> usize {
+    reap_leftovers_until(l, reg, Instant::now() + LEFTOVER_DEADLINE)
+}
+
+/// How long the daemon start keeps stopping leftovers. One stop already begun may still add
+/// its two terminate rounds (about 4 s).
+const LEFTOVER_DEADLINE: Duration = Duration::from_secs(10);
+
+fn reap_leftovers_until(l: &dyn Launcher, reg: &mut Registry, deadline: Instant) -> usize {
     let mut stopped = 0;
-    for (name, pid, start_time, exe) in reg.leftovers() {
+    let rows = reg.leftovers();
+    let total = rows.len();
+    for (n, (name, pid, start_time, exe)) in rows.into_iter().enumerate() {
+        if Instant::now() >= deadline {
+            let kept = total - n;
+            eprintln!("sync_gated: leftover cleanup out of time; {kept} kept for the next start");
+            break;
+        }
         if l.is_alive(pid, start_time) {
             match l.exe_of(pid) {
                 // unreadable is not "another program": neither stopped nor forgotten
@@ -1827,6 +1843,8 @@ mod tests {
         stuck: Vec<u32>,
         /// Pids whose identity cannot be read.
         unreadable: Vec<u32>,
+        /// How long each `terminate` takes.
+        slow: Duration,
     }
     struct FakeStdin(Log, Arc<Mutex<bool>>, bool);
     impl Write for FakeStdin {
@@ -1855,6 +1873,7 @@ mod tests {
                 exes: BTreeMap::new(),
                 stuck: Vec::new(),
                 unreadable: Vec::new(),
+                slow: Duration::ZERO,
             }
         }
         fn stdin(&self) -> Option<Box<dyn Write + Send>> {
@@ -1889,6 +1908,7 @@ mod tests {
         }
         fn terminate(&self, pid: u32, _: u64) -> io::Result<()> {
             self.log.lock().unwrap().push(format!("terminate {pid}"));
+            std::thread::sleep(self.slow);
             if self.stuck.contains(&pid) {
                 return Err(io::Error::other("access denied"));
             }
@@ -4177,5 +4197,34 @@ mod tests {
         assert_eq!(l.reap(u32::MAX - 1), None);
         assert!(!l.children.is_poisoned(), "not recovered");
         assert!(poisonings() > before);
+    }
+
+    /// The start-time cleanup has a total deadline: a row not reached by then is neither
+    /// signalled nor forgotten, it waits on disk for the next start.
+    #[test]
+    fn leftover_reaping_stops_at_its_deadline_and_keeps_the_rest() {
+        let dir = temp_dir("deadline");
+        let path = dir.join("services.json");
+        let mut reg = Registry::load(&path);
+        for (name, pid) in [("a", 10), ("b", 20), ("c", 30)] {
+            reg.record(name, pid, 1, Path::new("/bin/x"));
+        }
+        let mut f = Fake::new(false, false);
+        f.only = vec![10, 20, 30];
+        for pid in [10, 20, 30] {
+            f.exes.insert(pid, "/bin/x".into());
+        }
+        f.slow = Duration::from_millis(300);
+        let deadline = Instant::now() + Duration::from_millis(100);
+        assert_eq!(reap_leftovers_until(&f, &mut reg, deadline), 1);
+        let terminated: Vec<_> = f
+            .calls()
+            .into_iter()
+            .filter(|c| c.starts_with("terminate"))
+            .collect();
+        assert_eq!(terminated, ["terminate 10"]);
+        let kept: Vec<_> = Registry::load(&path).leftovers();
+        assert_eq!(kept.iter().map(|r| r.1).collect::<Vec<_>>(), vec![20, 30]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

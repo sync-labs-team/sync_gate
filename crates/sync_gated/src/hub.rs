@@ -77,7 +77,7 @@ pub const MAX_HELLO_BYTES: usize = 1024 * 1024;
 pub const HELLO_DEADLINE: Duration = Duration::from_secs(5);
 /// Time a refused connection gets to take its (best-effort) reply before the tick closes it.
 pub const REFUSAL_GRACE: Duration = Duration::from_secs(1);
-/// Time a child gets to exit after its stdin closes, before it is terminated.
+/// Stop grace of a server that is no longer configured (a reload only adds names, so never).
 const STOP_GRACE: Duration = Duration::from_secs(5);
 /// `stop_own` may add two 2 s terminate rounds to the grace; shutdown waits that much more.
 const STOP_SLACK: Duration = Duration::from_secs(5);
@@ -272,7 +272,8 @@ struct Inner {
     restarts: Mutex<BTreeMap<String, u32>>,
     stopped: AtomicBool,
     next_generation: AtomicU64,
-    stop_grace: Duration,
+    /// Test override of every server's `stop_grace_secs`.
+    grace_override: Option<Duration>,
     /// `supervisor::poisonings()` when the hub last noted it.
     poisonings_seen: AtomicU64,
     /// Free and reserve bytes from the daemon's last snapshot; `None`: the pool does not grow.
@@ -467,7 +468,7 @@ impl Hub {
                 restarts: Mutex::new(BTreeMap::new()),
                 stopped: AtomicBool::new(false),
                 next_generation: AtomicU64::new(1),
-                stop_grace: STOP_GRACE,
+                grace_override: None,
                 poisonings_seen: AtomicU64::new(poisonings()),
                 memory: Mutex::new(None),
             }),
@@ -478,7 +479,7 @@ impl Hub {
     pub(crate) fn with_stop_grace(mut self, grace: Duration) -> Hub {
         Arc::get_mut(&mut self.inner)
             .expect("set before the hub is shared")
-            .stop_grace = grace;
+            .grace_override = Some(grace);
         self
     }
 
@@ -889,10 +890,11 @@ impl Hub {
     }
 
     /// Clean stop: no new connections are attached, every client connection is closed, and
-    /// each child is stopped with `stop_own` (in parallel). Returns within the stop grace plus
-    /// `STOP_SLACK` whatever the children do.
+    /// each child is stopped with `stop_own` (in parallel). Returns within the longest stop
+    /// grace plus `STOP_SLACK` whatever the children do.
     pub fn shutdown(&self) {
         let runs = self.close_all();
+        let grace = runs.iter().map(|(s, _)| self.inner.stop_grace(s)).max();
         let (tx, rx) = mpsc::channel();
         let mut started = 0;
         for (server, run) in runs {
@@ -909,7 +911,7 @@ impl Hub {
                 started += 1;
             }
         }
-        let deadline = Instant::now() + self.inner.stop_grace + STOP_SLACK;
+        let deadline = Instant::now() + grace.unwrap_or_default() + STOP_SLACK;
         for _ in 0..started {
             let left = deadline.saturating_duration_since(Instant::now());
             if rx.recv_timeout(left).is_err() {
@@ -1043,6 +1045,14 @@ impl Inner {
             notes.pop_front();
         }
         notes.push_back(msg);
+    }
+
+    /// Time `server`'s child gets to exit after its stdin closes, before it is terminated.
+    fn stop_grace(&self, server: &str) -> Duration {
+        self.grace_override.unwrap_or_else(|| {
+            self.server(server)
+                .map_or(STOP_GRACE, |s| Duration::from_secs(s.stop_grace_secs))
+        })
     }
 
     /// The configured server `name`, including those a reload added.
@@ -1346,7 +1356,13 @@ impl Inner {
         } = run;
         // Dropping the queue ends the writer thread, which closes the child's stdin.
         drop(stdin);
-        let code = match stop_own(&*self.launcher, pid, start_time, None, self.stop_grace) {
+        let code = match stop_own(
+            &*self.launcher,
+            pid,
+            start_time,
+            None,
+            self.stop_grace(server),
+        ) {
             Ok(code) => code,
             Err(e) => {
                 self.note(format!("mcp {server}: cannot stop pid {pid}: {e}"));
