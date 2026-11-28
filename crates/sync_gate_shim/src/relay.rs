@@ -12,8 +12,10 @@ use std::time::{Duration, Instant};
 use sync_gate_core::{Kind, McpServer, classify, error_response};
 
 const MAX_PARSED_LINE: usize = 1 << 20;
-/// An `initialize` is stored for replay only when it fits one parsed line.
-const MAX_STORED_INITIALIZE: usize = MAX_PARSED_LINE;
+/// An `initialize` is stored for replay up to this size, kept across pieces. Measured: a real
+/// client sends well under 100 KiB; 8 MiB is the per-client queue limit, so one stored line never
+/// outweighs what the hub already holds for a session.
+const MAX_STORED_INITIALIZE: usize = 8 << 20;
 const MAX_TRACKED: usize = 4096;
 const LOST: &str = "hub connection lost; request not completed";
 const UNAVAILABLE: &str = "hub connection lost; direct server unavailable";
@@ -273,6 +275,8 @@ struct Session<'a> {
     initialize: Option<(String, Vec<u8>)>,
     /// The first `initialize` exceeded [`MAX_STORED_INITIALIZE`] and was not stored.
     initialize_too_large: bool,
+    /// The first `initialize` is still arriving in pieces (id, bytes so far).
+    init_partial: Option<(String, Vec<u8>)>,
     replay: Option<(String, Instant)>,
     /// The replayed `initialize` is still the client's own request: its reply goes to the client.
     replay_is_client: bool,
@@ -352,6 +356,7 @@ pub(crate) fn run(
         flight: HashSet::new(),
         initialize: None,
         initialize_too_large: false,
+        init_partial: None,
         replay: None,
         replay_is_client: false,
         forwarding: false,
@@ -505,6 +510,16 @@ impl Session<'_> {
             self.name
         ));
         self.source = Source::Child;
+        if self.init_partial.take().is_some() {
+            self.initialize_too_large = true; // cut by the hub loss: cannot be replayed
+        }
+        if self.initialize.is_none() && self.initialize_too_large {
+            // A direct server that never saw `initialize` would refuse every request.
+            self.log.line(
+                "sync_gate_mcp: initialize too large to replay; not starting the direct server without it",
+            );
+            return Err(1);
+        }
         self.start_child()?;
         if let Some((id, line)) = self.initialize.clone() {
             // Still unanswered: the replay is the client's own request and its reply is forwarded.
@@ -514,11 +529,6 @@ impl Session<'_> {
                 return Err(1);
             }
         } else {
-            if self.initialize_too_large {
-                self.log.line(
-                    "sync_gate_mcp: initialize too large to replay; the direct server starts without it",
-                );
-            }
             self.errors(LOST);
         }
         Ok(())
@@ -827,13 +837,23 @@ impl Session<'_> {
                     && !self.initialize_too_large
                     && prefix_value(&piece.bytes, "method").is_some_and(|v| v == "initialize")
                 {
-                    // The first piece is at most MAX_STORED_INITIALIZE: a line that does not
-                    // end inside it is too large and is forwarded without being stored.
-                    if piece.end && piece.bytes.len() <= MAX_STORED_INITIALIZE {
+                    if piece.end {
                         self.initialize = Some((id, piece.bytes.clone()));
                     } else {
-                        self.initialize_too_large = true;
+                        self.init_partial = Some((id, piece.bytes.clone()));
                     }
+                }
+            }
+        } else if self.source == Source::Hub
+            && let Some((_, buf)) = self.init_partial.as_mut()
+        {
+            if buf.len() + piece.bytes.len() > MAX_STORED_INITIALIZE {
+                self.init_partial = None;
+                self.initialize_too_large = true;
+            } else {
+                buf.extend_from_slice(&piece.bytes);
+                if piece.end {
+                    self.initialize = self.init_partial.take();
                 }
             }
         }
