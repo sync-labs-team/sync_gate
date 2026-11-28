@@ -409,10 +409,18 @@ impl TestClient {
     }
 }
 
+/// `/x` is absolute on Unix only: on Windows the fixture gets a drive.
+pub fn abs_dir(cwd: &str) -> PathBuf {
+    match cwd.strip_prefix('/') {
+        Some(rest) if cfg!(windows) => PathBuf::from(format!("C:/{rest}")),
+        _ => PathBuf::from(cwd),
+    }
+}
+
 pub fn hello(server: &str, env: &[(&str, &str)], cwd: &str) -> HubHello {
     HubHello {
         server: server.into(),
-        cwd: PathBuf::from(cwd),
+        cwd: abs_dir(cwd),
         env: env
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))

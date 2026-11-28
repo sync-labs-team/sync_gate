@@ -584,9 +584,9 @@ impl Hub {
         if srv.mode == McpMode::PerSession {
             return refuse(w, HubReply::PerSession);
         }
-        // A relay sends `current_dir`, empty when it could not read it; a folder without a root
-        // would be read from the daemon's, so that session runs the server in its own.
-        if srv.inherits_cwd() && !hello.cwd.has_root() {
+        // A relay sends `current_dir`, empty when it could not read it; a folder that is not
+        // absolute would be read from the daemon's, so that session runs the server in its own.
+        if srv.inherits_cwd() && !hello.cwd.is_absolute() {
             inner.note(format!(
                 "mcp {}: the session sent no absolute folder; that session runs it itself",
                 hello.server
@@ -1532,7 +1532,9 @@ impl Inner {
         } else {
             None
         };
-        let Some(v) = parsed else {
+        // A line that is no JSON-RPC 2.0 message has no effect here: the first mux refuses it.
+        let Some(v) = parsed.filter(|v| v.get("jsonrpc").and_then(Value::as_str) == Some("2.0"))
+        else {
             return self.to_unit(server, g, 0, c, line, now);
         };
         match classify(&v) {
