@@ -344,7 +344,7 @@ impl Launcher for FakeLauncher {
         self.alive.lock().unwrap().remove(&pid);
         Ok(())
     }
-    fn reap(&self, pid: u32) -> Option<i32> {
+    fn reap(&self, pid: u32, _start_time: u64) -> Option<i32> {
         self.log.lock().unwrap().push(format!("reap {pid}"));
         self.exit_codes.lock().unwrap().get(&pid).copied()
     }

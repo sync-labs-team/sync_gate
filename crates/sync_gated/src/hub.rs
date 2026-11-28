@@ -1391,7 +1391,7 @@ impl Inner {
             }
         };
         if let Some(reg) = &self.registry {
-            lock(reg).forget(pid);
+            lock(reg).forget(pid, start_time);
         }
         code
     }

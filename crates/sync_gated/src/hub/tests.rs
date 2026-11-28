@@ -2164,8 +2164,8 @@ impl crate::supervisor::Launcher for RemovesBeforeSpawn {
     fn resolve(&self, command: &str, env: &BTreeMap<String, String>) -> Option<PathBuf> {
         self.os.resolve(command, env)
     }
-    fn reap(&self, pid: u32) -> Option<i32> {
-        self.os.reap(pid)
+    fn reap(&self, pid: u32, start_time: u64) -> Option<i32> {
+        self.os.reap(pid, start_time)
     }
 }
 
@@ -2350,8 +2350,8 @@ impl crate::supervisor::Launcher for GatedSpawn {
     fn terminate(&self, pid: u32, start_time: u64) -> std::io::Result<()> {
         self.fake.terminate(pid, start_time)
     }
-    fn reap(&self, pid: u32) -> Option<i32> {
-        self.fake.reap(pid)
+    fn reap(&self, pid: u32, start_time: u64) -> Option<i32> {
+        self.fake.reap(pid, start_time)
     }
 }
 
