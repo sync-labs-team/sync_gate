@@ -161,7 +161,8 @@ fn save_and_sweep(
 
 /// Writes a new ticket file: created exclusively (an existing file with that id, whoever made
 /// it, is never truncated nor replaced: `AlreadyExists`), and removed again when it cannot be
-/// written whole, so a torn ticket is never left behind.
+/// written whole. When that removal fails too, the error names the torn file left behind (`wait`
+/// refuses it as unreadable).
 fn save_in(store: &Option<Store>, id: TicketId, p: &Pending) -> std::io::Result<()> {
     use std::io::Write;
     // In-process store: nothing is written anywhere; the ticket lives and dies with this process.
@@ -179,16 +180,27 @@ fn save_in(store: &Option<Store>, id: TicketId, p: &Pending) -> std::io::Result<
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
     let mut f = opts.open(&path)?;
     let done = if crate::shims::injected("pending-write") {
-        Err(std::io::Error::other("injected failure"))
+        // A torn write: part of the bytes, then a failure.
+        f.write_all(&bytes[..bytes.len() / 2])
+            .and(Err(std::io::Error::other("injected failure")))
     } else {
         f.write_all(&bytes)
     };
     drop(f);
-    if done.is_err() {
-        // This call created it (exclusively), in a folder nobody else can change.
-        let _ = std::fs::remove_file(&path);
+    let Err(e) = done else { return Ok(()) };
+    // This call created it (exclusively), in a folder nobody else can change.
+    let removed = if crate::shims::injected("pending-cleanup") {
+        Err(std::io::Error::other("injected failure"))
+    } else {
+        std::fs::remove_file(&path)
+    };
+    match removed {
+        Ok(()) => Err(e),
+        Err(r) => Err(std::io::Error::new(
+            e.kind(),
+            format!("{e}; {} could not be removed: {r}", path.display()),
+        )),
     }
-    done
 }
 
 /// Where this process is, for the Ctrl+C handler (installed once, at the start of `main`).

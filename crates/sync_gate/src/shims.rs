@@ -779,9 +779,9 @@ fn install_os(dir: &Path, exe: &Path, old: Option<Manifest>) -> io::Result<Insta
 }
 
 /// Removes only what the manifest lists and that is still what sync_gate made; the rest is kept
-/// and named on stderr, an entry that cannot be checked too. Returns (deleted, kept). A file of
-/// ours that could not be deleted keeps the manifest (it is what makes the folder skipped when a
-/// real program is looked up) and makes this an error naming what is left.
+/// and named on stderr. Returns (deleted, kept). A file of ours that could not be deleted, or an
+/// entry that cannot be checked (it may be ours), keeps the manifest (it is what makes the folder
+/// skipped when a real program is looked up) and makes this an error naming what is left.
 pub fn remove(dir: &Path) -> io::Result<(usize, usize)> {
     // The manifest names what gets deleted: trusted only in a folder nobody else can change.
     sync_gate_core::check_private_dir(dir)?;
@@ -795,7 +795,7 @@ pub fn remove(dir: &Path) -> io::Result<(usize, usize)> {
             Ok(None) => {}
             Err(e) => {
                 eprintln!("kept: {name}: cannot check it: {e}");
-                kept += 1;
+                left.push(format!("{name} (cannot check it)"));
             }
             Ok(Some(false)) => {
                 eprintln!("kept: {name}: changed by another program");
@@ -827,7 +827,14 @@ pub fn remove(dir: &Path) -> io::Result<(usize, usize)> {
     }
     #[cfg(unix)]
     for e in &m.files {
-        take(&e.name, &|p| Ok(is_ours(p, e)));
+        take(&e.name, &|p| {
+            // Not a link (`InvalidInput`): not ours. Any other error: cannot check it.
+            let t = match std::fs::read_link(p) {
+                Err(err) if err.kind() == io::ErrorKind::InvalidInput => return Ok(false),
+                r => r?,
+            };
+            Ok(t == Path::new(&e.target) || e.pending.iter().any(|x| t == Path::new(x)))
+        });
     }
     if !left.is_empty() {
         return Err(io::Error::other(format!(

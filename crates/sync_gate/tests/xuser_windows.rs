@@ -1732,12 +1732,37 @@ fn x13a_elevated_reads_its_own_config() {
         c.end();
         return;
     }
+    // From here every way out (a failed create, a panic) removes what this round made; the normal
+    // way checks it below.
+    struct Clean<F: Fn() -> Res>(F, bool);
+    impl<F: Fn() -> Res> Drop for Clean<F> {
+        fn drop(&mut self) {
+            if !self.1 {
+                let r = (self.0)();
+                println!(
+                    "X13a clean on the way out: exit={} {}",
+                    r.code,
+                    r.out.trim()
+                );
+            }
+        }
+    }
+    let mut clean = Clean(|| ps("clean", "0"), false);
+    // Removed (only ours) and checked: exit 0, the file gone, no folder this round made left.
+    let check = |gone: &Res| {
+        assert_eq!(gone.code, 0, "clean: {}{}", gone.out, gone.err);
+        assert_eq!(gone.out.trim().lines().last(), Some("gone"), "{}", gone.out);
+        assert!(!gone.out.contains("left:"), "{}", gone.out);
+    };
     if made.code != 0 {
         // The sandbox may not let its account write its own profile: a fact of the mode.
         println!(
             "skipped: the elevated guest could not create its config: {}",
             made.err
         );
+        clean.1 = true;
+        check(&(clean.0)());
+        drop(clean);
         c.end();
         return;
     }
@@ -1749,12 +1774,9 @@ fn x13a_elevated_reads_its_own_config() {
     let (b, sb) = guest_run_timed(&c, None);
     job.release();
     d.shutdown();
-    let gone = ps("clean", "0");
-    assert!(
-        gone.out.contains("gone"),
-        "the guest config was left: {}",
-        gone.out
-    );
+    clean.1 = true;
+    check(&(clean.0)());
+    drop(clean);
     assert_eq!(rw.code, 0, "{}", rw.err);
     assert_round("elevated", "A", &a, sa);
     assert_round("elevated", "B", &b, sb);

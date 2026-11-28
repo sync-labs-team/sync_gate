@@ -4,7 +4,8 @@
 #                    listed in <List>; the file gets `max_wait_secs = <Value>` and the line `# <Marker>`.
 #   -Action rewrite  only a file that holds `# <Marker>`: `max_wait_secs = <Value>` again.
 #   -Action clean    removes the file only if it holds `# <Marker>`, then the folders listed in <List> (deepest
-#                    first, only when empty). Prints `gone` when the file is absent afterwards.
+#                    first, only when empty). Prints `left: <folder>` for each listed folder still there, then
+#                    `gone` (last line) when the file is absent afterwards.
 param(
   [Parameter(Mandatory)][string]$Action,
   [string]$Value = '0',
@@ -43,6 +44,7 @@ switch ($Action) {
       foreach ($m in $made) {
         if ((Test-Path -LiteralPath $m) -and -not (Get-ChildItem -LiteralPath $m -Force)) { Remove-Item -LiteralPath $m -Force }
       }
+      foreach ($m in $made) { if (Test-Path -LiteralPath $m) { "left: $m" } }
     }
     if (Test-Path -LiteralPath $file) { 'still there' } else { 'gone' }
   }

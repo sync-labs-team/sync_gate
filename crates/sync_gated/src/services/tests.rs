@@ -1354,6 +1354,42 @@ fn unreadable_or_missing_registry_disables_leftover_cleanup() {
     }
 }
 
+/// B4, Windows: a registry another program holds open for writing when it is loaded (an error of
+/// the system, which passes on a retry) fails that try only: it is never set aside as unreadable
+/// nor turns leftover cleanup off for good; once closed, it loads as known.
+#[cfg(windows)]
+#[test]
+fn a_registry_held_open_at_load_is_not_taken_for_corrupt() {
+    let mut fx = Fx::bare("s6h");
+    seed(&fx, "", SERVER);
+    let leases = fx.root().join("leases.json");
+    std::fs::write(&leases, LEASES_KNOWN).unwrap();
+    let held = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&leases)
+        .unwrap();
+    fx.open();
+    fx.tick(1);
+    assert!(!fx.root().join("leases.json.unreadable").exists());
+    assert!(
+        !fx.s()
+            .take_notes()
+            .iter()
+            .any(|n| n.contains("registry was unreadable")),
+        "{}",
+        fx.state()
+    );
+    assert!(fx.state().contains("sharing violation"), "{}", fx.state());
+    drop(held);
+    fx.tick(120);
+    assert!(
+        fx.registry().contains(r#""unknown_before": false"#),
+        "{}",
+        fx.registry()
+    );
+    assert!(!fx.state().starts_with("failed:"), "{}", fx.state());
+}
+
 const LEASES_KNOWN: &str = r#"{"version":1,"unknown_before":false,"leases":[]}"#;
 
 fn tpl_json(version: u32, next_seq: u64, rows: &[String]) -> String {

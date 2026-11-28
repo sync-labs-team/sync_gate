@@ -205,13 +205,15 @@ fn read_text_checked(p: &Path) -> io::Result<String> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not UTF-8"))
 }
 
-/// A registry file (`leases.json`, `templates.json`) read for loading: a refusal by the rules is
-/// the outer error (the service fails with it and the file is kept, never set aside as
-/// unreadable); any other result is the caller's to judge.
-pub(crate) fn read_registry(p: &Path) -> Result<io::Result<Vec<u8>>, String> {
+/// A registry file (`leases.json`, `templates.json`) read for loading: its bytes, or `None` when
+/// absent. Any other error, a refusal by the rules or one of the system (a file in use, a failed
+/// read), fails the load (the service fails with it and retries; the file is kept, never set
+/// aside as unreadable): only bytes that do not parse make a registry unreadable.
+pub(crate) fn read_registry(p: &Path) -> Result<Option<Vec<u8>>, String> {
     match read_checked(p) {
-        Err(e) if is_policy_refusal(&e) => Err(e.to_string()),
-        r => Ok(r),
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -224,7 +226,11 @@ fn read_operational(p: &Path) -> io::Result<String> {
 
 /// Windows: nothing holds `p` open for writing its data. Opened for DELETE only (it takes part in
 /// the sharing check without reading the data, which a full read would make the virus scanner do
-/// for every file of the cluster), sharing reads and deletes but not writes.
+/// for every file of the cluster), sharing reads and deletes but not writes. Contract, pinned by
+/// `check_tree_probe_refuses_what_a_read_refuses`: refuses every handle with write or append
+/// access, as `open_private_file` does; also refuses a handle that does not share deletes (a
+/// sharing violation: retried, never disabling); judges nothing (`check_private_file` did, just
+/// before, in a folder only this user can change).
 #[cfg(windows)]
 fn no_writer(p: &Path) -> io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
