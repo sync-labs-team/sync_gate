@@ -296,15 +296,31 @@ fn spawn_parsing(f: impl FnOnce() + Send + 'static) -> io::Result<()> {
     spawn_with(PARSE_THREAD_STACK, f)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Thread starts that fail on this thread, for tests.
+    static FAIL_THREADS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The next `n` hub threads started from the calling thread fail to start.
+#[cfg(test)]
+pub(crate) fn fail_next_threads(n: u32) {
+    FAIL_THREADS.with(|c| c.set(n));
+}
+
 fn spawn_with(stack: usize, f: impl FnOnce() + Send + 'static) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_THREADS.with(|c| c.replace(c.get().saturating_sub(1)) > 0) {
+        return Err(io::Error::other("no thread (test)"));
+    }
     std::thread::Builder::new()
         .stack_size(stack)
         .spawn(f)
         .map(drop)
 }
 
-/// Runs `f` on a hub thread, or right here when no thread can be started.
-fn spawn_or_inline(f: impl FnOnce() + Send + 'static) {
+/// Runs `f` on a hub thread, or right here when no thread can be started (the error).
+fn spawn_or_inline(f: impl FnOnce() + Send + 'static) -> io::Result<()> {
     let slot = Arc::new(Mutex::new(Some(f)));
     let theirs = slot.clone();
     let started = spawn(move || {
@@ -317,6 +333,7 @@ fn spawn_or_inline(f: impl FnOnce() + Send + 'static) {
     {
         f()
     }
+    started
 }
 
 fn shutting_down() -> HubReply {
@@ -900,15 +917,16 @@ impl Hub {
         for (server, run) in runs {
             let inner = self.inner.clone();
             let tx = tx.clone();
+            let pid = run.pid;
             // A stopper that cannot start leaves the child to its stdin EOF (closed by now)
-            // and its registry row to the next start's `reap_leftovers`.
-            if spawn(move || {
+            // and its registry row to the next start's `reap_leftovers`. No tick drains the
+            // notes any more: the daemon log gets it.
+            match spawn(move || {
                 inner.stop_now(&server, run);
                 let _ = tx.send(());
-            })
-            .is_ok()
-            {
-                started += 1;
+            }) {
+                Ok(()) => started += 1,
+                Err(e) => eprintln!("sync_gated: cannot start a stopper for pid {pid}: {e}"),
             }
         }
         let deadline = Instant::now() + grace.unwrap_or_default() + STOP_SLACK;
@@ -1025,15 +1043,16 @@ impl Inner {
         }
         let theirs = slot.clone();
         // No thread: close at once, which also drops the reply.
-        if spawn(move || {
+        if let Err(e) = spawn(move || {
             let w = lock(&theirs).take();
             if let Some(mut w) = w {
                 write_reply(&mut w, &reply);
                 *lock(&theirs) = Some(w);
             }
-        })
-        .is_err()
-        {
+        }) {
+            self.note(format!(
+                "mcp hub: cannot start a reply thread: {e}; refused connection closed unanswered"
+            ));
             close();
             lock(&slot).take();
         }
@@ -1172,6 +1191,8 @@ impl Inner {
     /// loop (which, for the first unit, makes the key unavailable through the hub).
     fn crashed(&self, server: &str, g: &mut Inst, i: usize, now: Instant, why: &'static str) {
         let u = &mut g.units[i];
+        // An older child's exit code is not this failure's (`child_gone` sets its own after).
+        u.exit = None;
         u.crashes
             .retain(|t| now.saturating_duration_since(*t) < CRASH_WINDOW);
         u.crashes.push_back(now);
@@ -1377,9 +1398,14 @@ impl Inner {
 
     fn stop_later(self: &Arc<Self>, server: String, run: Run) {
         let me = self.clone();
-        spawn_or_inline(move || {
+        let name = server.clone();
+        if let Err(e) = spawn_or_inline(move || {
             me.stop_now(&server, run);
-        });
+        }) {
+            self.note(format!(
+                "mcp {name}: cannot start a stopper thread: {e}; stopped inline"
+            ));
+        }
     }
 
     fn client_reader(
@@ -1741,9 +1767,9 @@ impl Inner {
                 return;
             };
             let old = std::mem::replace(&mut g.units[i].child, Child::Stopped);
-            g.units[i].exit = Some((generation, None));
             let outs = g.units[i].mux.child_exited();
             self.crashed(server, g, i, now, "child exited");
+            g.units[i].exit = Some((generation, None));
             // After a fall-back the clients are gone: nobody is answered.
             self.dispatch(server, g, i, outs, now);
             running(old)

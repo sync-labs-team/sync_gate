@@ -211,8 +211,9 @@ The daemon log: on Windows, `daemon.log` in the install folder; on macOS,
 ## Shared MCP servers
 
 `sync_gate mcp adopt <name>` writes a `[mcp.<name>]` section to `config.toml`. To stop an
-instance, the daemon closes its input, waits `stop_grace_secs` seconds (1 to 300, default 5) for
-it to exit, then ends it. A change to an existing section takes effect when the daemon restarts.
+instance, the daemon closes its input once the messages already queued for it are written, and
+gives it `stop_grace_secs` seconds (1 to 300, default 5) from the start of the stop to exit before
+it ends it. A change to an existing section takes effect when the daemon restarts.
 
 ```toml
 [mcp.docs]
