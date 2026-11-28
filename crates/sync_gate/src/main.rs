@@ -117,15 +117,16 @@ enum McpCmd {
     },
 }
 
-/// `paths --check`: folders by `check_private_dir`, anything else by `check_private_file`.
+/// `paths --check`: folders by `check_private_dir`, anything else by `open_private_file` (which
+/// also refuses a file open for writing right now). An absent path (its name judged first) by
+/// where it would be created. A check at one instant: the caller reads the files by path later.
 fn check_paths(paths: &[PathBuf]) -> i32 {
     let mut refused = 0;
     for p in paths {
         let r = match std::fs::symlink_metadata(p) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Ok(m) if m.is_dir() => sync_gate_core::check_private_dir(p).map(drop),
-            _ => match sync_gate_core::check_private_file(p) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            _ => match sync_gate_core::open_private_file(p).map(drop) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => nearest_folder(p),
                 r => r,
             },
         };
@@ -135,6 +136,19 @@ fn check_paths(paths: &[PathBuf]) -> i32 {
         }
     }
     i32::from(refused > 0)
+}
+
+/// What is created at the absent `p` inherits from the nearest folder above it that exists: that
+/// folder passes `check_private_dir` (inheritable grants included), with its ancestors.
+fn nearest_folder(p: &std::path::Path) -> std::io::Result<()> {
+    let mut up = p.parent();
+    while let Some(d) = up {
+        match std::fs::symlink_metadata(d) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => up = d.parent(),
+            _ => return sync_gate_core::check_private_dir(d).map(drop),
+        }
+    }
+    Ok(())
 }
 
 /// `key=value` lines, values as they are; a value that is missing, not UTF-8 or multi-line fails.

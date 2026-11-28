@@ -260,9 +260,11 @@ them). When a limit cuts a session, its relay runs the server itself, as when th
 - **Windows ARM64** is not part of 0.1.
 - **Files another account can change are refused** (see [`SECURITY.md`](../SECURITY.md)). The
   installer stops with `writable by other users` and `nothing was changed` when its folder,
-  `bin\`, `launcher.cmd`, `install-state.json` or `rollback\` lets another account change them:
-  check those files, delete what others could change (the whole install folder can go), then run
-  the installer again.
+  `bin\`, `launcher.cmd`, `install-state.json` or `rollback\` lets another account change them.
+  A program in `bin\` or `launcher.cmd`: delete it (the installer writes it again).
+  `install-state.json` and `rollback\`: keep them (they record what the installer changed and how
+  to undo an interrupted run); check their content, then remove the other accounts from their
+  permissions. Then run the installer again.
 
 ## TLS on older Windows PowerShell
 

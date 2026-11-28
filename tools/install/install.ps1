@@ -242,24 +242,50 @@ function Get-SyncGatePaths {
 
 # ---------------------------------------------------------------- files the installer trusts (item 6)
 
+function Get-SgTree {
+    # Every entry under $Dir, without going through a link or other reparse point (each is listed, and refused).
+    param([string]$Dir)
+    foreach ($e in @(Get-ChildItem -LiteralPath $Dir -Force)) {
+        $e.FullName
+        if ($e.PSIsContainer -and -not ($e.Attributes -band [IO.FileAttributes]::ReparsePoint)) { Get-SgTree $e.FullName }
+    }
+}
+
+function Invoke-SgJudge {
+    # `paths --check` by $Judge: $true when judged and passed; $false when $Judge predates it and $AllowOld (said so).
+    param([string]$Judge, [string[]]$Paths, [string]$Nothing, [string]$Root, [bool]$AllowOld)
+    $r = Invoke-SgNative -File $Judge -Arguments (@('paths', '--check') + $Paths) -Env @{}
+    if ($r.ExitCode -eq 2 -and $r.Err -match "unexpected argument '--check'") {
+        if (-not $AllowOld) { throw "$Judge cannot check the files sync_gate runs and reads (it predates 0.1.5); $Nothing" }
+        Write-SgLine "note: $Judge is older and cannot check these files; they were not checked"
+        return $false
+    }
+    if ($r.ExitCode -ne 0) {
+        throw ("$(($r.Out + $r.Err).Trim())`n$Nothing. Another account can change what sync_gate runs or reads in $Root. " +
+            'A program in bin\ or launcher.cmd: delete it (the installer writes it again). install-state.json or rollback\: ' +
+            'keep them (they record what the installer changed and how to undo an interrupted run); check their content, ' +
+            'then remove the other accounts from their permissions. A folder: do what the message says. Then run this installer again')
+    }
+    $true
+}
+
 function Assert-SgPrivateFiles {
     # The programs, the launcher the scheduled task runs, the state this script acts on and the rollback copies are
     # judged by the rule sync_gate uses for its own data (`sync_gate paths --check`): folders only you can change,
-    # files nobody else can change. $Judge is the downloaded, checksum-verified binary when there is one.
-    param($Layout, [Parameter(Mandatory)][string]$Judge, [Parameter(Mandatory)][string]$Nothing)
-    $paths = @($Layout.Root, $Layout.Bin, $Layout.Launcher, $Layout.StatePath, $Layout.Rollback)
-    foreach ($n in $script:SgExes) { $paths += Join-Path $Layout.Bin $n }
-    if (Test-Path -LiteralPath $Layout.Rollback) {
-        $paths += @(Get-ChildItem -LiteralPath $Layout.Rollback -Recurse -Force | ForEach-Object { $_.FullName })
-    }
-    $r = Invoke-SgNative -File $Judge -Arguments (@('paths', '--check') + $paths) -Env @{}
-    if ($r.ExitCode -eq 2 -and $r.Err -match "unexpected argument '--check'") {
-        # A version before 0.1.5 (uninstalling it) has no `paths --check`: nothing judged, said so.
-        Write-SgLine "note: $Judge is older and cannot check these files; they were not checked"
-        return
-    }
-    if ($r.ExitCode -ne 0) {
-        throw "$(($r.Out + $r.Err).Trim())`n$Nothing. Another account can change what sync_gate runs or reads there: check those files, delete what others could change (the whole folder $($Layout.Root) can go), then run this installer again"
+    # files nobody else can change, and for an absent one the folder it would be created in. $Root comes from
+    # Get-SgInstallRoot: nothing under it is read before this passes (Get-SyncGateLayout reads the state). $Judge is
+    # the downloaded, checksum-verified binary when there is one. -AllowOld: a $Judge before 0.1.5 (no --check) is
+    # let through with a note; only where no newer one can exist (uninstalling it, installing an older version).
+    # Point in time: the installer then reads these files by path (SECURITY.md, Declared limits).
+    param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Judge, [Parameter(Mandatory)][string]$Nothing, [switch]$AllowOld)
+    $bin = Join-Path $Root 'bin'; $rollback = Join-Path $Root 'rollback'
+    $paths = @($Root, $bin, (Join-Path $Root 'launcher.cmd'), (Join-Path $Root 'install-state.json'), $rollback)
+    foreach ($n in $script:SgExes) { $paths += Join-Path $bin $n }
+    if (-not (Invoke-SgJudge $Judge $paths $Nothing $Root $AllowOld)) { return }
+    # The rollback folder passed: only now is it listed.
+    if (Test-Path -LiteralPath $rollback) {
+        $inner = @(Get-SgTree $rollback)
+        if ($inner.Count) { [void](Invoke-SgJudge $Judge $inner $Nothing $Root $AllowOld) }
     }
 }
 
@@ -1163,13 +1189,15 @@ function Invoke-SgConfigure {
 
 function Invoke-SyncGateInstall {
     param([string]$Version, [switch]$ClearOverrides)
-    $L = Get-SyncGateLayout -ClearOverrides:$ClearOverrides
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ('sync_gate-install-' + [Guid]::NewGuid().ToString('N'))
     try {
         $assets = Get-SyncGateAssets -Version $Version -Dest $tmp
         $staged = Join-Path $assets.Dir 'sync_gate.exe'
-        # Before anything acts on what is there (a rollback to resume included).
-        Assert-SgPrivateFiles -Layout $L -Judge $staged -Nothing 'nothing was changed'
+        # Before anything reads or acts on what is there (the state, a rollback to resume).
+        # Only a version pinned below 0.1.5 (a documented downgrade) may ship a judge without --check.
+        $old = [bool]$Version -and ([version]$Version -lt [version]'0.1.5')
+        Assert-SgPrivateFiles -Root (Get-SgInstallRoot) -Judge $staged -Nothing 'nothing was changed' -AllowOld:$old
+        $L = Get-SyncGateLayout -ClearOverrides:$ClearOverrides
         if (Test-Path -LiteralPath (Join-Path $L.Rollback 'in-progress')) {
             $was = [IO.File]::ReadAllText((Join-Path $L.Rollback 'in-progress')).Trim()
             Write-SgLine "a previous run stopped at $was; restoring it first"
@@ -1229,10 +1257,11 @@ function Invoke-SyncGateInstall {
 }
 
 function Invoke-SyncGateUninstall {
+    # No other binary is at hand: the installed one judges (it runs below anyway), before the state is read.
+    $root = Get-SgInstallRoot
+    $judge = Join-Path $root 'bin\sync_gate.exe'
+    if (Test-Path -LiteralPath $judge) { Assert-SgPrivateFiles -Root $root -Judge $judge -Nothing 'nothing was removed' -AllowOld }
     $L = Get-SyncGateLayout
-    # No other binary is at hand: the installed one judges (it runs below anyway).
-    $judge = Join-Path $L.Bin 'sync_gate.exe'
-    if (Test-Path -LiteralPath $judge) { Assert-SgPrivateFiles -Layout $L -Judge $judge -Nothing 'nothing was removed' }
     if (Test-Path -LiteralPath (Join-Path $L.Rollback 'in-progress')) {
         $was = [IO.File]::ReadAllText((Join-Path $L.Rollback 'in-progress')).Trim()
         Write-SgLine "a previous run stopped at $was; restoring it first"
