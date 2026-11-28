@@ -330,6 +330,29 @@ fn slow_client_is_disconnected_without_stalling_others() {
     hub.shutdown();
 }
 
+/// Review F08 (r5): the hub stops a child and forgets its registry row by the launch id the
+/// launcher gave it (the fake answers only to that id).
+#[test]
+fn a_stopped_child_leaves_no_registry_row() {
+    let dir = std::env::temp_dir().join(format!("sync_gate_hub-row-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let l = Arc::new(FakeLauncher::default());
+    let hub = Hub::new(&config(), l.clone(), Some(&dir), None);
+    let mut c = connect(&hub, hello("docs", &[], "/r"));
+    assert_eq!(c.reply(), HubReply::Ok);
+    let _child = l.take_child();
+    let rows = || crate::store::load_services(&dir.join("services.json")).len();
+    assert_eq!(rows(), 1);
+    c.hang_up();
+    wait_until("the client to leave", || docs(&hub).clients == 0);
+    hub.tick(Instant::now() + Duration::from_secs(11));
+    wait_until("stop_own", || l.calls().contains(&"reap 100".to_string()));
+    wait_until("the row to go", || rows() == 0);
+    hub.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn env_from_secret_never_leaves_memory() {
     const CANARY: &str = "canary-5f3c9e1d-secret";
@@ -2152,11 +2175,11 @@ impl crate::supervisor::Launcher for RemovesBeforeSpawn {
         let _ = std::fs::remove_file(&self.victim);
         self.os.spawn(command, args, env, env_remove, cwd)
     }
-    fn is_alive(&self, pid: u32, start_time: u64) -> bool {
-        self.os.is_alive(pid, start_time)
+    fn is_alive(&self, pid: u32, start_time: u64, launch: u64) -> bool {
+        self.os.is_alive(pid, start_time, launch)
     }
-    fn terminate(&self, pid: u32, start_time: u64) -> std::io::Result<()> {
-        self.os.terminate(pid, start_time)
+    fn terminate(&self, pid: u32, start_time: u64, launch: u64) -> std::io::Result<()> {
+        self.os.terminate(pid, start_time, launch)
     }
     fn exe_of(&self, pid: u32) -> Option<PathBuf> {
         self.os.exe_of(pid)
@@ -2164,8 +2187,8 @@ impl crate::supervisor::Launcher for RemovesBeforeSpawn {
     fn resolve(&self, command: &str, env: &BTreeMap<String, String>) -> Option<PathBuf> {
         self.os.resolve(command, env)
     }
-    fn reap(&self, pid: u32, start_time: u64) -> Option<i32> {
-        self.os.reap(pid, start_time)
+    fn reap(&self, pid: u32, launch: u64) -> Option<i32> {
+        self.os.reap(pid, launch)
     }
 }
 
@@ -2344,14 +2367,14 @@ impl crate::supervisor::Launcher for GatedSpawn {
         let _ = lock(&self.go).recv();
         self.fake.spawn(command, args, env, env_remove, cwd)
     }
-    fn is_alive(&self, pid: u32, start_time: u64) -> bool {
-        self.fake.is_alive(pid, start_time)
+    fn is_alive(&self, pid: u32, start_time: u64, launch: u64) -> bool {
+        self.fake.is_alive(pid, start_time, launch)
     }
-    fn terminate(&self, pid: u32, start_time: u64) -> std::io::Result<()> {
-        self.fake.terminate(pid, start_time)
+    fn terminate(&self, pid: u32, start_time: u64, launch: u64) -> std::io::Result<()> {
+        self.fake.terminate(pid, start_time, launch)
     }
-    fn reap(&self, pid: u32, start_time: u64) -> Option<i32> {
-        self.fake.reap(pid, start_time)
+    fn reap(&self, pid: u32, launch: u64) -> Option<i32> {
+        self.fake.reap(pid, launch)
     }
 }
 

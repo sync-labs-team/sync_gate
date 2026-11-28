@@ -2325,11 +2325,11 @@ impl crate::Launcher for OrderLauncher {
     ) -> io::Result<crate::supervisor::Spawned> {
         Err(io::ErrorKind::Unsupported.into())
     }
-    fn is_alive(&self, _pid: u32, _start_time: u64) -> bool {
+    fn is_alive(&self, _pid: u32, _start_time: u64, _launch: u64) -> bool {
         self.seen.lock().unwrap().push(self.ctl.calls().len());
         false
     }
-    fn terminate(&self, _pid: u32, _start_time: u64) -> io::Result<()> {
+    fn terminate(&self, _pid: u32, _start_time: u64, _launch: u64) -> io::Result<()> {
         Ok(())
     }
 }
@@ -2344,6 +2344,7 @@ fn startup_resumes_frozen_jobs_before_touching_mcp_leftovers() {
         777,
         5,
         Path::new("/fake/mcp-server"),
+        0,
     );
     let ctl = FakeControl::default();
     ctl.starts.lock().unwrap().insert(4242, 111);

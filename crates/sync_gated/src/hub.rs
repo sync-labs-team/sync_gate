@@ -185,6 +185,9 @@ enum Child {
 struct Run {
     pid: u32,
     start_time: u64,
+    /// The launcher's id for this child: stopping it and forgetting its row name it by this,
+    /// never by pid + start time alone (they repeat).
+    launch: u64,
     /// Tags the child's reader thread, so a stale one cannot touch a newer child.
     generation: u64,
     stdin: Queue,
@@ -1285,6 +1288,7 @@ impl Inner {
         let Spawned {
             pid,
             start_time,
+            launch,
             exe,
             stdin,
             stdout,
@@ -1312,13 +1316,14 @@ impl Inner {
             }
         };
         if let Some(reg) = &self.registry {
-            lock(reg).record(server, pid, start_time, &exe);
+            lock(reg).record(server, pid, start_time, &exe, launch);
         }
         let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
         let (q, rx, bytes) = Queue::new(CHILD_QUEUE_MESSAGES, CHILD_QUEUE_BYTES);
         let run = Run {
             pid,
             start_time,
+            launch,
             generation,
             stdin: q,
             started: now,
@@ -1372,6 +1377,7 @@ impl Inner {
         let Run {
             pid,
             start_time,
+            launch,
             stdin,
             ..
         } = run;
@@ -1381,6 +1387,7 @@ impl Inner {
             &*self.launcher,
             pid,
             start_time,
+            launch,
             None,
             self.stop_grace(server),
         ) {
@@ -1391,7 +1398,7 @@ impl Inner {
             }
         };
         if let Some(reg) = &self.registry {
-            lock(reg).forget(pid, start_time);
+            lock(reg).forget(pid, start_time, launch);
         }
         code
     }
