@@ -4474,8 +4474,14 @@ fn restore_strict_exits_1_when_a_real_failure_comes_with_a_leftover() {
 
 #[test]
 fn adopt_writes_cwd_inherit_unless_any_folder() {
+    // `/srv/pinned` is absolute on Unix only: on Windows the fixture gets a drive.
+    let pinned = if cfg!(windows) {
+        "C:/srv/pinned"
+    } else {
+        "/srv/pinned"
+    };
     let codex = format!(
-        "{CODEX_MODEL}\n[mcp_servers.pinned]\ncommand = \"pinned-mcp\"\ncwd = \"/srv/pinned\"\n"
+        "{CODEX_MODEL}\n[mcp_servers.pinned]\ncommand = \"pinned-mcp\"\ncwd = \"{pinned}\"\n"
     );
     let a = Adopt::with(CLAUDE_MODEL, &codex);
     let r = a.run("adopt", &["--agent", "codex", "context7", "pinned"], &[]);
@@ -4488,7 +4494,7 @@ fn adopt_writes_cwd_inherit_unless_any_folder() {
     assert_eq!(r.code, 0, "{r:?}");
     let cfg = Config::from_toml(&Adopt::read(&a.config())).unwrap();
     assert_eq!(cfg.mcp["context7"].cwd.as_deref(), Some("inherit"));
-    assert_eq!(cfg.mcp["pinned"].cwd.as_deref(), Some("/srv/pinned"));
+    assert_eq!(cfg.mcp["pinned"].cwd.as_deref(), Some(pinned));
     assert_eq!(cfg.mcp["markitdown"].cwd, None);
     assert!(is_adopted(&a.codex, "markitdown"));
 }

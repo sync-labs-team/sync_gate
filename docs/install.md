@@ -249,3 +249,8 @@ irm https://gate.synclabs.team/install.ps1 | iex
 ```
 
 Older builds of Windows 10 were not verified.
+
+## Shared MCP servers
+
+- **Breaking for configs:** in `[mcp.<name>]`, `cwd` must be `"inherit"` or an absolute path (on Windows, `/x` is not absolute), and `env`/`env_from` names must be valid variable names. A config with a relative `cwd` no longer loads.
+- A shared server's change notifications go only to sessions that opened with `initialize`. A client on the 2026-07-28 revision gets `subscriptions/listen` acknowledged with no notification types and then closed, and no `notifications/message` logs: it sees changes on its next request.
