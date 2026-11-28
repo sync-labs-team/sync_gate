@@ -469,11 +469,10 @@ fn two_heavy_jobs_queue_instead_of_running_together() {
     let b = Proc::spawn(env.run(&[], &env.ticker("b", 60)));
     wait_for("b queued", 30, || env.status().queued.len() == 1);
     assert_eq!(read_n(&fb), 0, "b must not start while a runs");
-    assert_eq!(
-        env.pending_files().len(),
-        1,
-        "b's ticket is saved while queued"
-    );
+    // The client saves the ticket only after it reads `Queued`, so the daemon can list b first.
+    wait_for("b's ticket saved while queued", 10, || {
+        env.pending_files().len() == 1
+    });
     std::fs::write(env.file("a.stop"), "").unwrap();
     wait_for("b ticking", 20, || read_n(&fb) > 0);
     // Critical 2: once admitted, the resume ticket is gone, so `wait N` cannot run it twice.
