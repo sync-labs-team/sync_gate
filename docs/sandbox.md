@@ -73,6 +73,11 @@ If the account is not listed, the sandboxed `sync_gate` prints
   of the daemon's pipe to a sandboxed process; with the cache, that assumption covers the whole
   command instead of each connection.
 - On the machine this was developed on, the `@restricted` and `@appcontainer` entries are off.
+- A guest reads a `config.toml` only from a folder and file its own account owns that nobody else
+  can change. `unelevated` (`@restricted`) is your own account, so it reads yours. An `elevated`
+  account reads its own config (in its own profile), never yours. `mxc` runs inside an
+  AppContainer: a standard install grants it nothing it could read and that the sandbox could not
+  also change, so it runs with the defaults and prints `ignoring the config`.
 
 ## What sync_gate keeps on disk
 

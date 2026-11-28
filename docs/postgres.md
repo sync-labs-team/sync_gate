@@ -83,6 +83,12 @@ Not guaranteed:
   changes the file system while the daemon runs, is outside the guarantee. Protection against a
   hostile agent needs an operating system boundary per agent (another user, a container or a
   virtual machine); this version does not provide one.
+- Only the cluster's own folder is checked. Before each start every file and folder of the
+  cluster must be yours and not changeable by another account, and nothing may hold a file of it
+  open for writing; otherwise the service does not start and the cluster is left as it is. A
+  configuration that points outside the cluster folder (`include` with another path, `hba_file`,
+  `ident_file`, `ssl_*_file`, `data_directory`, `config_file`) is not supported and not checked;
+  sync_gate never writes one. The programs in `bin_dir` are trusted as any program you installed.
 
 ## `lease_wait_secs`
 
