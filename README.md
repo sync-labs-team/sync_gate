@@ -82,7 +82,7 @@ sync_gate mcp adopt
 - The cost key (program, up to two short words, folder name) appears in `sync_gate status`, so it enters the agent's context and reaches the provider of the agent's model.
 - On Windows, the shortcut does not hide a program that exists only as a `.ps1` when you run `sync_gate shims install`. If one appears later, it exits 127 with an instruction until the next install.
 - Weekly, the daemon checks GitHub for a newer release; `status` shows it. Off: `update_check_days = 0` ([details](docs/install.md#update)).
-- A shared MCP server's change notifications go only to sessions that opened with `initialize`. A client on the 2026-07-28 revision gets `subscriptions/listen` acknowledged with no notification types, and no `notifications/message` logs: it sees changes on its next request.
+- A shared MCP server's change notifications go only to sessions that opened with `initialize`. A client on the 2026-07-28 revision gets `subscriptions/listen` acknowledged with no notification types and then closed, and no `notifications/message` logs: it sees changes on its next request.
 
 <!-- s:docs -->
 ## Documentation

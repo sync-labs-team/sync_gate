@@ -534,7 +534,9 @@ fn invalid_client_lines_get_parse_or_invalid_request_errors() {
     assert_eq!(to_client(&out, 1)[0]["error"]["code"], -32700);
     assert_eq!(to_client(&out, 1)[0]["id"], Value::Null);
     let out = m.client_line(1, r#"[{"id":1,"method":"x"}]"#, now);
-    assert_eq!(to_client(&out, 1)[0]["error"]["code"], -32700);
+    // JSON-RPC 2.0 section 5.1: valid JSON that is no Request object is -32600 (null id).
+    assert_eq!(to_client(&out, 1)[0]["error"]["code"], -32600);
+    assert_eq!(to_client(&out, 1)[0]["id"], Value::Null);
     let out = m.client_line(1, r#"{"jsonrpc":"2.0","id":9,"method":5}"#, now);
     assert_eq!(to_client(&out, 1)[0]["error"]["code"], -32600);
     assert_eq!(to_client(&out, 1)[0]["id"], 9);
@@ -1740,12 +1742,7 @@ fn a_legacy_to_stateless_restart_clears_old_subscriptions() {
 fn only_a_non_legacy_string_version_makes_a_request_modern() {
     let now = Instant::now();
     let mut m = stateless_two(now);
-    for v in [
-        json!(null),
-        json!("2025-11-25"),
-        json!("2024-11-05"),
-        json!(5),
-    ] {
+    for v in [json!("2025-11-25"), json!("2024-11-05")] {
         let line = json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{MODERN_META: v}}});
         let sent = to_child(&m.client_line(1, &line.to_string(), now));
         // legacy: the hub's own meta replaces the client's value
@@ -1863,16 +1860,23 @@ fn synthetic_server_info_falls_back_without_discover_meta() {
 }
 
 #[test]
-fn a_legacy_client_own_capabilities_in_meta_are_replaced() {
+// A request with clientCapabilities but no protocolVersion is a malformed modern one (see
+// `a_malformed_modern_request_is_invalid_params_not_legacy`); the optional clientInfo alone keeps
+// a request legacy, and the hub's own fields replace the client's.
+fn a_legacy_client_own_meta_fields_are_replaced() {
     let now = Instant::now();
     let mut m = stateless_two(now);
     let line = json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{
-        "io.modelcontextprotocol/clientCapabilities":{"sampling":{}},"keep":1}}});
+        "io.modelcontextprotocol/clientInfo":{"name":"c","version":"1"},"keep":1}}});
     let sent = to_child(&m.client_line(1, &line.to_string(), now));
     let meta = &sent[0]["params"]["_meta"];
     assert_eq!(
         meta["io.modelcontextprotocol/clientCapabilities"],
         json!({})
+    );
+    assert_eq!(
+        meta["io.modelcontextprotocol/clientInfo"]["name"],
+        "sync_gate_hub"
     );
     assert_eq!(meta["keep"], 1);
 }
@@ -2130,11 +2134,22 @@ fn subscriptions_listen_is_acknowledged_with_no_notification_types() {
     let out = m.client_line(1, &line.to_string(), now);
     assert!(to_child(&out).is_empty());
     let sent = to_client(&out, 1);
-    assert_eq!(sent.len(), 1, "an acknowledgment and no response");
+    assert_eq!(
+        sent.len(),
+        2,
+        "the acknowledgment, then the end of the stream"
+    );
     assert_eq!(
         sent[0],
         json!({"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged",
             "params":{"_meta":{"io.modelcontextprotocol/subscriptionId":11},"notifications":{}}})
+    );
+    // "Graceful Closure": a server ending a subscription on its own SHOULD answer the listen
+    // request with a completion result carrying the subscription id; nothing stays open.
+    assert_eq!(
+        sent[1],
+        json!({"jsonrpc":"2.0","id":11,"result":{"resultType":"complete",
+            "_meta":{"io.modelcontextprotocol/subscriptionId":11}}})
     );
     assert_eq!(m.in_flight(), 0);
     assert!(!m.holds_subscriptions(1));
@@ -2145,4 +2160,56 @@ fn subscriptions_listen_is_acknowledged_with_no_notification_types() {
         now,
     );
     assert!(to_client(&out, 1).is_empty());
+}
+
+// MCP 2026-07-28 basic/versioning: the hub answers -32022 for any version but 2026-07-28, so its
+// `server/discover` must list only that one, whatever else the child supports.
+#[test]
+fn discover_lists_only_the_version_the_hub_serves() {
+    let now = Instant::now();
+    let mut m = Mux::new("docs", T);
+    let id = to_child(&m.child_started(now))[0]["id"].clone();
+    feed(
+        &mut m,
+        json!({"jsonrpc":"2.0","id":id,"result":{"resultType":"complete",
+            "supportedVersions":["2027-01-01","2026-07-28"],"capabilities":{}}}),
+        now,
+    );
+    assert_eq!(m.era(), Some(Era::Stateless));
+    m.client_attached(1);
+    let out = m.client_line(1, &modern_line(1, "server/discover", json!({})), now);
+    assert_eq!(
+        to_client(&out, 1)[0]["result"]["supportedVersions"],
+        json!(["2026-07-28"])
+    );
+}
+
+// MCP 2026-07-28 basic, "_meta": a request that carries per-request protocol fields is modern
+// even when one is missing or of the wrong type; it is malformed (-32602), not a legacy request
+// (whose discover would get -32601 and send the client back to `initialize`).
+#[test]
+fn a_malformed_modern_request_is_invalid_params_not_legacy() {
+    let now = Instant::now();
+    let mut m = stateless_two(now);
+    let caps = "io.modelcontextprotocol/clientCapabilities";
+    for meta in [
+        json!({caps: {}}),
+        json!({MODERN_META: null, caps: {}}),
+        json!({MODERN_META: 5, caps: {}}),
+        json!({MODERN_META: "2026-07-28", caps: null}),
+        json!({MODERN_META: "2026-07-28", caps: []}),
+    ] {
+        for method in ["server/discover", "tools/list"] {
+            let line =
+                json!({"jsonrpc":"2.0","id":8,"method":method,"params":{"_meta":meta.clone()}});
+            let out = m.client_line(1, &line.to_string(), now);
+            assert!(to_child(&out).is_empty(), "{method} {meta}");
+            assert_eq!(
+                to_client(&out, 1)[0]["error"]["code"],
+                -32602,
+                "{method} {meta}"
+            );
+        }
+    }
+    assert_eq!(m.in_flight(), 0);
 }

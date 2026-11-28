@@ -1,6 +1,7 @@
 //! Pure state machine that multiplexes many MCP clients onto ONE child MCP
-//! server of the `initialize` generation. No I/O, no threads, no clock: the
-//! caller feeds lines and the current `Instant`, and writes what comes back.
+//! server, legacy (`initialize`) or stateless (2026-07-28). No I/O, no threads,
+//! no clock: the caller feeds lines and the current `Instant`, and writes what
+//! comes back.
 //!
 //! Phases of the child: `Stopped -> Probing -> Initializing -> Ready`, with the
 //! side exits `Stateless` (child answered the `server/discover` probe with a
@@ -272,7 +273,11 @@ impl Mux {
     fn set_stateless(&mut self, discover: Value, now: Instant, out: &mut Vec<Out>) {
         self.reset_subscriptions();
         let mut discover = discover;
-        // Advertise only what the hub serves: it refuses subscriptions and sends no list_changed here.
+        // Advertise only what the hub serves: one modern version, no subscriptions, and no
+        // list_changed for modern clients (legacy clients that sent `initialize` still get it).
+        if let Some(o) = discover.as_object_mut() {
+            o.insert("supportedVersions".into(), json!([MODERN_VERSION]));
+        }
         if let Some(caps) = discover
             .get_mut("capabilities")
             .and_then(Value::as_object_mut)
@@ -609,11 +614,8 @@ impl Mux {
                 let readable = v
                     .get("id")
                     .filter(|i| i.is_string() || i.is_i64() || i.is_u64());
-                let e = match readable {
-                    Some(rid) => err(-32600, "invalid request", rid),
-                    None => err(-32700, "parse error", &Value::Null),
-                };
-                push_client(&mut out, id, e);
+                let rid = readable.unwrap_or(&Value::Null);
+                push_client(&mut out, id, err(-32600, "invalid request", rid));
             }
         }
         out
@@ -714,19 +716,27 @@ impl Mux {
     ) {
         let over = self.over_cap(c);
         let stateless = matches!(self.phase, Phase::Stateless);
-        let modern = modern_version(&v).is_some();
+        let field = |k: &str| v.pointer("/params/_meta").and_then(|m| m.get(k));
+        let version = field(META_VERSION);
+        let legacy = version
+            .and_then(Value::as_str)
+            .is_some_and(|ver| LEGACY_VERSIONS.contains(&ver));
+        // Per-request protocol fields make a request modern, even a malformed one.
+        let modern = !legacy && (version.is_some() || field(META_CAPS).is_some());
         // A stateless child is served in the one modern version the hub speaks, and only to a
         // request that carries every required `_meta` field (basic/index, "_meta").
-        if stateless && let Some(ver) = modern_version(&v) {
-            if ver != MODERN_VERSION {
-                return push_client(out, c, version_error(&rid, ver, &[MODERN_VERSION]));
-            }
-            if v.pointer("/params/_meta")
-                .and_then(|m| m.get(META_CAPS))
-                .is_none()
-            {
-                let m = "invalid params: _meta needs io.modelcontextprotocol/clientCapabilities";
-                return push_client(out, c, error_response(&rid, -32602, m));
+        if stateless && modern {
+            let m = match version.and_then(Value::as_str) {
+                Some(MODERN_VERSION) if field(META_CAPS).is_some_and(Value::is_object) => None,
+                Some(MODERN_VERSION) => Some("clientCapabilities must be an object"),
+                Some(ver) => {
+                    return push_client(out, c, version_error(&rid, ver, &[MODERN_VERSION]));
+                }
+                None => Some("protocolVersion must be a string"),
+            };
+            if let Some(m) = m {
+                let m = format!("invalid params: _meta io.modelcontextprotocol/{m}");
+                return push_client(out, c, error_response(&rid, -32602, &m));
             }
         }
         let strict = stateless && !modern;
@@ -764,15 +774,17 @@ impl Mux {
                 push_client(out, c, error_response(&rid, -32601, "method not found"))
             }
             // The hub opens no stream on the child, so it agrees to no notification type: an empty
-            // acknowledgment, and the stream stays open until the client cancels it.
+            // acknowledgment, then a graceful end of the stream ("Graceful Closure").
             ("subscriptions/listen", _) if stateless && modern => {
-                let params = json!({"_meta": {META_SUBSCRIPTION: rid}, "notifications": {}});
+                let meta = json!({META_SUBSCRIPTION: rid});
+                let params = json!({"_meta": meta.clone(), "notifications": {}});
                 let method = "notifications/subscriptions/acknowledged";
                 push_client(
                     out,
                     c,
                     json!({"jsonrpc":"2.0","method":method,"params":params}),
                 );
+                local(out, json!({"_meta": meta}));
             }
             // A legacy client on a stateless child: it was offered no subscribe, so none is served.
             ("resources/subscribe" | "resources/unsubscribe" | "subscriptions/listen", _)

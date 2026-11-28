@@ -106,7 +106,7 @@ fn inherit_cwd_splits_by_directory() {
     assert_eq!(l.spawns(), 2);
     let children = [l.take_child(), l.take_child()];
     let cwds: Vec<_> = children.iter().map(|c| c.cwd.clone().unwrap()).collect();
-    assert_eq!(cwds, [PathBuf::from("/r/a"), PathBuf::from("/r/b")]);
+    assert_eq!(cwds, [abs_dir("/r/a"), abs_dir("/r/b")]);
     let r = row(&hub.report(), "files").clone();
     assert_eq!((r.instances, r.clients), (2, 3));
     // `docs` does not inherit: the cwd plays no part in its key.
@@ -123,7 +123,8 @@ fn inherit_cwd_splits_by_directory() {
 fn a_relative_hello_cwd_runs_an_inherit_server_per_session() {
     let l = Arc::new(FakeLauncher::default());
     let hub = hub(&l);
-    for cwd in ["", "rel/a"] {
+    // `\x` has a root but no drive: on Windows it names the daemon's drive, not the session's.
+    for cwd in ["", "rel/a", r"\rel"] {
         let c = connect(&hub, hello("files", &[], cwd));
         assert_eq!(c.reply(), HubReply::PerSession, "{cwd:?}");
     }
@@ -1399,6 +1400,28 @@ fn a_cancelled_queued_request_gets_no_reply_and_frees_its_place() {
     c.send(request(3, "tools/list"));
     assert_eq!(child.answer()["method"], "tools/list");
     assert_eq!(c.recv()["id"], 3, "the cancelled request was answered");
+    hub.shutdown();
+}
+
+// #2 item 20 (JSON-RPC 2.0, section 4): with a pool the hub reads a line before any mux. One
+// without "jsonrpc":"2.0" neither waits in the hub queue nor cancels a request queued there.
+#[test]
+fn a_line_without_jsonrpc_neither_waits_nor_cancels_in_the_hub_queue() {
+    let l = Arc::new(FakeLauncher::default());
+    let hub = pool_hub(&l, 3, 1);
+    let (mut c, mut child) = pool_client(&hub, &l, false);
+    let seen = overflow(&hub, &mut c, &child, 1..=2, 1);
+    c.send(json!({"method": "notifications/cancelled", "params": {"requestId": 2}}));
+    c.send(json!({"id": 9, "method": "tools/list"}));
+    let refused = c.recv();
+    assert_eq!(refused["id"], 9);
+    assert_eq!(refused["error"]["code"], -32600);
+    assert_eq!(queued(&hub), 1, "the queued request was cancelled");
+    reply_to(&mut child, &seen[0]);
+    assert_eq!(c.recv()["id"], 1);
+    let moved = child.next();
+    reply_to(&mut child, &moved);
+    assert_eq!(c.recv()["id"], 2);
     hub.shutdown();
 }
 
