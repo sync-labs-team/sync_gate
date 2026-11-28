@@ -47,6 +47,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// `cargo test -p sync_gate_core` alone leaves `ipc` off and its tests out. The note goes straight
 /// to the stderr handle, which libtest does not capture, so it shows even with `--quiet`.
+/// Limit: a filtered run (`cargo test -p sync_gate_core --lib ipc_name`) filters this note out
+/// too and skips the IPC coverage in silence; to cover IPC, run with `--features ipc`.
 #[cfg(all(test, not(feature = "ipc")))]
 mod ipc_coverage {
     #[test]
