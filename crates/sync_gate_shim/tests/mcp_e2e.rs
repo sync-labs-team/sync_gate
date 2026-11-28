@@ -3,8 +3,10 @@
 //!
 //! The MCP servers are this test binary re-executed in a child mode (`child_entry`, driven by
 //! `SYNC_GATE_TEST_CHILD`): `mcp-legacy` needs `initialize`; `mcp-stateless` answers
-//! `server/discover` and rejects `initialize`. Each server appends its pid to the file named by
-//! `SYNC_GATE_TEST_PIDS` and one line per `initialize` it receives to `SYNC_GATE_TEST_INITS`.
+//! `server/discover` and rejects `initialize`; `mcp-unsupported-first` and `mcp-reject-init-first`
+//! misbehave in their first process only. Each server appends its pid to the file named by
+//! `SYNC_GATE_TEST_PIDS` and `initialize <pid>` per `initialize` it receives to
+//! `SYNC_GATE_TEST_INITS`. `daemon` runs the daemon as its own process; `hung` never ends.
 //!
 //! `measure_hub_memory` is not a test: it does nothing unless `SYNC_GATE_MEASURE_MEMORY` is set.
 
@@ -35,10 +37,17 @@ fn child_entry() {
         return;
     };
     match mode.as_str() {
-        "mcp-legacy" => serve(false, false),
-        "mcp-stateless" => serve(true, false),
-        "mcp-reject-first" => serve(false, true),
+        "mcp-legacy" => serve(false, ""),
+        "mcp-stateless" => serve(true, ""),
+        "mcp-unsupported-first" => serve(false, "unsupported"),
+        "mcp-reject-init-first" => serve(false, "reject-init"),
         "daemon" => daemon(),
+        "hung" => {
+            let _w = Watchdog::start("hung", Duration::from_millis(100), abort_with);
+            loop {
+                std::thread::park();
+            }
+        }
         other => panic!("unknown child mode {other}"),
     }
 }
@@ -54,9 +63,9 @@ fn append(var: &str, line: &str) {
     f.write_all(format!("{line}\n").as_bytes()).unwrap();
 }
 
-/// `reject_first`: the first server started for the key (the hub's) offers no version the hub
-/// speaks and rejects `initialize`.
-fn serve(stateless: bool, reject_first: bool) -> ! {
+/// `first`: how the first server started for the key (the hub's) misbehaves: `unsupported`
+/// offers no version the hub speaks; `reject-init` is a legacy server that rejects `initialize`.
+fn serve(stateless: bool, first: &str) -> ! {
     std::thread::spawn(|| {
         std::thread::sleep(SERVER_LIFETIME);
         std::process::exit(3);
@@ -67,9 +76,9 @@ fn serve(stateless: bool, reject_first: bool) -> ! {
     writeln!(out).unwrap();
     out.flush().unwrap();
     append("SYNC_GATE_TEST_PIDS", &pid.to_string());
-    let rejecting = reject_first
-        && std::fs::read_to_string(std::env::var("SYNC_GATE_TEST_PIDS").unwrap())
-            .is_ok_and(|p| p.lines().next() == Some(&pid.to_string()));
+    let is_first = std::fs::read_to_string(std::env::var("SYNC_GATE_TEST_PIDS").unwrap())
+        .is_ok_and(|p| p.lines().next() == Some(&pid.to_string()));
+    let first = if is_first { first } else { "" };
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         let Ok(v) = serde_json::from_str::<Value>(&line) else {
@@ -81,8 +90,8 @@ fn serve(stateless: bool, reject_first: bool) -> ! {
         };
         let mut reply = match method {
             "initialize" => {
-                append("SYNC_GATE_TEST_INITS", "initialize");
-                if stateless || rejecting {
+                append("SYNC_GATE_TEST_INITS", &format!("initialize {pid}"));
+                if stateless || first == "reject-init" {
                     json!({"error":{"code":-32601,"message":"initialize is not supported"}})
                 } else {
                     json!({"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},
@@ -90,7 +99,7 @@ fn serve(stateless: bool, reject_first: bool) -> ! {
                 }
             }
             // A modern server that offers no version the hub speaks: the hub gives up on it.
-            "server/discover" if rejecting => {
+            "server/discover" if first == "unsupported" => {
                 json!({"result":{"resultType":"complete","supportedVersions":["2099-01-01"],
                     "capabilities":{"tools":{}}}})
             }
@@ -210,10 +219,7 @@ impl Sandbox {
             _watchdog: Watchdog::start(
                 std::thread::current().name().unwrap_or("?"),
                 LIMIT + WATCHDOG_SLACK,
-                |m| {
-                    eprintln!("{m}");
-                    std::process::abort()
-                },
+                abort_with,
             ),
         }
     }
@@ -293,6 +299,15 @@ impl Sandbox {
         self.lines(format!("{server}.inits")).len()
     }
 
+    /// `initialize` requests the server with this pid received.
+    fn inits_of(&self, server: &str, pid: u64) -> usize {
+        let line = format!("initialize {pid}");
+        self.lines(format!("{server}.inits"))
+            .iter()
+            .filter(|l| **l == line)
+            .count()
+    }
+
     fn wait_for(&self, what: &str, mut ok: impl FnMut() -> bool) {
         while !ok() {
             assert!(Instant::now() < self.until, "timed out: {what}");
@@ -328,8 +343,9 @@ fn assert_no_canary_under(root: &Path) {
     }
 }
 
-/// What the hub says about itself (status notes, decisions, rows) and what the relay prints.
-fn assert_no_canary_in_hub_output(status: &StatusReport, relay_stderr: &str) {
+/// What the hub says about itself (status notes, decisions, rows), what the relay prints and
+/// what the daemon prints.
+fn assert_no_canary_in_hub_output(status: &StatusReport, relay_stderr: &str, daemon_stderr: &str) {
     let status = serde_json::to_string(status).unwrap();
     assert!(
         !status.contains(CANARY),
@@ -339,6 +355,41 @@ fn assert_no_canary_in_hub_output(status: &StatusReport, relay_stderr: &str) {
         !relay_stderr.contains(CANARY),
         "secret in the relay stderr: {relay_stderr}"
     );
+    assert!(
+        !daemon_stderr.contains(CANARY),
+        "secret in the daemon stderr: {daemon_stderr}"
+    );
+}
+
+/// Collects what `pipe` yields; the receiver disconnects once the pipe has ended.
+fn capture(mut pipe: impl Read + Send + 'static) -> (Arc<Mutex<String>>, mpsc::Receiver<()>) {
+    let text = Arc::new(Mutex::new(String::new()));
+    let (t, (ended, done)) = (text.clone(), mpsc::channel::<()>());
+    std::thread::spawn(move || {
+        let _ended = ended;
+        let mut buf = [0u8; 4096];
+        while let Ok(n @ 1..) = pipe.read(&mut buf) {
+            t.lock()
+                .unwrap()
+                .push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    });
+    (text, done)
+}
+
+/// Waits (until `by`) for a pipe [`capture`] reads to end.
+fn wait_end(done: &mpsc::Receiver<()>, by: Instant) {
+    let r = done.recv_timeout(by.saturating_duration_since(Instant::now()));
+    assert!(
+        matches!(r, Err(mpsc::RecvTimeoutError::Disconnected)),
+        "stderr never ended"
+    );
+}
+
+/// What a watchdog does when it fires: the message, then the whole test binary ends.
+fn abort_with(message: String) {
+    eprintln!("{message}");
+    std::process::abort()
 }
 
 /// Aborts the whole test binary, with a message naming the test, when its owner outlives `limit`.
@@ -420,6 +471,7 @@ struct Relay {
     lines: mpsc::Receiver<Value>,
     seen: Vec<Value>,
     err: Arc<Mutex<String>>,
+    err_done: Option<mpsc::Receiver<()>>,
     until: Instant,
 }
 
@@ -440,22 +492,14 @@ impl Relay {
                 }
             }
         });
-        let err = Arc::new(Mutex::new(String::new()));
-        let (mut pipe, e) = (child.stderr.take().unwrap(), err.clone());
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            while let Ok(n @ 1..) = pipe.read(&mut buf) {
-                e.lock()
-                    .unwrap()
-                    .push_str(&String::from_utf8_lossy(&buf[..n]));
-            }
-        });
+        let (err, err_done) = capture(child.stderr.take().unwrap());
         Relay {
             child,
             stdin,
             lines,
             seen: Vec::new(),
             err,
+            err_done: Some(err_done),
             until,
         }
     }
@@ -506,6 +550,15 @@ impl Relay {
 
     fn stderr(&self) -> String {
         self.err.lock().unwrap().clone()
+    }
+
+    /// Like [`Relay::close`], then reads its stderr to the end: what it printed while exiting too.
+    fn close_with_stderr(mut self) -> (i32, String) {
+        let (done, err, until) = (self.err_done.take().unwrap(), self.err.clone(), self.until);
+        let code = self.close();
+        wait_end(&done, until);
+        let text = err.lock().unwrap().clone();
+        (code, text)
     }
 
     /// Closes the client's stdin and waits for the relay to exit; returns its exit code.
@@ -769,13 +822,14 @@ fn per_session_server_gets_one_process_per_session() {
 
 #[test]
 fn secrets_from_env_from_never_reach_status_or_disk() {
-    let mut sb = Sandbox::new(&[(
+    let sb = Sandbox::new(&[(
         "docs",
         "mcp-legacy",
         "shared",
         "env_from = [\"DOCS_TOKEN\"]",
     )]);
-    sb.start_daemon();
+    // Its own process, so that what the daemon prints is scanned too.
+    let mut daemon = sb.spawn_daemon();
     let mut r = sb.relay("docs", &[("DOCS_TOKEN", CANARY)]);
     r.open();
     assert_eq!(
@@ -785,20 +839,19 @@ fn secrets_from_env_from_never_reach_status_or_disk() {
     );
     assert!(sb.data_dir().join("services.json").exists());
     let status = sb.status();
-    assert_no_canary_in_hub_output(&status, &r.stderr());
     sb.assert_no_canary_on_disk();
-    let stderr = r.stderr();
-    assert_eq!(r.close(), 0);
-    sb.shutdown();
+    let (code, stderr) = r.close_with_stderr();
+    assert_eq!(code, 0);
+    let daemon_stderr = daemon.stop();
     sb.assert_no_canary_on_disk();
-    assert_no_canary_in_hub_output(&status, &stderr);
+    assert_no_canary_in_hub_output(&status, &stderr, &daemon_stderr);
 }
 
-/// The first server of `docs` (the hub's) offers no supported version and rejects `initialize`, so the hub
-/// gives up on the shared server; the relay then runs its own copy, which answers.
+/// The first server of `docs` (the hub's) offers no protocol version the hub speaks, so the hub
+/// gives up on it before any `initialize`; the relay then runs its own copy, which answers.
 #[test]
-fn a_server_that_rejects_initialize_falls_back_end_to_end() {
-    let sb = shared("mcp-reject-first");
+fn a_server_with_no_supported_version_falls_back_end_to_end() {
+    let sb = shared("mcp-unsupported-first");
     let mut r = sb.relay("docs", &[]);
     r.open();
     let pid = r.call(1)["pid"].as_u64().unwrap();
@@ -809,6 +862,9 @@ fn a_server_that_rejects_initialize_falls_back_end_to_end() {
         "the hub's server and the relay's own: {pids:?}"
     );
     assert_eq!(pid, pids[1], "the session was not served by its own server");
+    // The cause is the version: the hub's server never saw an initialize, the relay's got one.
+    assert_eq!(sb.inits_of("docs", pids[0]), 0);
+    assert_eq!(sb.inits_of("docs", pids[1]), 1);
     assert!(
         r.stderr().contains("running 'docs' directly"),
         "{}",
@@ -817,7 +873,40 @@ fn a_server_that_rejects_initialize_falls_back_end_to_end() {
     assert_eq!(r.close(), 0);
 }
 
-/// Every session sends the same ids with its own mark; each must get its own mark back.
+/// The hub's server (a legacy one) receives the hub's `initialize` and rejects it. The hub does
+/// not let go of the key for that: it answers the session's `initialize` with an error and
+/// restarts the server through its backoff (only a crash loop or an unsupported version make the
+/// relay run it directly).
+#[test]
+fn a_server_that_rejects_initialize_answers_the_session_with_an_error() {
+    let sb = shared("mcp-reject-init-first");
+    let mut r = sb.relay("docs", &[]);
+    r.send(initialize());
+    let e = r.reply(0);
+    assert_eq!(
+        e["error"]["message"], "mcp server failed to initialize",
+        "{e}"
+    );
+    let first = sb.pids("docs")[0];
+    assert_eq!(
+        sb.inits_of("docs", first),
+        1,
+        "the hub's server never received the initialize it rejected"
+    );
+    assert!(
+        sb.status()
+            .decisions
+            .iter()
+            .any(|d| d.contains("child rejected initialize")),
+        "{:?}",
+        sb.status().decisions
+    );
+    assert!(!r.stderr().contains("directly"), "{}", r.stderr());
+    assert_eq!(r.close(), 0);
+}
+
+/// Every session sends the same ids with its own mark through ONE shared server; each must get
+/// its own mark back.
 #[test]
 fn replies_reach_the_session_that_asked() {
     let sb = shared("mcp-legacy");
@@ -829,10 +918,19 @@ fn replies_reach_the_session_that_asked() {
         r.send(tools_call_marked(1, &format!("session-{i}")));
         r.send(tools_call_marked(2, &format!("session-{i}-b")));
     }
+    let mut served = Vec::new();
     for (i, r) in relays.iter_mut().enumerate() {
-        assert_eq!(result(r.reply(1))["mark"], format!("session-{i}"));
+        let a = result(r.reply(1));
+        assert_eq!(a["mark"], format!("session-{i}"));
         assert_eq!(result(r.reply(2))["mark"], format!("session-{i}-b"));
+        served.push(a["pid"].as_u64().unwrap());
     }
+    // Sessions with servers of their own would each get their own mark back too.
+    let pids = sb.pids("docs");
+    assert_eq!(pids.len(), 1, "one server for every session: {pids:?}");
+    assert!(served.iter().all(|p| *p == pids[0]), "{served:?} {pids:?}");
+    let row = sb.row("docs");
+    assert_eq!((row.instances, row.clients), (1, 4), "{row:?}");
     for r in relays {
         assert_eq!(r.close(), 0);
     }
@@ -842,37 +940,64 @@ fn replies_reach_the_session_that_asked() {
 fn the_canary_scan_covers_hub_output() {
     let sb = shared("mcp-legacy");
     let clean = sb.status();
-    assert_no_canary_in_hub_output(&clean, "");
+    assert_no_canary_in_hub_output(&clean, "", "");
     // The hub's status notes and the relay's stderr are both scanned.
     let mut noted = clean.clone();
     noted.decisions.push(format!("mcp docs: leaked {CANARY}"));
-    let caught = std::panic::catch_unwind(|| assert_no_canary_in_hub_output(&noted, ""));
+    let caught = std::panic::catch_unwind(|| assert_no_canary_in_hub_output(&noted, "", ""));
     assert!(
         caught.is_err(),
         "a canary in the status notes passed the scan"
     );
     let caught = std::panic::catch_unwind(|| {
-        assert_no_canary_in_hub_output(&clean, &format!("sync_gate_mcp: {CANARY}"))
+        assert_no_canary_in_hub_output(&clean, &format!("sync_gate_mcp: {CANARY}"), "")
     });
     assert!(
         caught.is_err(),
         "a canary in the relay stderr passed the scan"
     );
+    let caught = std::panic::catch_unwind(|| {
+        assert_no_canary_in_hub_output(&clean, "", &format!("sync_gated: {CANARY}"))
+    });
+    assert!(
+        caught.is_err(),
+        "a canary in the daemon stderr passed the scan"
+    );
 }
 
+/// A test binary stuck for good (`hung` mode: a 100 ms watchdog with the sandbox's own abort,
+/// then a thread that never returns) really ends, and says which test it was.
 #[test]
 fn a_hung_test_is_aborted_by_its_own_watchdog() {
-    let fired = Arc::new(Mutex::new(None::<String>));
-    let f = fired.clone();
-    let _w = Watchdog::start("hung", Duration::from_millis(50), move |m| {
-        *f.lock().unwrap() = Some(m)
-    });
-    let until = Instant::now() + Duration::from_secs(5);
-    while fired.lock().unwrap().is_none() {
-        assert!(Instant::now() < until, "the watchdog never fired");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(fired.lock().unwrap().as_ref().unwrap().contains("hung"));
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["child_entry", "--exact", "--nocapture", "--test-threads=1"])
+        .env("SYNC_GATE_TEST_CHILD", "hung")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= until {
+            let _ = child.kill(); // tests only: this test's own child
+            let _ = child.wait();
+            panic!("the watchdog never ended the hung process");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    assert!(!status.success(), "{status:?}");
+    assert!(err.contains("watchdog: test hung still running"), "{err}");
 }
 
 #[test]
@@ -888,22 +1013,62 @@ fn a_watchdog_dropped_in_time_stays_quiet() {
     assert!(!*fired.lock().unwrap(), "a finished test was aborted");
 }
 
-/// The daemon process of the memory measurement; dropping it closes its stdin (clean shutdown)
-/// and waits, killing it only if it has not exited after 20 s.
-struct DaemonProcess(Child);
+/// The daemon as its own process (this binary in `daemon` mode), with its stderr collected.
+struct DaemonProcess {
+    child: Child,
+    err: Arc<Mutex<String>>,
+    err_done: mpsc::Receiver<()>,
+}
+
+impl DaemonProcess {
+    /// Clean shutdown (its stdin closes), killing it only if it has not exited after 20 s.
+    fn end(&mut self) {
+        drop(self.child.stdin.take());
+        let until = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < until && self.child.try_wait().ok().flatten().is_none() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = self.child.kill(); // tests only: this test's own child; no-op once it exited
+        let _ = self.child.wait();
+    }
+
+    /// [`DaemonProcess::end`], then all it printed to stderr, read to the end.
+    fn stop(&mut self) -> String {
+        self.end();
+        wait_end(&self.err_done, Instant::now() + Duration::from_secs(5));
+        self.err.lock().unwrap().clone()
+    }
+}
 
 impl Drop for DaemonProcess {
     fn drop(&mut self) {
-        drop(self.0.stdin.take());
-        let until = Instant::now() + Duration::from_secs(20);
-        while Instant::now() < until {
-            if self.0.try_wait().ok().flatten().is_some() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        self.end();
+    }
+}
+
+impl Sandbox {
+    /// Starts the daemon as its own process on this sandbox and waits until it answers.
+    fn spawn_daemon(&self) -> DaemonProcess {
+        let mut c = Command::new(std::env::current_exe().unwrap());
+        c.args(["child_entry", "--exact", "--nocapture", "--test-threads=1"])
+            .env("SYNC_GATE_TEST_CHILD", "daemon")
+            .env("SYNC_GATE_CONFIG", self.dir.join("config.toml"))
+            .env("SYNC_GATE_SOCKET", &self.socket)
+            .env("SYNC_GATE_DATA_DIR", self.data_dir())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = c.spawn().unwrap();
+        let (err, err_done) = capture(child.stderr.take().unwrap());
+        let daemon = DaemonProcess {
+            child,
+            err,
+            err_done,
+        };
+        self.wait_for("the daemon never answered", || {
+            sync_gate::client::call_at(&self.socket, &Request::Status).is_ok()
+        });
+        daemon
     }
 }
 
@@ -926,18 +1091,7 @@ fn measure_hub_memory() {
     let names = ["s1", "s2", "s3", "s4", "s5"];
     let mut sb = Sandbox::new(&names.map(|n| (n, "mcp-legacy", "shared", "")));
     sb.until = Instant::now() + Duration::from_secs(120);
-    let mut c = Command::new(std::env::current_exe().unwrap());
-    c.args(["child_entry", "--exact", "--nocapture", "--test-threads=1"])
-        .env("SYNC_GATE_TEST_CHILD", "daemon")
-        .env("SYNC_GATE_CONFIG", sb.dir.join("config.toml"))
-        .env("SYNC_GATE_SOCKET", &sb.socket)
-        .env("SYNC_GATE_DATA_DIR", sb.data_dir())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null());
-    let daemon = DaemonProcess(c.spawn().unwrap());
-    sb.wait_for("the daemon never answered", || {
-        sync_gate::client::call_at(&sb.socket, &Request::Status).is_ok()
-    });
+    let daemon = sb.spawn_daemon();
     let mut relays: Vec<Relay> = names
         .iter()
         .flat_map(|n| (0..10).map(|_| sb.relay(n, &[])).collect::<Vec<_>>())
@@ -960,11 +1114,11 @@ fn measure_hub_memory() {
     let relay_pids: Vec<u32> = relays.iter().map(|r| r.child.id()).collect();
     report_memory(
         "loaded (right after the last reply)",
-        daemon.0.id(),
+        daemon.child.id(),
         &relay_pids,
     );
     std::thread::sleep(Duration::from_secs(30));
-    report_memory("idle (30 s later)", daemon.0.id(), &relay_pids);
+    report_memory("idle (30 s later)", daemon.child.id(), &relay_pids);
     for r in relays {
         assert_eq!(r.close(), 0);
     }
