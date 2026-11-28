@@ -275,8 +275,8 @@ struct Session<'a> {
     initialize: Option<(String, Vec<u8>)>,
     /// The first `initialize` exceeded [`MAX_STORED_INITIALIZE`] and was not stored.
     initialize_too_large: bool,
-    /// The first `initialize` is still arriving in pieces (id, bytes so far).
-    init_partial: Option<(String, Vec<u8>)>,
+    /// A line that may be the first `initialize` is still arriving (bytes so far).
+    init_partial: Option<Vec<u8>>,
     replay: Option<(String, Instant)>,
     /// The replayed `initialize` is still the client's own request: its reply goes to the client.
     replay_is_client: bool,
@@ -505,21 +505,27 @@ impl Session<'_> {
             self.put(b"\n");
             self.output_open = false;
         }
+        self.source = Source::Child;
+        // Decided before anything is announced: a direct server that never saw `initialize`
+        // would refuse every request.
+        let refused = if self.init_partial.take().is_some() {
+            Some("hub connection lost while the client's initialize was still arriving")
+        } else if self.initialize.is_none() && self.initialize_too_large {
+            Some("hub connection lost; initialize too large to replay")
+        } else {
+            None
+        };
+        if let Some(why) = refused {
+            self.log.line(&format!(
+                "sync_gate_mcp: {why}; not starting '{}' directly without it",
+                self.name
+            ));
+            return Err(1);
+        }
         self.log.line(&format!(
             "sync_gate_mcp: hub connection lost, running '{}' directly",
             self.name
         ));
-        self.source = Source::Child;
-        if self.init_partial.take().is_some() {
-            self.initialize_too_large = true; // cut by the hub loss: cannot be replayed
-        }
-        if self.initialize.is_none() && self.initialize_too_large {
-            // A direct server that never saw `initialize` would refuse every request.
-            self.log.line(
-                "sync_gate_mcp: initialize too large to replay; not starting the direct server without it",
-            );
-            return Err(1);
-        }
         self.start_child()?;
         if let Some((id, line)) = self.initialize.clone() {
             // Still unanswered: the replay is the client's own request and its reply is forwarded.
@@ -738,6 +744,13 @@ impl Session<'_> {
                     {
                         if self.replay_is_client {
                             self.forwarding = true;
+                        } else if is_error(&piece.bytes) {
+                            // The client was told it is initialized; this server is not.
+                            self.log.line(&format!(
+                                "sync_gate_mcp: '{}' refused the replayed initialize",
+                                self.name
+                            ));
+                            return self.fail_replay(rx, 1);
                         } else {
                             self.swallowing = true;
                         }
@@ -828,32 +841,42 @@ impl Session<'_> {
         self.input_open = piece.streamed && !piece.end;
         if piece.first {
             self.line_source = self.source;
-            self.unknown_large = piece.streamed && request_id(&piece.bytes).is_none();
-            if self.source == Source::Hub
-                && let Some(id) = request_id(&piece.bytes)
-            {
-                self.flight.insert(id.clone());
+            let id = request_id(&piece.bytes);
+            self.unknown_large = piece.streamed && id.is_none();
+            if self.source == Source::Hub {
+                if let Some(id) = id {
+                    self.flight.insert(id);
+                }
+                // JSON fields come in any order: until it has an `initialize`, the relay keeps
+                // every object whose start does not show another method, and reads it whole.
                 if self.initialize.is_none()
                     && !self.initialize_too_large
-                    && prefix_value(&piece.bytes, "method").is_some_and(|v| v == "initialize")
+                    && piece.bytes.trim_ascii_start().first() == Some(&b'{')
+                    && prefix_value(&piece.bytes, "method").is_none_or(|v| v == "initialize")
                 {
-                    if piece.end {
-                        self.initialize = Some((id, piece.bytes.clone()));
-                    } else {
-                        self.init_partial = Some((id, piece.bytes.clone()));
-                    }
+                    self.init_partial = Some(Vec::new());
                 }
             }
-        } else if self.source == Source::Hub
-            && let Some((_, buf)) = self.init_partial.as_mut()
+        }
+        if self.source == Source::Hub
+            && let Some(buf) = self.init_partial.as_mut()
         {
             if buf.len() + piece.bytes.len() > MAX_STORED_INITIALIZE {
+                // Too large to keep is too large to tell; MCP sends `initialize` first, so a
+                // line this size before it is taken for one.
                 self.init_partial = None;
                 self.initialize_too_large = true;
             } else {
                 buf.extend_from_slice(&piece.bytes);
-                if piece.end {
-                    self.initialize = self.init_partial.take();
+                if piece.end
+                    && let Some(line) = self.init_partial.take()
+                    && let Some(Kind::Request { id, method }) = parse(&line)
+                    && method == "initialize"
+                {
+                    // Its id may lie past the start the first piece was scanned for.
+                    let id = id.to_string();
+                    self.flight.insert(id.clone());
+                    self.initialize = Some((id, line));
                 }
             }
         }
@@ -907,6 +930,13 @@ fn response_id(bytes: &[u8]) -> Option<String> {
             scan_id(bytes)
         }
         _ => None,
+    }
+}
+/// An error response: parsed, or for a line too large to parse, a top-level `error` near its start.
+fn is_error(bytes: &[u8]) -> bool {
+    match serde_json::from_slice::<Value>(bytes) {
+        Ok(v) => v.get("error").is_some(),
+        Err(_) => prefix_field(bytes, "error").is_some(),
     }
 }
 /// Tolerant top-level id scan: ignores strings, nested ids and the rest of a huge JSON value.

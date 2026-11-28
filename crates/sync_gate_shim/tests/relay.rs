@@ -4,7 +4,7 @@
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -83,6 +83,8 @@ fn child_entry() {
     }
     // `SYNC_GATE_TEST_NEED_INIT`: a strict server that refuses every request before `initialize`.
     let strict = std::env::var_os("SYNC_GATE_TEST_NEED_INIT").is_some();
+    // `SYNC_GATE_TEST_REJECT_INIT`: answers `initialize` with an error and stays uninitialized.
+    let rejects = std::env::var_os("SYNC_GATE_TEST_REJECT_INIT").is_some();
     let mut initialized = false;
     for line in std::io::stdin().lock().lines() {
         let line = line.unwrap();
@@ -99,8 +101,12 @@ fn child_entry() {
         };
         let method = v["method"].as_str().unwrap_or_default().to_string();
         writeln!(log, "{method}").unwrap();
-        initialized |= method == "initialize";
-        if v.get("id").is_some() && strict && !initialized {
+        initialized |= method == "initialize" && !rejects;
+        if v.get("id").is_some() && method == "initialize" && rejects {
+            let reply = json!({"jsonrpc":"2.0","id":v["id"],"error":{"code":-32603,"message":"initialize refused"}});
+            println!("{reply}");
+            std::io::stdout().flush().unwrap();
+        } else if v.get("id").is_some() && strict && !initialized {
             let reply = json!({"jsonrpc":"2.0","id":v["id"],"error":{"code":-32002,"message":"not initialized"}});
             println!("{reply}");
             std::io::stdout().flush().unwrap();
@@ -164,8 +170,9 @@ fn config(mode: McpMode, exit_code: i32, methods: &std::path::Path) -> Config {
     }
 }
 
-/// The client's stdin: bytes sent through a channel; EOF when the sender is dropped.
-struct Stdin(mpsc::Receiver<Vec<u8>>, Vec<u8>);
+/// The client's stdin: bytes sent through a channel; EOF when the sender is dropped. The third
+/// field counts the bytes the relay has taken.
+struct Stdin(mpsc::Receiver<Vec<u8>>, Vec<u8>, Arc<AtomicUsize>);
 
 impl Read for Stdin {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -178,6 +185,7 @@ impl Read for Stdin {
         let n = buf.len().min(self.1.len());
         buf[..n].copy_from_slice(&self.1[..n]);
         self.1.drain(..n);
+        self.2.fetch_add(n, Ordering::SeqCst);
         Ok(n)
     }
 }
@@ -229,6 +237,8 @@ impl Sink {
 /// A relay running on its own thread.
 struct Session {
     stdin: Option<mpsc::Sender<Vec<u8>>>,
+    /// Bytes of the client's stdin the relay has read.
+    read: Arc<AtomicUsize>,
     out: Sink,
     err: Sink,
     done: mpsc::Receiver<i32>,
@@ -262,12 +272,14 @@ impl Session {
         let err = Sink::default();
         let (o, e, hub, server) = (stdout, err.clone(), hub.to_string(), server.to_string());
         let (dtx, done) = mpsc::channel();
+        let read = Arc::new(AtomicUsize::new(0));
+        let r = read.clone();
         std::thread::spawn(move || {
             let code = sync_gate_shim::run_with_options(
                 &cfg,
                 &hub,
                 &server,
-                Stdin(rx, Vec::new()),
+                Stdin(rx, Vec::new(), r),
                 o,
                 e,
                 options,
@@ -276,6 +288,7 @@ impl Session {
         });
         Session {
             stdin: Some(tx),
+            read,
             out,
             err,
             done,
@@ -973,7 +986,7 @@ fn tracking_applies_backpressure_before_reading_request_4097() {
             &n,
             "docs",
             Counted {
-                inner: Stdin(rx, Vec::new()),
+                inner: Stdin(rx, Vec::new(), Arc::default()),
                 reads: c,
             },
             o,
@@ -1224,7 +1237,7 @@ fn blocked_output(signal: bool) {
             &cfg,
             &tmp_name("bo"),
             "docs",
-            Stdin(stdin, Vec::new()),
+            Stdin(stdin, Vec::new(), Arc::default()),
             Blocked {
                 entered,
                 release: Some(released),
@@ -1376,10 +1389,10 @@ fn client_stops_reading(mode: McpMode) {
         gate.entered.load(Ordering::SeqCst)
     });
     // Absence window: returns at once if the session ends, else after a few write timeouts.
-    let ended = s.done.recv_timeout(ABSENCE_WINDOW).is_ok();
+    let window = s.done.recv_timeout(ABSENCE_WINDOW);
     gate.open();
     assert!(
-        !ended,
+        matches!(window, Err(mpsc::RecvTimeoutError::Timeout)),
         "a client that stopped reading ended the session: {}",
         s.err.text()
     );
@@ -1425,13 +1438,24 @@ fn direct_child_that_stops_reading_stdin_does_not_end_the_session() {
         .insert("SYNC_GATE_TEST_START_DELAY_MS".into(), "1000".into());
     let mut s = Session::with_options(cfg, &tmp_name("slow"), "docs", short_options());
     // Larger than any pipe buffer: the relay's write blocks until the child reads.
-    s.stdin.as_ref().unwrap().send(big_request(1)).unwrap();
-    // The child exists (it opens its file first) and is still in its start delay: the write blocks.
+    let request = big_request(1);
+    s.stdin.as_ref().unwrap().send(request.clone()).unwrap();
+    // The child exists (it opens its file first) and is in its start delay; the relay took the
+    // first 1 MiB piece off stdin and is writing it: that write cannot finish yet.
     wait_for("the child never started", || file.exists());
+    wait_for("the relay never took the first piece", || {
+        s.read.load(Ordering::SeqCst) >= 1 << 20
+    });
+    let window = s.done.recv_timeout(ABSENCE_WINDOW);
     assert!(
-        s.done.recv_timeout(ABSENCE_WINDOW).is_err(),
-        "a direct server busy for a while ended the session: {}",
+        matches!(window, Err(mpsc::RecvTimeoutError::Timeout)),
+        "a direct server busy for a while ended the session: {window:?} {}",
         s.err.text()
+    );
+    // Still blocked on that write after the window: the rest of the line was not read.
+    assert!(
+        s.read.load(Ordering::SeqCst) < request.len(),
+        "the write never blocked: the whole request was read"
     );
     assert_eq!(s.out.reply(1)["result"], json!({"echo":"tools/call"}));
     assert_eq!(s.finish(), 0);
@@ -1451,7 +1475,10 @@ fn shutdown_returns_while_a_write_to_the_direct_child_is_blocked() {
     wait_for("child never recorded its pid", || file.exists());
     let _child = TestChild(std::fs::read_to_string(&file).unwrap().parse().unwrap());
     s.stdin.as_ref().unwrap().send(big_request(1)).unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    // The first 1 MiB piece is off stdin: the relay is writing it to a child that never reads.
+    wait_for("the relay never took the first piece", || {
+        s.read.load(Ordering::SeqCst) >= 1 << 20
+    });
     shutdown.request();
     let code = s
         .done
@@ -1530,52 +1557,176 @@ fn large_client_response_is_not_tracked_as_a_request() {
     hub.shutdown();
 }
 
-/// A strict direct server (refuses every request before `initialize`) behind a hub that drops
-/// the connection at id 5, with a first `initialize` of `padding` bytes.
-fn strict_fallback(tag: &str, padding: usize) -> (Session, std::path::PathBuf, impl FnOnce()) {
-    let (name, file) = (tmp_name(tag), methods_file(tag));
+/// A first `initialize` (id 0) with about `padding` bytes of params, its fields in this order.
+fn initialize_line(padding: usize, params_first: bool) -> String {
+    let params = format!(r#"{{"padding":"{}"}}"#, "x".repeat(padding));
+    if params_first {
+        format!(r#"{{"params":{params},"jsonrpc":"2.0","id":0,"method":"initialize"}}"#)
+    } else {
+        format!(r#"{{"jsonrpc":"2.0","id":0,"method":"initialize","params":{params}}}"#)
+    }
+}
+
+/// A strict direct server (refuses every request before `initialize`, logs every line it reads)
+/// behind a hub that drops the connection at id 5, after the client's first line `init`.
+/// Returns the session, the methods file and the lines file.
+fn strict_fallback(
+    tag: &str,
+    init: &str,
+    edit: impl FnOnce(&mut McpServer),
+) -> (
+    Session,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    impl FnOnce(),
+) {
+    let (name, file, lines) = (
+        tmp_name(tag),
+        methods_file(tag),
+        methods_file(&format!("{tag}-lines")),
+    );
     let (hub, _) = test_hub(&name, HubReply::Ok, true);
     let mut cfg = config(McpMode::Shared, 0, &file);
-    cfg.mcp
-        .get_mut("docs")
-        .unwrap()
-        .env
+    let srv = cfg.mcp.get_mut("docs").unwrap();
+    srv.env
         .insert("SYNC_GATE_TEST_NEED_INIT".into(), "1".into());
+    srv.env
+        .insert("SYNC_GATE_TEST_LINES".into(), lines.display().to_string());
+    edit(srv);
     let s = Session::start(cfg, &name, "docs");
-    s.send(json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"padding":"x".repeat(padding)}}));
+    s.stdin
+        .as_ref()
+        .unwrap()
+        .send(format!("{init}\n").into_bytes())
+        .unwrap();
     s.out.reply(0);
     s.send(request(5, "tools/call"));
-    (s, file, move || hub.shutdown())
+    (s, file, lines, move || hub.shutdown())
 }
 
+/// The replay reaches the strict direct server once and byte for byte, whatever its size (one
+/// piece past the 64 KiB field scan, or several pieces) and the order of its fields.
 #[test]
 fn a_large_initialize_is_replayed_to_the_direct_server() {
-    let (mut s, file, stop) = strict_fallback("mid-init", 3 << 19); // 1.5 MiB
-    wait_for("fallback never started", || {
-        s.err.text().contains("hub connection lost")
+    for (padding, params_first) in [(3 << 19, false), (3 << 19, true), (100 << 10, true)] {
+        let case = format!("padding {padding}, params first {params_first}");
+        let init = initialize_line(padding, params_first);
+        let (mut s, file, lines, stop) = strict_fallback("mid-init", &init, |_| {});
+        wait_for("fallback never started", || {
+            s.err.text().contains("hub connection lost")
+        });
+        s.send(request(6, "tools/list"));
+        let reply = s.out.reply(6);
+        assert_eq!(
+            reply["result"],
+            json!({"echo":"tools/list"}),
+            "{case}: {reply}"
+        );
+        assert_eq!(s.finish(), 0);
+        let m = methods(&file);
+        assert_eq!(
+            m.first().map(String::as_str),
+            Some("initialize"),
+            "{case}: {m:?}"
+        );
+        assert_eq!(
+            m.iter().filter(|m| *m == "initialize").count(),
+            1,
+            "{case}: {m:?}"
+        );
+        let got = std::fs::read_to_string(&lines).unwrap();
+        assert!(
+            got.lines().next() == Some(init.as_str()),
+            "{case}: the replayed initialize differs from the client's"
+        );
+        assert_eq!(s.out.json().iter().filter(|v| v["id"] == 5).count(), 1);
+        stop();
+    }
+}
+
+/// Over the limit, in either field order: the session ends with an error and the direct server
+/// is never started (its command cannot start, so any attempt would say "cannot start").
+#[test]
+fn an_initialize_over_the_limit_ends_the_session_with_an_error() {
+    for params_first in [true, false] {
+        let init = initialize_line(9 << 20, params_first);
+        let missing = std::env::temp_dir().join(tmp_name("no-such-server"));
+        let (s, _, _, stop) = strict_fallback("big-init", &init, |srv| {
+            srv.command = missing.to_string_lossy().into_owned();
+        });
+        let code = s.done.recv_timeout(BOUND).expect("session did not end");
+        let text = s.err.text();
+        assert!(
+            !text.contains("cannot start"),
+            "params first {params_first}: a direct start was tried: {text}"
+        );
+        assert_eq!(code, 1, "params first {params_first}: {text}");
+        assert!(text.contains("initialize too large to replay"), "{text}");
+        assert!(!text.contains("running 'docs' directly"), "{text}");
+        assert_eq!(s.out.json().iter().filter(|v| v["id"] == 5).count(), 1);
+        stop();
+    }
+}
+
+/// The direct server refuses the replayed initialize: the session ends instead of going on with
+/// a server that is not initialized.
+#[test]
+fn a_refused_replay_ends_the_session() {
+    let init = initialize_line(16, false);
+    let (s, file, _, stop) = strict_fallback("replay-refused", &init, |srv| {
+        srv.env
+            .insert("SYNC_GATE_TEST_REJECT_INIT".into(), "1".into());
     });
-    s.send(request(6, "tools/list"));
-    let reply = s.out.reply(6);
-    assert_eq!(reply["result"], json!({"echo":"tools/list"}), "{reply}");
-    assert_eq!(s.finish(), 0);
-    assert_eq!(methods(&file)[0], "initialize", "{:?}", methods(&file));
-    assert_eq!(s.out.json().iter().filter(|v| v["id"] == 5).count(), 1);
+    let code = s
+        .done
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the session went on after its replay was refused");
+    let text = s.err.text();
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("refused the replayed initialize"), "{text}");
+    let e = s.out.reply(5);
+    assert_eq!(
+        e["error"]["message"], "hub connection lost; direct server unavailable",
+        "{e}"
+    );
+    let m = methods(&file);
+    assert!(!m.contains(&"notifications/initialized".into()), "{m:?}");
     stop();
 }
 
+/// The hub disappears while the client's initialize (below the limit) is still arriving: the
+/// session ends and says so, without calling it too large or announcing a direct start.
 #[test]
-fn an_initialize_over_the_limit_ends_the_session_with_an_error() {
-    let (s, file, stop) = strict_fallback("big-init", 9 << 20);
-    let code = s.done.recv_timeout(BOUND).expect("session did not end");
-    assert_ne!(code, 0);
-    let text = s.err.text();
-    assert!(text.contains("initialize too large to replay"), "{text}");
-    assert!(
-        methods(&file).is_empty(),
-        "a direct server ran without initialize"
+fn a_hub_lost_mid_initialize_ends_the_session_truthfully() {
+    let name = tmp_name("cut-init");
+    let hub = sync_gated::ipc::serve_stream(&name, move |r, mut w, close| {
+        let mut r = BufReader::new(r);
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        w.write_all(b"\"Ok\"\n").unwrap();
+        let _ = r.read_exact(&mut vec![0; 64 << 10]);
+        close();
+    })
+    .unwrap();
+    let s = Session::start(
+        config(McpMode::Shared, 0, &methods_file("cut-init")),
+        &name,
+        "docs",
     );
-    assert_eq!(s.out.json().iter().filter(|v| v["id"] == 5).count(), 1);
-    stop();
+    // 1.5 MiB without its end: the rest of the line has not arrived when the hub goes.
+    let init = initialize_line(3 << 19, false);
+    s.stdin
+        .as_ref()
+        .unwrap()
+        .send(init.as_bytes()[..init.len() - 100].to_vec())
+        .unwrap();
+    let code = s.done.recv_timeout(BOUND).expect("session did not end");
+    let text = s.err.text();
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("initialize was still arriving"), "{text}");
+    assert!(!text.contains("too large"), "{text}");
+    assert!(!text.contains("running 'docs' directly"), "{text}");
+    hub.shutdown();
 }
 
 // ---- Task 11: the relay runs the adopted server when the config cannot ----
