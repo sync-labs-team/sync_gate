@@ -23,6 +23,18 @@ and what happened.
 - **Guests, only when you list them.** A sandbox (Codex's, for example) reaches the queue through
   its own narrow pipe, and only if you name it in the configuration. See
   [`docs/sandbox.md`](docs/sandbox.md).
+- **Files in its data and config folders, only when owned by you (or SYSTEM/Administrators) and no
+  account outside those can change them.** That covers `config.toml`, the adoption record, the
+  shims, the stored commands of queued tickets, the daemon's records and the PostgreSQL cluster
+  sync_gate runs. On Windows the owner and the permissions of each file are checked, and a file
+  that is a link, or any other reparse point Windows reports, is refused. On
+  Linux and macOS the file must be yours, not writable by group or others, and have one link. A
+  file another account (root included) owns is refused, so a `config.toml` under `/etc`, or in a
+  folder your group can write, is not read. The same holds for a sandbox that runs as another
+  account: it never reads your files and uses its own config or the defaults.
+- **The installer's files, when it runs.** Before it changes anything, the installer checks with
+  the same rule its folder, `bin\`, `launcher.cmd`, `install-state.json` and the rollback copies
+  (Windows), and stops if another account can change them.
 
 ## Declared limits
 
@@ -49,6 +61,18 @@ and what happened.
   Only a queued command gets a key: every command typed after `sync_gate run`, whatever the
   program, a heavy command reached through a shim, and any program with `SYNC_GATE_FORCE_HEAVY=1`.
   A light command reached through a shim gets none. The old history was reset.
+- **A refused file is not repaired.** sync_gate reports it and leaves it as it is, and the
+  command that needed it stops or uses defaults. Fixing the permissions does not make the
+  content trustworthy: another account may already have changed it. Delete the file (or, for the
+  shims, the shims folder and then `sync_gate shims install`), or read it before you trust it
+  again. `services.json` and `cost.json` are rebuilt by the daemon and replaced on its next save.
+- **What is checked is the state when it is read.** A program that opened a file for writing
+  before its permissions were fixed keeps that access, and Windows cannot take it back: delete the
+  file and sign out. Files that Windows or PostgreSQL run or read later (the shims, the cluster)
+  are checked when sync_gate puts them on `PATH` or starts the server.
+- **The program files and the logon task are checked by the installer only.** Task Scheduler and
+  your shell run `launcher.cmd` and the programs before any code of sync_gate does. An uninstall
+  uses the installed `sync_gate.exe` to check, since no other copy is at hand.
 - **Unsigned binaries.** The release binaries are not code-signed. Check them against `SHA256SUMS`.
   The installer changes only what belongs to the user. The list is in
   [`docs/install.md`](docs/install.md).
