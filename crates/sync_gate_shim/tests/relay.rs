@@ -36,10 +36,13 @@ fn child_entry() {
         }
     }
     if let Some(file) = spec.strip_prefix("stall:") {
-        // Publishes its pid and never reads stdin, so a large write to it blocks.
+        // Publishes its pid, reads one byte (`<file>.got`: a write to it has begun) and then
+        // never reads again, so a large write to it stays blocked.
         let starting = format!("{file}.starting");
         std::fs::write(&starting, std::process::id().to_string()).unwrap();
         std::fs::rename(starting, file).unwrap();
+        std::io::stdin().read_exact(&mut [0u8]).unwrap();
+        std::fs::write(format!("{file}.got"), b"1").unwrap();
         loop {
             std::thread::park();
         }
@@ -102,6 +105,22 @@ fn child_entry() {
         let method = v["method"].as_str().unwrap_or_default().to_string();
         writeln!(log, "{method}").unwrap();
         initialized |= method == "initialize" && !rejects;
+        // `SYNC_GATE_TEST_INIT_REPLY`: a 2 MiB reply to `initialize` that is not a success:
+        // `truncated` (its line ends mid-JSON) or `both` (a `result`, then an `error`).
+        if let Ok(kind) = std::env::var("SYNC_GATE_TEST_INIT_REPLY")
+            && method == "initialize"
+        {
+            let (id, pad) = (&v["id"], "x".repeat(2 << 20));
+            let head = format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"padding":"{pad}""#);
+            let line = if kind == "truncated" {
+                head
+            } else {
+                format!(r#"{head}}},"error":{{"code":-1,"message":"no"}}}}"#)
+            };
+            println!("{line}");
+            std::io::stdout().flush().unwrap();
+            continue;
+        }
         if v.get("id").is_some() && method == "initialize" && rejects {
             let reply = json!({"jsonrpc":"2.0","id":v["id"],"error":{"code":-32603,"message":"initialize refused"}});
             println!("{reply}");
@@ -1475,10 +1494,9 @@ fn shutdown_returns_while_a_write_to_the_direct_child_is_blocked() {
     wait_for("child never recorded its pid", || file.exists());
     let _child = TestChild(std::fs::read_to_string(&file).unwrap().parse().unwrap());
     s.stdin.as_ref().unwrap().send(big_request(1)).unwrap();
-    // The first 1 MiB piece is off stdin: the relay is writing it to a child that never reads.
-    wait_for("the relay never took the first piece", || {
-        s.read.load(Ordering::SeqCst) >= 1 << 20
-    });
+    // A byte of the 1 MiB piece reached the child, which reads no more: the write is blocked.
+    let got = std::path::PathBuf::from(format!("{}.got", file.display()));
+    wait_for("the write to the child never began", || got.exists());
     shutdown.request();
     let code = s
         .done
@@ -1672,26 +1690,97 @@ fn an_initialize_over_the_limit_ends_the_session_with_an_error() {
 /// a server that is not initialized.
 #[test]
 fn a_refused_replay_ends_the_session() {
+    replay_not_accepted(
+        "replay-refused",
+        ("SYNC_GATE_TEST_REJECT_INIT", "1"),
+        "refused the replayed initialize",
+    );
+}
+
+/// The reply is read whole before the session goes on: an error past the start of a 2 MiB reply
+/// is still a refusal, and a reply cut mid-JSON is no success.
+#[test]
+fn a_replay_reply_checked_whole_ends_the_session_unless_it_is_a_success() {
+    replay_not_accepted(
+        "replay-both",
+        ("SYNC_GATE_TEST_INIT_REPLY", "both"),
+        "refused the replayed initialize",
+    );
+    replay_not_accepted(
+        "replay-cut",
+        ("SYNC_GATE_TEST_INIT_REPLY", "truncated"),
+        "gave no valid reply to the replayed initialize",
+    );
+}
+
+fn replay_not_accepted(tag: &str, (key, value): (&str, &str), says: &str) {
     let init = initialize_line(16, false);
-    let (s, file, _, stop) = strict_fallback("replay-refused", &init, |srv| {
-        srv.env
-            .insert("SYNC_GATE_TEST_REJECT_INIT".into(), "1".into());
+    let (s, file, _, stop) = strict_fallback(tag, &init, |srv| {
+        srv.env.insert(key.into(), value.into());
     });
     let code = s
         .done
         .recv_timeout(Duration::from_secs(10))
-        .expect("the session went on after its replay was refused");
+        .unwrap_or_else(|e| panic!("{tag}: the session went on after its replay: {e:?}"));
     let text = s.err.text();
-    assert_eq!(code, 1, "{text}");
-    assert!(text.contains("refused the replayed initialize"), "{text}");
+    assert_eq!(code, 1, "{tag}: {text}");
+    assert!(text.contains(says), "{tag}: {text}");
     let e = s.out.reply(5);
     assert_eq!(
         e["error"]["message"], "hub connection lost; direct server unavailable",
-        "{e}"
+        "{tag}: {e}"
     );
     let m = methods(&file);
-    assert!(!m.contains(&"notifications/initialized".into()), "{m:?}");
+    assert!(
+        !m.contains(&"notifications/initialized".into()),
+        "{tag}: {m:?}"
+    );
     stop();
+}
+
+/// An `initialize` the relay cannot parse (nested past serde_json's depth limit) is not taken
+/// for "no initialize": the direct server is never started without its replay.
+#[test]
+fn an_initialize_that_cannot_be_parsed_ends_the_session_with_an_error() {
+    let name = tmp_name("deep-init");
+    // Reads the hello, the initialize and id 5, then drops the connection; it parses nothing.
+    let hub = sync_gated::ipc::serve_stream(&name, move |r, mut w, close| {
+        let mut r = BufReader::new(r);
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        w.write_all(b"\"Ok\"\n").unwrap();
+        r.read_line(&mut line).unwrap();
+        r.read_line(&mut line).unwrap();
+        close();
+    })
+    .unwrap();
+    let mut cfg = config(McpMode::Shared, 0, &methods_file("deep-init"));
+    let missing = std::env::temp_dir().join(tmp_name("no-such-server"));
+    cfg.mcp.get_mut("docs").unwrap().command = missing.to_string_lossy().into_owned();
+    let s = Session::start(cfg, &name, "docs");
+    let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+    let init =
+        format!(r#"{{"jsonrpc":"2.0","id":0,"method":"initialize","params":{{"x":{deep}}}}}"#);
+    assert!(
+        serde_json::from_str::<Value>(&init).is_err(),
+        "not too deep"
+    );
+    s.stdin
+        .as_ref()
+        .unwrap()
+        .send(format!("{init}\n").into_bytes())
+        .unwrap();
+    s.send(request(5, "tools/call"));
+    let code = s.done.recv_timeout(BOUND).expect("session did not end");
+    let text = s.err.text();
+    assert!(
+        !text.contains("cannot start"),
+        "a direct start was tried: {text}"
+    );
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("initialize could not be read"), "{text}");
+    assert_eq!(s.out.json().iter().filter(|v| v["id"] == 5).count(), 1);
+    hub.shutdown();
 }
 
 /// The hub disappears while the client's initialize (below the limit) is still arriving: the
