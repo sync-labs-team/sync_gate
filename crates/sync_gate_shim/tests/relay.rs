@@ -1565,7 +1565,10 @@ fn an_initialize_over_the_limit_ends_the_session_with_an_error() {
     assert_ne!(code, 0);
     let text = s.err.text();
     assert!(text.contains("initialize too large to replay"), "{text}");
-    assert!(methods(&file).is_empty(), "a direct server ran without initialize");
+    assert!(
+        methods(&file).is_empty(),
+        "a direct server ran without initialize"
+    );
     assert_eq!(s.out.json().iter().filter(|v| v["id"] == 5).count(), 1);
     stop();
 }
