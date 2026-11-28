@@ -64,6 +64,11 @@ pub trait Launcher: Send + Sync {
     fn is_alive(&self, pid: u32, start_time: u64) -> bool;
     /// Terminates the process (and the tree it started) if it still matches `start_time`.
     fn terminate(&self, pid: u32, start_time: u64) -> io::Result<()>;
+    /// False when `pid`'s identity (state, start time) cannot be read, so it can be neither
+    /// confirmed as the recorded process nor ruled out. A launcher that cannot tell says true.
+    fn identity_readable(&self, _pid: u32, _start_time: u64) -> bool {
+        true
+    }
     /// Executable path of the live process `pid`, if the OS can tell.
     fn exe_of(&self, _pid: u32) -> Option<PathBuf> {
         None
@@ -169,8 +174,8 @@ pub fn stop_own(
 /// Daemon start: stop what a previous run left behind. Entries that still match pid + start
 /// time + exe path are terminated (their stdin pipe died with the old daemon); one that is gone
 /// or is another process (start time or exe differs) is forgotten. The row is kept, for the
-/// next start, when something could not be read (the exe here, the identity `terminate`
-/// checks) or the stop failed. Returns how many were terminated.
+/// next start, when something could not be read (the exe, the identity; `terminate` checks the
+/// identity again) or the stop failed. Returns how many were terminated.
 pub fn reap_leftovers(l: &dyn Launcher, reg: &mut Registry) -> usize {
     let mut stopped = 0;
     for (name, pid, start_time, exe) in reg.leftovers() {
@@ -182,6 +187,12 @@ pub fn reap_leftovers(l: &dyn Launcher, reg: &mut Registry) -> usize {
                     continue;
                 }
                 Some(e) if e != exe => {}
+                // same exe but cannot be told apart from another process: never signalled,
+                // and kept, unlike a refused target
+                Some(_) if !l.identity_readable(pid, start_time) => {
+                    eprintln!("sync_gated: cannot verify leftover {name} (pid {pid}); kept");
+                    continue;
+                }
                 Some(_) => match l.terminate(pid, start_time) {
                     Ok(()) => stopped += 1,
                     // refused as a target (pid 0, 1, ours): no retry will ever work
@@ -437,6 +448,11 @@ impl Launcher for OsLauncher {
                 "pid {pid} survived the final kill"
             )))
         }
+    }
+
+    #[cfg(windows)]
+    fn identity_readable(&self, pid: u32, start_time: u64) -> bool {
+        foreign_seen(pid, start_time) != Seen::Unreadable
     }
 
     fn exe_of(&self, pid: u32) -> Option<PathBuf> {
@@ -1712,12 +1728,17 @@ fn seen_through(h: windows_sys::Win32::Foundation::HANDLE, start_time: u64) -> S
 /// refuses to signal it.
 #[cfg(windows)]
 fn foreign_is_alive(pid: u32, start_time: u64) -> bool {
+    matches!(foreign_seen(pid, start_time), Seen::Same | Seen::Unreadable)
+}
+
+/// What a query-only open of a process we hold no handle on shows.
+#[cfg(windows)]
+fn foreign_seen(pid: u32, start_time: u64) -> Seen {
     use std::os::windows::io::AsRawHandle;
-    let seen = match open_foreign(pid, false) {
+    match open_foreign(pid, false) {
         Ok(h) => seen_through(h.as_raw_handle(), start_time),
         Err(e) => seen_on_open_error(&e),
-    };
-    matches!(seen, Seen::Same | Seen::Unreadable)
+    }
 }
 
 /// Leftover from disk: opens the process and kills through that handle (`kill_through`).
@@ -1783,6 +1804,8 @@ mod tests {
         exes: BTreeMap<u32, PathBuf>,
         /// Pids `terminate` refuses to stop.
         stuck: Vec<u32>,
+        /// Pids whose identity cannot be read.
+        unreadable: Vec<u32>,
     }
     struct FakeStdin(Log, Arc<Mutex<bool>>, bool);
     impl Write for FakeStdin {
@@ -1810,6 +1833,7 @@ mod tests {
                 only: Vec::new(),
                 exes: BTreeMap::new(),
                 stuck: Vec::new(),
+                unreadable: Vec::new(),
             }
         }
         fn stdin(&self) -> Option<Box<dyn Write + Send>> {
@@ -1848,6 +1872,9 @@ mod tests {
                 return Err(io::Error::other("access denied"));
             }
             Ok(())
+        }
+        fn identity_readable(&self, pid: u32, _: u64) -> bool {
+            !self.unreadable.contains(&pid)
         }
         fn exe_of(&self, pid: u32) -> Option<PathBuf> {
             self.exes.get(&pid).cloned()
@@ -1892,8 +1919,7 @@ mod tests {
         assert_eq!(f.calls(), ["close_stdin", "is_alive", "reap 7"]);
     }
 
-    /// Matching exe, but `terminate` fails (the real one errors when the identity cannot be
-    /// read): the row stays on disk for the next start.
+    /// Matching exe, but `terminate` fails: the row stays on disk for the next start.
     #[test]
     fn a_leftover_that_cannot_be_stopped_keeps_its_row_on_disk() {
         let dir = temp_dir("keep");
@@ -1906,6 +1932,29 @@ mod tests {
         f.stuck = vec![10];
         assert_eq!(reap_leftovers(&f, &mut reg), 0);
         assert!(f.calls().contains(&"terminate 10".to_string()));
+        let kept: Vec<_> = Registry::load(&path).leftovers();
+        assert_eq!(kept.iter().map(|r| r.1).collect::<Vec<_>>(), vec![10]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Matching exe, identity unreadable: never terminated, and the row stays on disk (it is
+    /// not the refused-target case, which forgets it).
+    #[test]
+    fn a_leftover_with_an_unreadable_identity_keeps_its_row_on_disk() {
+        let dir = temp_dir("unreadable");
+        let path = dir.join("services.json");
+        let mut reg = Registry::load(&path);
+        reg.record("a", 10, 1, Path::new("/bin/a"));
+        let mut f = Fake::new(false, false);
+        f.only = vec![10];
+        f.exes.insert(10, "/bin/a".into());
+        f.unreadable = vec![10];
+        assert_eq!(reap_leftovers(&f, &mut reg), 0);
+        assert!(
+            !f.calls().iter().any(|c| c.starts_with("terminate")),
+            "{:?}",
+            f.calls()
+        );
         let kept: Vec<_> = Registry::load(&path).leftovers();
         assert_eq!(kept.iter().map(|r| r.1).collect::<Vec<_>>(), vec![10]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2299,15 +2348,6 @@ mod tests {
             seen_on_open_error(&io::Error::from_raw_os_error(5)),
             Seen::Unreadable
         );
-        // For real: pid 4 is the protected System process; opening it to terminate is
-        // denied (5), which is an error, never "gone".
-        // The exact code depends on the machine; what matters is an error that is not 87.
-        match kill_foreign(4, 123, true) {
-            Err(e) => assert_ne!(e.raw_os_error(), Some(87), "{e}"),
-            // This machine let us open it: nothing to check here (nothing was terminated:
-            // the start time differs), the classification above is the test.
-            Ok(()) => eprintln!("skipped: pid 4 opened with PROCESS_TERMINATE"),
-        }
     }
     /// Re-executed by the tests below; `echo` repeats stdin lines with a prefix, `sleep`
     /// ignores stdin, `tree` starts a `sleep` grandchild and reports both pids, `env` says
