@@ -137,7 +137,8 @@ unsafe fn others(dacl: *const ACL, trusted: &dyn Fn(PSID) -> bool, bits: u32, io
     seen
 }
 
-/// The SIDs, as text, that `dacl` grants any of `bits` to and `trusted` rejects.
+/// The SIDs, as text, that `dacl` grants any of `bits` to and `trusted` rejects; None when one
+/// of those grants cannot be named (no DACL, an unreadable entry, an object or callback one).
 ///
 /// # Safety
 /// `dacl` must be null or point to a valid ACL for the whole call.
@@ -146,22 +147,24 @@ unsafe fn writers(
     trusted: &dyn Fn(PSID) -> bool,
     bits: u32,
     io: bool,
-) -> Vec<String> {
-    let mut out = Vec::new();
+) -> Option<Vec<String>> {
     if dacl.is_null() {
-        return out;
+        return None;
     }
+    let (mut out, mut named) = (Vec::new(), true);
     let mut f = |s: Option<PSID>, mask: u32| {
-        if let Some(s) = s.filter(|_| mask & bits != 0)
-            && let Some(t) = sid_text(s)
-            && !out.contains(&t)
-        {
-            out.push(t);
+        if mask & bits == 0 {
+            return;
+        }
+        match s.and_then(sid_text) {
+            Some(t) if !out.contains(&t) => out.push(t),
+            Some(_) => {}
+            None => named = false,
         }
     };
     // SAFETY: a valid ACL (caller).
-    unsafe { foreign(dacl, trusted, io, &mut f) };
-    out
+    let read = unsafe { foreign(dacl, trusted, io, &mut f) };
+    (read && named).then_some(out)
 }
 
 /// `S-1-...` for a valid SID.
@@ -350,23 +353,19 @@ fn wide(p: &Path) -> Vec<u16> {
     p.as_os_str().encode_wide().chain([0]).collect()
 }
 
-/// The command, for the messages, that removes from `p` the entries of `sids` (inherited ones
-/// are made its own first); without SIDs to name, one that leaves only this user, SYSTEM and
-/// Administrators.
-fn fix(p: &Path, sids: &[String]) -> String {
-    if sids.is_empty() {
-        let me = token_info::<TOKEN_USER>(TokenUser)
-            // SAFETY: `token_info` checked the buffer holds a whole TOKEN_USER.
-            .and_then(|u| sid_text(unsafe { (*u.as_ptr().cast::<TOKEN_USER>()).User.Sid }))
-            .unwrap_or_default();
+/// What the messages tell to do about `p`: with every writer named (`sids`), the command that
+/// removes their entries (inherited ones are made its own first), which makes `p` pass; else no
+/// command, since none built from names would: the entries are to be removed by hand.
+fn fix(p: &Path, sids: Option<Vec<String>>) -> String {
+    let Some(sids) = sids else {
         return format!(
-            r#"icacls "{}" /inheritance:r /grant:r *{me}:(OI)(CI)F *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F"#,
+            r#"remove by hand every entry that lets another user change it; `icacls "{}"` lists them, and some cannot be named here"#,
             p.display()
         );
-    }
+    };
     let list: Vec<String> = sids.iter().map(|s| format!("*{s}")).collect();
     format!(
-        r#"icacls "{}" /inheritance:d /remove:g {}"#,
+        r#"run: icacls "{}" /inheritance:d /remove:g {}"#,
         p.display(),
         list.join(" ")
     )
@@ -385,13 +384,13 @@ pub fn check_private_dir(dir: &Path) -> io::Result<DirState> {
     }
     let t = Trust::get()?;
     let trusted = |s: PSID| t.trusted(s);
-    let changeable = |p: &Path, sids: Vec<String>| {
+    let changeable = |p: &Path, sids: Option<Vec<String>>| {
         deny(
             dir,
             &format!(
-                "sits in a folder other users can change: {} (check it, then run: {})",
+                "sits in a folder other users can change: {} (check it, then {})",
                 p.display(),
-                fix(p, &sids)
+                fix(p, sids)
             ),
         )
     };
@@ -455,8 +454,8 @@ pub fn check_private_dir(dir: &Path) -> io::Result<DirState> {
                 Others::Change => Err(deny(
                     dir,
                     &format!(
-                        "is writable by other users (check its files, then run: {})",
-                        fix(dir, &sids())
+                        "is writable by other users (check its files, then {})",
+                        fix(dir, sids())
                     ),
                 )),
                 Others::Read => Ok(DirState::OthersCanRead),
@@ -570,7 +569,8 @@ fn drop_writes(dir: &Path, t: &Trust) -> io::Result<()> {
 /// away: an existing folder that passes the check is left as it is (one others can change, a link
 /// or another owner's is an error and is left as found). A missing one, and each missing parent,
 /// is created with what it inherits, less any write access for others (`drop_writes`). Then the
-/// folder is checked again; on failure the folders created here are removed.
+/// folder is checked again; on failure the folders created here are removed, and any that
+/// cannot be is named in the error.
 pub fn create_private_dir(dir: &Path) -> io::Result<()> {
     if check_private_dir(dir)? != DirState::Missing {
         return Ok(());
@@ -598,13 +598,25 @@ pub fn create_private_dir(dir: &Path) -> io::Result<()> {
             _ => Ok(()),
         }
     };
-    let r = go();
-    if r.is_err() {
-        for d in made.iter().rev() {
-            let _ = std::fs::remove_dir(d);
-        }
+    let Err(e) = go() else {
+        return Ok(());
+    };
+    // A folder made here that cannot be removed is named, not left behind in silence.
+    let left: Vec<String> = made
+        .iter()
+        .rev()
+        .filter_map(|d| {
+            let r = std::fs::remove_dir(d);
+            r.err().map(|x| format!("{} ({x})", d.display()))
+        })
+        .collect();
+    if left.is_empty() {
+        return Err(e);
     }
-    r
+    Err(io::Error::new(
+        e.kind(),
+        format!("{e}; created here and not removed: {}", left.join(", ")),
+    ))
 }
 
 #[cfg(test)]
@@ -865,6 +877,79 @@ mod tests {
         std::fs::create_dir(p.join("c")).unwrap();
         run(&err_text(check_private_dir(&p.join("c"))));
         check_private_dir(&p.join("c")).unwrap();
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// Sets the descriptor of `p` from SDDL.
+    fn set_sddl(p: &Path, sddl: &str) {
+        use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+        use windows_sys::Win32::Security::SetFileSecurityW;
+        let text: Vec<u16> = sddl.encode_utf16().chain([0]).collect();
+        let mut sd = std::ptr::null_mut();
+        // SAFETY: NUL-terminated strings; `sd` is freed below.
+        unsafe {
+            let ok = ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                text.as_ptr(),
+                1,
+                &mut sd,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(ok, 0, "{sddl}: {}", io::Error::last_os_error());
+            let ok = SetFileSecurityW(wide(p).as_ptr(), DACL_SECURITY_INFORMATION, sd);
+            let err = io::Error::last_os_error();
+            LocalFree(sd);
+            assert_ne!(ok, 0, "{}: {err}", p.display());
+        }
+    }
+
+    /// A grant the check cannot name (a conditional entry for Everyone): no command is offered,
+    /// since one that names SIDs would leave it; any command offered must make the check pass.
+    #[test]
+    fn an_entry_that_cannot_be_named_gets_no_command() {
+        let b = base("unnamed");
+        let w = b.join("w");
+        create_private_dir(&w).unwrap();
+        set_sddl(
+            &w,
+            "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)\
+             (XA;OICI;0x1301bf;;;WD;(Member_of {SID(WD)}))",
+        );
+        let t = err_text(check_private_dir(&w));
+        if let Some(i) = t.find("run: ") {
+            use std::os::windows::process::CommandExt;
+            let cmd = &t[i + 5..t.rfind(')').unwrap()];
+            let out = Command::new("cmd").arg("/C").raw_arg(cmd).output().unwrap();
+            assert!(out.status.success(), "{cmd}: {out:?}");
+            let after = check_private_dir(&w);
+            assert!(
+                after.is_ok(),
+                "the suggested command left it refused: {after:?}"
+            );
+        }
+        assert!(t.contains("by hand"), "{t}");
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// A folder created here that cannot be removed after the refusal is named in the error.
+    #[test]
+    fn a_created_folder_left_behind_is_reported() {
+        let b = base("left");
+        let p = b.join("p");
+        create_private_dir(&p).unwrap();
+        // Others may add entries (refused), and this user may not delete what is created inside.
+        icacls(&p, &["/grant", "*S-1-1-0:(AD)"]);
+        let me = token_info::<TOKEN_USER>(TokenUser)
+            // SAFETY: `token_info` checked the buffer holds a whole TOKEN_USER.
+            .and_then(|u| sid_text(unsafe { (*u.as_ptr().cast::<TOKEN_USER>()).User.Sid }))
+            .unwrap();
+        icacls(&p, &["/deny", &format!("*{me}:(OI)(CI)(IO)(DE,DC)")]);
+        let t = create_private_dir(&p.join("x").join("y"))
+            .unwrap_err()
+            .to_string();
+        assert!(t.contains("other users can change"), "{t}");
+        assert!(p.join("x").join("y").exists(), "premise: the folder stayed");
+        assert!(t.contains("not removed") && t.contains("y"), "{t}");
+        icacls(&b, &["/reset", "/T"]);
         let _ = std::fs::remove_dir_all(&b);
     }
 
