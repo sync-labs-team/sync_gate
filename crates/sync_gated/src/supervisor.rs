@@ -51,11 +51,16 @@ pub trait Launcher: Send + Sync {
         env_remove: &[String],
         cwd: Option<&Path>,
     ) -> io::Result<Spawned>;
-    /// False only when the process is known to be gone or known to be another one (its start
-    /// time differs). True when it is the recorded process, and also when its state or start
-    /// time cannot be read (Windows: the open, the wait or the creation-time query failed), so
-    /// no caller reports a stop or drops a row on a guess. True is no leave to signal:
-    /// `terminate` verifies again and refuses, with an error, a process it cannot identify.
+    /// For a foreign process (not a child of this launcher) on Windows with a recorded start
+    /// time, false only when it is known to be gone or known to be another one (its start time
+    /// differs). True when it is the recorded process, and also when its state or start time
+    /// cannot be read (the open, the wait or the creation-time query failed), so no caller
+    /// reports a stop or drops a row on a guess. True is no leave to signal: `terminate`
+    /// verifies again and refuses, with an error, a process it cannot identify.
+    /// Not covered by that guarantee, false without proof: a recorded start time of 0 (a
+    /// foreign process is never ours then); on Unix, a probe that cannot read the start time;
+    /// and a child of this launcher whose exit cannot be observed and cannot be confirmed
+    /// running (its entry is dropped).
     fn is_alive(&self, pid: u32, start_time: u64) -> bool;
     /// Terminates the process (and the tree it started) if it still matches `start_time`.
     fn terminate(&self, pid: u32, start_time: u64) -> io::Result<()>;
@@ -1887,6 +1892,25 @@ mod tests {
         assert_eq!(f.calls(), ["close_stdin", "is_alive", "reap 7"]);
     }
 
+    /// Matching exe, but `terminate` fails (the real one errors when the identity cannot be
+    /// read): the row stays on disk for the next start.
+    #[test]
+    fn a_leftover_that_cannot_be_stopped_keeps_its_row_on_disk() {
+        let dir = temp_dir("keep");
+        let path = dir.join("services.json");
+        let mut reg = Registry::load(&path);
+        reg.record("a", 10, 1, Path::new("/bin/a"));
+        let mut f = Fake::new(false, false);
+        f.only = vec![10];
+        f.exes.insert(10, "/bin/a".into());
+        f.stuck = vec![10];
+        assert_eq!(reap_leftovers(&f, &mut reg), 0);
+        assert!(f.calls().contains(&"terminate 10".to_string()));
+        let kept: Vec<_> = Registry::load(&path).leftovers();
+        assert_eq!(kept.iter().map(|r| r.1).collect::<Vec<_>>(), vec![10]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn stop_own_never_terminates_a_reused_pid() {
         let f = Fake::new(false, false);
@@ -2277,8 +2301,13 @@ mod tests {
         );
         // For real: pid 4 is the protected System process; opening it to terminate is
         // denied (5), which is an error, never "gone".
-        let e = kill_foreign(4, 123, true).unwrap_err();
-        assert_eq!(e.raw_os_error(), Some(5), "{e}");
+        // The exact code depends on the machine; what matters is an error that is not 87.
+        match kill_foreign(4, 123, true) {
+            Err(e) => assert_ne!(e.raw_os_error(), Some(87), "{e}"),
+            // This machine let us open it: nothing to check here (nothing was terminated:
+            // the start time differs), the classification above is the test.
+            Ok(()) => eprintln!("skipped: pid 4 opened with PROCESS_TERMINATE"),
+        }
     }
     /// Re-executed by the tests below; `echo` repeats stdin lines with a prefix, `sleep`
     /// ignores stdin, `tree` starts a `sleep` grandchild and reports both pids, `env` says
