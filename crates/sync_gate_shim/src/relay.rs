@@ -534,7 +534,10 @@ impl Session<'_> {
         if let Some((id, line)) = self.initialize.clone() {
             // Still unanswered: the replay is the client's own request and its reply is forwarded.
             self.replay_is_client = self.flight.contains(&id);
-            self.replay = Some((id, Instant::now() + self.options.replay_timeout));
+            // The deadline the hub gives a child's `initialize`: the server's request timeout
+            // (a server that starts slowly, like a first `npx` download, gets the same room).
+            let deadline = Duration::from_secs(self.srv.request_timeout_secs);
+            self.replay = Some((id, Instant::now() + deadline));
             if !self.send(line) {
                 return Err(1);
             }

@@ -221,6 +221,16 @@ it ends it. A change to an existing section takes effect when the daemon restart
 stop_grace_secs = 15
 ```
 
+**Hub limits.** Fixed values, measured on a Windows desktop (numbers in the pull request that set
+them). When a limit cuts a session, its relay runs the server itself, as when the hub is down.
+
+- **Connections.** The hub accepts 256 connections at once, one per session and shared server.
+  One more is closed before anything is read from it.
+- **Replay deadline.** A relay that loses the hub replays the session's `initialize` to the server
+  it starts and waits up to the server's `request_timeout_secs` (default 300) for the answer: the
+  same time the hub gives a server's own `initialize`, so a server that starts slowly (a first
+  `npx` download, say) still comes up.
+
 ## Limits
 
 - **Windows `PATH` order.** The machine `PATH` comes before the user `PATH`. A program installed

@@ -6,7 +6,7 @@ use interprocess::local_socket::{Listener, ListenerOptions, Stream, prelude::*};
 use interprocess::os::windows::security_descriptor::SecurityDescriptor;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -312,7 +312,9 @@ pub fn serve(
     name: &str,
     handler: impl Fn(Request) -> Response + Send + Sync + 'static,
 ) -> io::Result<ServerHandle> {
-    listen(name, None, PEER_CHECK, move |conn| handle(conn, &handler))
+    listen(name, None, PEER_CHECK, None, move |conn, _| {
+        handle(conn, &handler)
+    })
 }
 
 /// Forcibly ends one connection from any thread: blocked reads and writes on it return, and
@@ -333,24 +335,77 @@ pub fn serve_stream(
     name: &str,
     on_conn: impl Fn(Box<dyn Read + Send>, Box<dyn Write + Send>, Closer) + Send + Sync + 'static,
 ) -> io::Result<ServerHandle> {
-    serve_stream_with(name, PEER_CHECK, on_conn)
+    serve_stream_with(name, PEER_CHECK, HUB_MAX_CONNECTIONS, on_conn)
 }
 
-/// [`serve_stream`] with the accept-loop check injectable (a test makes it refuse).
+/// Live connections the hub socket holds; one more is dropped unread.
+pub const HUB_MAX_CONNECTIONS: usize = 256;
+
+/// [`serve_stream`] with the accept-loop check (a test makes it refuse) and the connection cap
+/// injectable.
 fn serve_stream_with(
     name: &str,
     allowed: fn(&Stream) -> bool,
+    max: usize,
     on_conn: impl Fn(Box<dyn Read + Send>, Box<dyn Write + Send>, Closer) + Send + Sync + 'static,
 ) -> io::Result<ServerHandle> {
-    listen(name, Some(PARSE_THREAD_STACK), allowed, move |conn| {
-        let conn = Arc::new(conn);
-        let close = closer(&conn);
-        on_conn(
-            Box::new(Shared(conn.clone())),
-            Box::new(Shared(conn)),
-            close,
-        )
-    })
+    let live = Arc::new(AtomicUsize::new(0));
+    let full = std::sync::Mutex::new(None);
+    let admit: Admit = Arc::new(move || {
+        let slot = Slot(live.clone());
+        if slot.0.fetch_add(1, Ordering::SeqCst) >= max {
+            once_a_minute(
+                &full,
+                "sync_gated: hub connection limit reached; new connections are dropped",
+            );
+            return None;
+        }
+        Some(Box::new(slot))
+    });
+    listen(
+        name,
+        Some(PARSE_THREAD_STACK),
+        allowed,
+        Some(admit),
+        move |conn, permit| {
+            let conn = Arc::new(conn);
+            let close = closer(&conn);
+            // The hub keeps both halves after this returns: the slot frees when both are gone.
+            let permit = Arc::new(permit);
+            on_conn(
+                Box::new(Held(Shared(conn.clone()), permit.clone())),
+                Box::new(Held(Shared(conn), permit)),
+                close,
+            )
+        },
+    )
+}
+
+/// One live connection of a capped listener, given back on every exit path.
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A hub connection half that holds the connection's slot.
+struct Held(Shared, #[allow(dead_code)] Arc<Option<Permit>>);
+
+impl Read for Held {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Write for Held {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
 }
 
 /// One stream shared by its reader and writer halves (`&Stream` is `Read + Write`).
@@ -408,7 +463,8 @@ fn listen(
     name: &str,
     stack: Option<usize>,
     allowed: fn(&Stream) -> bool,
-    on_conn: impl Fn(Stream) + Send + Sync + 'static,
+    admit: Option<Admit>,
+    on_conn: impl Fn(Stream, Option<Permit>) + Send + Sync + 'static,
 ) -> io::Result<ServerHandle> {
     #[cfg(unix)]
     let (keep, listener) = {
@@ -418,14 +474,15 @@ fn listen(
     #[cfg(windows)]
     let (keep, listener) = ((), bind(name, owner_only_descriptor()?)?);
     Ok(accept_loop(
-        name, listener, keep, stack, allowed, None, on_conn,
+        name, listener, keep, stack, allowed, admit, on_conn,
     ))
 }
 
 /// Reserves a connection slot in the accept thread, before any worker exists: `None` = full, the
-/// connection is dropped unread. The returned guard lives as long as the worker (or until the
-/// spawn fails) and gives the slot back.
-type Admit = Arc<dyn Fn() -> Option<Box<dyn Send>> + Send + Sync>;
+/// connection is dropped unread. The returned guard goes to the worker's `on_conn` (it is dropped
+/// with the closure if the spawn fails) and gives the slot back when dropped.
+type Admit = Arc<dyn Fn() -> Option<Permit> + Send + Sync>;
+type Permit = Box<dyn Send + Sync>;
 
 /// The accept loop of a bound listener; `keep` lives as long as the loop.
 fn accept_loop(
@@ -435,9 +492,9 @@ fn accept_loop(
     stack: Option<usize>,
     allowed: fn(&Stream) -> bool,
     admit: Option<Admit>,
-    on_conn: impl Fn(Stream) + Send + Sync + 'static,
+    on_conn: impl Fn(Stream, Option<Permit>) + Send + Sync + 'static,
 ) -> ServerHandle {
-    let on_conn: Arc<dyn Fn(Stream) + Send + Sync> = Arc::new(on_conn);
+    let on_conn: Arc<dyn Fn(Stream, Option<Permit>) + Send + Sync> = Arc::new(on_conn);
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
     let accept = thread::spawn(move || {
@@ -466,10 +523,7 @@ fn accept_loop(
                         thread::Builder::new().stack_size(s)
                     });
                     // On a failed spawn the closure, and with it the permit, is dropped.
-                    if let Err(e) = b.spawn(move || {
-                        let _permit = permit;
-                        h(conn)
-                    }) {
+                    if let Err(e) = b.spawn(move || h(conn, permit)) {
                         let line = format!("sync_gated: cannot start a connection thread: {e}");
                         if admit.is_some() {
                             once_a_minute(&spawn_failed, &line);
@@ -630,14 +684,6 @@ fn serve_guest_with(
 ) -> io::Result<ServerHandle> {
     use crate::guest::GUEST_MAX_CONNECTIONS;
     use std::sync::Mutex;
-    use std::sync::atomic::AtomicUsize;
-    /// One live connection, given back on every exit path.
-    struct Slot(Arc<AtomicUsize>);
-    impl Drop for Slot {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
     let user = user_sid()?;
     let listener = bind(name, guest_descriptor(&user, &user, ace_sid)?)?;
     let live = Arc::new(AtomicUsize::new(0));
@@ -663,7 +709,8 @@ fn serve_guest_with(
         None,
         PEER_CHECK,
         Some(admit),
-        move |conn| {
+        // The slot is held until this returns.
+        move |conn, _permit| {
             #[cfg(test)]
             workers_entered(&worker_name, true);
             let conn = Arc::new(conn);
@@ -725,7 +772,7 @@ mod tests {
         let tx = std::sync::Mutex::new(tx);
         // The handler reads the connection's first byte before it lets go of the stream, so the
         // client's write cannot race a drop, and reports what it read: served == one byte seen.
-        let server = serve_stream_with(&name, first_refused, move |mut r, _w, _close| {
+        let server = serve_stream_with(&name, first_refused, 8, move |mut r, _w, _close| {
             let mut b = [0u8; 1];
             if r.read_exact(&mut b).is_ok() {
                 let _ = tx.lock().unwrap().send(b[0]);
@@ -753,6 +800,55 @@ mod tests {
         );
         assert!(rx.try_recv().is_err(), "handler ran more than once");
         assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+        server.shutdown();
+    }
+
+    /// Issue #2, item 14: the hub socket holds at most `max` live connections; one more is
+    /// dropped unread (its handler never runs). A slot is held while the connection's reader or
+    /// writer lives, not just its thread: the hub keeps both after the handler returns.
+    #[test]
+    fn connections_over_the_hub_limit_are_dropped_unread() {
+        type Halves = (Box<dyn Read + Send>, Box<dyn Write + Send>);
+        let tag = format!("sync_gate-test-{}-hub-cap", std::process::id());
+        let name = if cfg!(windows) {
+            tag
+        } else {
+            std::env::temp_dir()
+                .join(tag)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let (tx, held) = mpsc::channel::<Halves>();
+        let tx = std::sync::Mutex::new(tx);
+        // Like the hub: the handler hands both halves on and returns at once.
+        let server = serve_stream_with(&name, PEER_CHECK, 2, move |r, w, _close| {
+            let _ = tx.lock().unwrap().send((r, w));
+        })
+        .unwrap();
+        let wait = Duration::from_secs(5);
+        let _a = Stream::connect(to_name(&name).unwrap()).unwrap();
+        let first = held.recv_timeout(wait).expect("first connection served");
+        let _b = Stream::connect(to_name(&name).unwrap()).unwrap();
+        let _second = held.recv_timeout(wait).expect("second connection served");
+        let mut over = Stream::connect(to_name(&name).unwrap()).unwrap();
+        let (done, read) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = done.send(over.read(&mut [0u8; 1]));
+        });
+        // Dropped: end of file or an error. Served, its halves would be held open: a timeout.
+        assert!(
+            matches!(read.recv_timeout(wait), Ok(Ok(0) | Err(_))),
+            "the connection over the cap was not dropped"
+        );
+        assert!(held.try_recv().is_err(), "the handler ran over the cap");
+        // Both halves of one connection go: its slot frees and the next one is served.
+        drop(first);
+        let mut next = Stream::connect(to_name(&name).unwrap()).unwrap();
+        next.write_all(b"x").unwrap();
+        let (mut r, _w) = held.recv_timeout(wait).expect("a freed slot serves again");
+        let mut b = [0u8; 1];
+        r.read_exact(&mut b).unwrap();
+        assert_eq!(&b, b"x");
         server.shutdown();
     }
 

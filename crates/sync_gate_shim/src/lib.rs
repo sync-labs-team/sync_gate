@@ -28,7 +28,6 @@ pub(crate) type Writer = Box<dyn Write + Send>;
 
 /// Longest the relay waits for the hub's answer to its hello before starting the server itself.
 const HELLO_DEADLINE: Duration = Duration::from_secs(2);
-const REPLAY_DEADLINE: Duration = Duration::from_secs(10);
 const EXIT_GRACE: Duration = Duration::from_secs(5);
 const BUF: usize = 16 * 1024;
 
@@ -36,7 +35,6 @@ const BUF: usize = 16 * 1024;
 #[derive(Clone)]
 pub struct RunOptions {
     pub hello_timeout: Duration,
-    pub replay_timeout: Duration,
     pub exit_grace: Duration,
     pub write_timeout: Duration,
     pub shutdown: Shutdown,
@@ -53,7 +51,6 @@ impl Default for RunOptions {
     fn default() -> Self {
         Self {
             hello_timeout: HELLO_DEADLINE,
-            replay_timeout: REPLAY_DEADLINE,
             exit_grace: EXIT_GRACE,
             write_timeout: Duration::from_secs(10),
             shutdown: Shutdown::default(),
