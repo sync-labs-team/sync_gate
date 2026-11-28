@@ -27,7 +27,8 @@ pub use cost::{CostModel, Estimate, MIB, PRIOR_HEAVY, PRIOR_LIGHT};
 pub use jsonrpc::{Kind, classify, error_response, result_response};
 pub use pressure::{JobSample, Verdict, analyze, under_pressure};
 pub use private_dir::{
-    DirState, check_private_dir, check_private_file, is_refusal, open_private_file, refusal,
+    DirState, check_private_dir, check_private_file, is_in_use, is_refusal, open_private_file,
+    refusal,
 };
 pub use program::{SHIMS_MANIFEST, find_program, find_ps1, resolve_in_env, resolve_program};
 pub use protocol::{

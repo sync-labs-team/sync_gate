@@ -1493,6 +1493,63 @@ fn requeue_busy_runs_the_command_once() {
     assert!(env.pending_files().is_empty(), "{:?}", env.pending_files());
 }
 
+/// Windows: another `wait N` renewing the stored command holds it open for writing, and the check
+/// before the marker cannot share that. A brief hold is waited out; a lasting one is Busy (exit 1),
+/// never "run the original command again" (the other wait runs it).
+#[cfg(windows)]
+#[test]
+fn wait_meeting_a_renewal_in_progress_is_busy_not_run_again() {
+    let env = Env::new();
+    let fake = busy_fake(&env, true);
+    let out = Proc::spawn(counting_run(&env, &count_command())).finish();
+    assert_eq!(out.code, 75, "{}", out.stderr);
+    let pending = env.data_dir().join("pending").join("7.json");
+    let hold = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&pending)
+            .unwrap()
+    };
+    let wait = || {
+        let mut c = env.cli(&["wait", "7"], None);
+        c.current_dir(&env.dir);
+        Proc::spawn(c).finish()
+    };
+    // Held for the whole wait: Busy, nothing run, the stored command kept.
+    let held = hold();
+    let out = wait();
+    drop(held);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(
+        out.stderr
+            .contains("is being run or expired by another process right now"),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("run the original command again"),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(count_lines(&env), 0);
+    assert!(env.pending_files().iter().any(|p| p.ends_with("7.json")));
+    // Held for 200 ms: waited out, the wait goes on to the queue (the fake forgot the ticket).
+    fake.phase.store(2, Ordering::SeqCst);
+    let held = hold();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        drop(held);
+    });
+    let out = wait();
+    release.join().unwrap();
+    fake.server.shutdown();
+    assert!(
+        out.stderr.contains("cannot queue ticket 7 again"),
+        "{}",
+        out.stderr
+    );
+}
+
 /// Windows: a `.cmd` shim on `PATH` (as `npm.cmd` is) runs by its bare name, with its arguments.
 #[cfg(windows)]
 #[test]

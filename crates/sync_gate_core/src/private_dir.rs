@@ -59,6 +59,31 @@ pub fn is_refusal(e: &io::Error) -> bool {
     e.get_ref().is_some_and(|i| i.is::<Refused>())
 }
 
+/// Windows: the file is open for writing elsewhere (sharing violation), told apart by `is_in_use`
+/// (the rewritten message drops the OS error code).
+#[derive(Debug)]
+#[cfg_attr(not(windows), allow(dead_code))]
+struct InUse(String);
+
+impl std::fmt::Display for InUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InUse {}
+
+#[cfg(windows)]
+fn in_use(kind: io::ErrorKind, msg: String) -> io::Error {
+    io::Error::new(kind, InUse(msg))
+}
+
+/// True when `open_private_file` failed only because another program holds the file open for
+/// writing (Windows sharing violation), which may pass on a retry.
+pub fn is_in_use(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(32) || e.get_ref().is_some_and(|i| i.is::<InUse>())
+}
+
 fn deny(path: &Path, why: &str) -> io::Error {
     refusal(
         io::ErrorKind::PermissionDenied,
