@@ -117,6 +117,28 @@ fn inherit_cwd_splits_by_directory() {
     hub.shutdown();
 }
 
+// #2 item 20: a relay that could not read its folder sends an empty one; a relative folder
+// would be read from the daemon's, so an `inherit` server runs in that session instead.
+#[test]
+fn a_relative_hello_cwd_runs_an_inherit_server_per_session() {
+    let l = Arc::new(FakeLauncher::default());
+    let hub = hub(&l);
+    for cwd in ["", "rel/a"] {
+        let c = connect(&hub, hello("files", &[], cwd));
+        assert_eq!(c.reply(), HubReply::PerSession, "{cwd:?}");
+    }
+    assert_eq!(l.spawns(), 0);
+    assert!(notes_contain(
+        &hub,
+        &mut Vec::new(),
+        "files: the session sent no absolute folder"
+    ));
+    // A server that does not inherit ignores the folder.
+    let d = connect(&hub, hello("docs", &[], ""));
+    assert_eq!(d.reply(), HubReply::Ok);
+    hub.shutdown();
+}
+
 #[test]
 fn child_crash_restarts_and_clients_keep_working() {
     let l = Arc::new(FakeLauncher::default());

@@ -584,6 +584,15 @@ impl Hub {
         if srv.mode == McpMode::PerSession {
             return refuse(w, HubReply::PerSession);
         }
+        // A relay sends `current_dir`, empty when it could not read it; a folder without a root
+        // would be read from the daemon's, so that session runs the server in its own.
+        if srv.inherits_cwd() && !hello.cwd.has_root() {
+            inner.note(format!(
+                "mcp {}: the session sent no absolute folder; that session runs it itself",
+                hello.server
+            ));
+            return refuse(w, HubReply::PerSession);
+        }
         let mut key = Key {
             server: hello.server.clone(),
             env: srv

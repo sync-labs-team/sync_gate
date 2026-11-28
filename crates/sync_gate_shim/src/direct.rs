@@ -78,7 +78,7 @@ pub(crate) fn program_of(srv: &McpServer) -> Option<std::path::PathBuf> {
     )
 }
 
-/// Where the server runs: its fixed `cwd` (a relative one from ours), else ours.
+/// Where the server runs: its fixed `cwd` (absolute, the config refuses others), else ours.
 fn server_dir(srv: &McpServer) -> std::path::PathBuf {
     let ours = std::env::current_dir().unwrap_or_default();
     match srv.cwd.as_deref().filter(|d| *d != "inherit") {
