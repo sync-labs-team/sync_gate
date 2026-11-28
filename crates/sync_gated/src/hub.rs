@@ -72,6 +72,10 @@ pub const CLIENT_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 pub const CHILD_QUEUE_MESSAGES: usize = 1024;
 /// Bytes queued for a child's stdin (an empty queue always takes one message of any size).
 pub const CHILD_QUEUE_BYTES: usize = 32 * 1024 * 1024;
+/// Bytes every outgoing queue of the hub (to clients and to children) holds together. Past it,
+/// a queue holding more than its share (the budget over the live queues) is full; an empty
+/// queue still takes one message.
+pub const QUEUE_BUDGET: usize = 256 * 1024 * 1024;
 /// Longest `HubHello` line.
 pub const MAX_HELLO_BYTES: usize = 1024 * 1024;
 /// A connection that has not sent its hello by then is closed (at the next tick).
@@ -118,38 +122,101 @@ struct Key {
     program: Option<PathBuf>,
 }
 
+/// What every queue of the hub holds together, against its `max`.
+struct Budget {
+    bytes: AtomicUsize,
+    /// Live queues: the budget's share of each one is `max / queues`.
+    queues: AtomicUsize,
+    max: usize,
+}
+
+impl Budget {
+    fn new(max: usize) -> Arc<Budget> {
+        Arc::new(Budget {
+            bytes: AtomicUsize::new(0),
+            queues: AtomicUsize::new(0),
+            max,
+        })
+    }
+}
+
+/// One queue's bytes, queued and not written yet. Dropped once its queue and its writer are both
+/// gone: then nothing can push or write, and what was never written leaves the budget.
+struct Gauge {
+    bytes: AtomicUsize,
+    budget: Arc<Budget>,
+}
+
+impl Drop for Gauge {
+    fn drop(&mut self) {
+        let left = *self.bytes.get_mut();
+        self.budget.bytes.fetch_sub(left, Ordering::SeqCst);
+        self.budget.queues.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Why a queue did not take a message.
+#[derive(Clone, Copy)]
+enum Spill {
+    /// Its own bound, or its writer is gone.
+    Full,
+    /// The hub's `QUEUE_BUDGET`.
+    Budget,
+}
+
 /// Sending end of a bounded outgoing queue drained by one writer thread.
 struct Queue {
     tx: SyncSender<Vec<u8>>,
-    bytes: Arc<AtomicUsize>,
+    gauge: Arc<Gauge>,
     max_bytes: usize,
 }
 
 impl Queue {
-    fn new(messages: usize, max_bytes: usize) -> (Queue, Receiver<Vec<u8>>, Arc<AtomicUsize>) {
+    fn new(
+        messages: usize,
+        max_bytes: usize,
+        budget: &Arc<Budget>,
+    ) -> (Queue, Receiver<Vec<u8>>, Arc<Gauge>) {
         let (tx, rx) = mpsc::sync_channel(messages);
-        let bytes = Arc::new(AtomicUsize::new(0));
+        budget.queues.fetch_add(1, Ordering::SeqCst);
+        let gauge = Arc::new(Gauge {
+            bytes: AtomicUsize::new(0),
+            budget: budget.clone(),
+        });
         let q = Queue {
             tx,
-            bytes: bytes.clone(),
+            gauge: gauge.clone(),
             max_bytes,
         };
-        (q, rx, bytes)
+        (q, rx, gauge)
     }
 
-    /// Never blocks; false when the queue is full or its writer is gone.
-    fn push(&self, line: Vec<u8>) -> bool {
+    /// Never blocks.
+    fn push(&self, line: Vec<u8>) -> Result<(), Spill> {
         let n = line.len();
-        let queued = self.bytes.load(Ordering::SeqCst);
+        let g = &self.gauge;
+        let queued = g.bytes.load(Ordering::SeqCst);
         if queued > 0 && queued.saturating_add(n) > self.max_bytes {
-            return false;
+            return Err(Spill::Full);
         }
-        self.bytes.fetch_add(n, Ordering::SeqCst);
+        // Over the budget, only a queue past its share is refused: the one that fills it (a
+        // client that stopped reading), not one that keeps up and holds a message or two.
+        let b = &g.budget;
+        let share = b.max / b.queues.load(Ordering::SeqCst).max(1);
+        if queued > 0
+            && b.bytes.load(Ordering::SeqCst).saturating_add(n) > b.max
+            && queued.saturating_add(n) > share
+        {
+            return Err(Spill::Budget);
+        }
+        g.bytes.fetch_add(n, Ordering::SeqCst);
+        g.budget.bytes.fetch_add(n, Ordering::SeqCst);
         if self.tx.try_send(line).is_err() {
-            self.bytes.fetch_sub(n, Ordering::SeqCst);
-            return false;
+            g.bytes.fetch_sub(n, Ordering::SeqCst);
+            g.budget.bytes.fetch_sub(n, Ordering::SeqCst);
+            return Err(Spill::Full);
         }
-        true
+        Ok(())
     }
 }
 
@@ -158,12 +225,13 @@ impl Queue {
 /// and on a Windows named pipe `flush` is `FlushFileBuffers`, which waits for the peer to read
 /// everything (a stuck client would pin this thread there, and every message would wait for
 /// the relay). Dropped unflushed, a pipe goes to interprocess's "limbo" (flush, then close).
-fn drain(rx: Receiver<Vec<u8>>, bytes: Arc<AtomicUsize>, mut w: Box<dyn Write + Send>) {
+fn drain(rx: Receiver<Vec<u8>>, gauge: Arc<Gauge>, mut w: Box<dyn Write + Send>) {
     for mut line in rx {
         let n = line.len();
         line.push(b'\n');
         let r = w.write_all(&line);
-        bytes.fetch_sub(n, Ordering::SeqCst);
+        gauge.bytes.fetch_sub(n, Ordering::SeqCst);
+        gauge.budget.bytes.fetch_sub(n, Ordering::SeqCst);
         if r.is_err() {
             return;
         }
@@ -288,6 +356,8 @@ struct Inner {
     poisonings_seen: AtomicU64,
     /// Free and reserve bytes from the daemon's last snapshot; `None`: the pool does not grow.
     memory: Mutex<Option<(u64, u64)>>,
+    /// Shared by every outgoing queue (`QUEUE_BUDGET`).
+    budget: Arc<Budget>,
 }
 
 pub struct Hub {
@@ -498,8 +568,23 @@ impl Hub {
                 grace_override: None,
                 poisonings_seen: AtomicU64::new(poisonings()),
                 memory: Mutex::new(None),
+                budget: Budget::new(QUEUE_BUDGET),
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_queue_budget(mut self, max: usize) -> Hub {
+        Arc::get_mut(&mut self.inner)
+            .expect("set before the hub is shared")
+            .budget = Budget::new(max);
+        self
+    }
+
+    /// Bytes the hub's queues hold now.
+    #[cfg(test)]
+    pub(crate) fn queued_bytes(&self) -> usize {
+        self.inner.budget.bytes.load(Ordering::SeqCst)
     }
 
     #[cfg(test)]
@@ -650,8 +735,9 @@ impl Hub {
             key.program = q;
         }
         drop(hello);
-        let (q, rx, bytes) = Queue::new(CLIENT_QUEUE_MESSAGES, CLIENT_QUEUE_BYTES);
-        q.push(serde_json::to_vec(&HubReply::Ok).unwrap_or_default());
+        let (q, rx, gauge) = Queue::new(CLIENT_QUEUE_MESSAGES, CLIENT_QUEUE_BYTES, &inner.budget);
+        // An empty queue always takes one message.
+        let _ = q.push(serde_json::to_vec(&HubReply::Ok).unwrap_or_default());
         let (inst, id, starts) = {
             let mut map = lock(&inner.map);
             if inner.stopped.load(Ordering::SeqCst) {
@@ -697,7 +783,7 @@ impl Hub {
         let threads = {
             let (inner2, inst2, close2) = (inner.clone(), inst.clone(), close.clone());
             spawn_parsing(move || {
-                drain(rx, bytes, w);
+                drain(rx, gauge, w);
                 inner2.drop_client(&inst2, id, Instant::now());
                 close2();
             })
@@ -1153,29 +1239,28 @@ impl Inner {
             match out {
                 Out::ToChild(line) => {
                     if let Some(Child::Running(run)) = g.units.get_mut(i).map(|u| &mut u.child)
-                        && !run.stdin.push(line.into_bytes())
+                        && let Err(spill) = run.stdin.push(line.into_bytes())
                         && !run.full_noted
                     {
                         run.full_noted = true;
-                        self.note(format!(
-                            "mcp {server}: child input queue full; messages dropped"
-                        ));
+                        let why = match spill {
+                            Spill::Full => "child input queue full",
+                            Spill::Budget => "hub queue budget spent",
+                        };
+                        self.note(format!("mcp {server}: {why}; messages dropped"));
                     }
                 }
                 Out::ToClient(c, line) => {
-                    let full = g
+                    let spill = g
                         .clients
                         .get(&c)
-                        .is_some_and(|p| !p.q.push(line.into_bytes()));
-                    if let Some(p) = full.then(|| g.clients.remove(&c)).flatten() {
-                        (p.close)();
-                        self.note(format!(
-                            "mcp {server}: client disconnected (output queue full)"
-                        ));
-                        g.queue.retain(|w| w.client != c);
-                        for (j, u) in g.units.iter_mut().enumerate() {
-                            work.extend(u.mux.client_detached(c).into_iter().map(|o| (j, o)));
-                        }
+                        .and_then(|p| p.q.push(line.into_bytes()).err());
+                    if let Some(spill) = spill {
+                        let why = match spill {
+                            Spill::Full => "output queue full",
+                            Spill::Budget => "hub queue budget spent",
+                        };
+                        work.extend(self.cut(server, g, c, why));
                     }
                 }
                 Out::Note(n) => self.note(mux_note(server, &n)),
@@ -1184,6 +1269,22 @@ impl Inner {
         if g.clients.is_empty() && g.idle_since.is_none() {
             g.idle_since = Some(now);
         }
+    }
+
+    /// Disconnects client `c` of the key: closes it, drops its queued requests and detaches it
+    /// from every unit. Returns what the detaches produce, by unit.
+    fn cut(&self, server: &str, g: &mut Inst, c: ClientId, why: &str) -> Vec<(usize, Out)> {
+        let Some(p) = g.clients.remove(&c) else {
+            return Vec::new();
+        };
+        (p.close)();
+        self.note(format!("mcp {server}: client disconnected ({why})"));
+        g.queue.retain(|w| w.client != c);
+        let mut outs = Vec::new();
+        for (j, u) in g.units.iter_mut().enumerate() {
+            outs.extend(u.mux.client_detached(c).into_iter().map(|o| (j, o)));
+        }
+        outs
     }
 
     /// After any mux event: a child a mux gave up on is taken out (to be stopped by the
@@ -1356,7 +1457,7 @@ impl Inner {
             lock(reg).record(server, pid, start_time, &exe, launch);
         }
         let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
-        let (q, rx, bytes) = Queue::new(CHILD_QUEUE_MESSAGES, CHILD_QUEUE_BYTES);
+        let (q, rx, gauge) = Queue::new(CHILD_QUEUE_MESSAGES, CHILD_QUEUE_BYTES, &self.budget);
         let run = Run {
             pid,
             start_time,
@@ -1383,7 +1484,7 @@ impl Inner {
             }
         };
         // Threads start under the lock so the reader cannot see the child before it is Running.
-        let threads = spawn_parsing(move || drain(rx, bytes, stdin)).and_then(|()| {
+        let threads = spawn_parsing(move || drain(rx, gauge, stdin)).and_then(|()| {
             let (me, inst2) = (self.clone(), inst.clone());
             spawn_parsing(move || me.child_reader(&inst2, generation, stdout))
         });

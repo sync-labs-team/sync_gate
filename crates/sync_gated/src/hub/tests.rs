@@ -353,7 +353,74 @@ fn slow_client_is_disconnected_without_stalling_others() {
     hub.shutdown();
 }
 
-/// Review F08 (r5): the hub stops a child and forgets its registry row by the launch id the
+/// Issue #2, item 1: every outgoing queue of the hub counts against one budget. Past it, a queue
+/// holding more than its share is full: the clients that stopped reading are cut, the one that
+/// keeps reading is not, and what the cut ones held leaves the budget.
+#[test]
+fn queues_stop_at_the_global_budget() {
+    const BUDGET: usize = 64 * 1024;
+    let l = Arc::new(FakeLauncher::default());
+    let hub = hub(&l).with_queue_budget(BUDGET);
+    let mut fast = connect(&hub, hello("docs", &[], "/r"));
+    let mut slow: Vec<TestClient> = (0..2)
+        .map(|_| connect_stuck(&hub, hello("docs", &[], "/r")))
+        .collect();
+    assert_eq!(fast.reply(), HubReply::Ok);
+    let mut child = l.take_child();
+    child.handshake();
+    let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+    fast.send(init.clone());
+    for s in &mut slow {
+        s.send(init.clone());
+    }
+    assert_eq!(fast.recv()["id"], 1);
+    wait_until("the slow clients' handshakes", || {
+        slow.iter().all(|s| s.unread() == STUCK_PIPE_BYTES)
+    });
+    // 1 KiB broadcasts in batches the fast client reads before the next one: its queue never
+    // holds more than a few, far below its share (a quarter of the budget).
+    let pad = "x".repeat(1024);
+    let changed = json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed", "params": {"pad": pad}});
+    let mut sent = 0;
+    while !slow.iter().all(|s| s.closed.load(Ordering::SeqCst)) {
+        // Without the budget, each slow queue fills its own 256 messages first.
+        assert!(
+            sent < CLIENT_QUEUE_MESSAGES,
+            "the budget never cut the slow clients"
+        );
+        for _ in 0..4 {
+            child.send(changed.clone());
+        }
+        for _ in 0..4 {
+            assert_eq!(fast.recv()["method"], "notifications/tools/list_changed");
+        }
+        sent += 4;
+    }
+    wait_until("the slow clients to be detached", || {
+        docs(&hub).clients == 1
+    });
+    let mut seen = Vec::new();
+    assert!(
+        notes_contain(
+            &hub,
+            &mut seen,
+            "client disconnected (hub queue budget spent)"
+        ),
+        "{seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|n| n.contains("output queue full")),
+        "{seen:?}"
+    );
+    // Nothing is queued any more: what the cut clients held left the budget.
+    wait_until("the budget to empty", || hub.queued_bytes() == 0);
+    fast.send(request(2, "tools/list"));
+    child.answer();
+    assert_eq!(fast.recv()["id"], 2);
+    hub.shutdown();
+}
+
+/// Review F08 (r5):the hub stops a child and forgets its registry row by the launch id the
 /// launcher gave it (the fake answers only to that id).
 #[test]
 fn a_stopped_child_leaves_no_registry_row() {

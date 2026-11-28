@@ -226,6 +226,11 @@ them). When a limit cuts a session, its relay runs the server itself, as when th
 
 - **Connections.** The hub accepts 256 connections at once, one per session and shared server.
   One more is closed before anything is read from it.
+- **Queue memory.** Messages waiting to be written to sessions and to servers share a budget of
+  256 MiB. Past it, a queue that holds more than its share (the budget divided by the open
+  queues) takes nothing more: a session that stopped reading is disconnected and the log says
+  `client disconnected (hub queue budget spent)`; messages to a server are dropped and time out.
+  An empty queue always takes one message, so a session that keeps reading is not cut.
 - **Replay deadline.** A relay that loses the hub replays the session's `initialize` to the server
   it starts and waits up to the server's `request_timeout_secs` (default 300) for the answer: the
   same time the hub gives a server's own `initialize`, so a server that starts slowly (a first
