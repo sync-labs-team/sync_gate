@@ -452,15 +452,17 @@ unsafe fn file_refusal(
 pub(crate) fn check_names(path: &Path) -> io::Result<()> {
     const DEVICES: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
     let device = |n: &str| {
-        let stem = n.split('.').next().unwrap_or(n).trim_end();
-        // Bytes, not `str` slices: a name may hold any character.
+        // Win32 drops only ASCII spaces before an extension.
+        let stem = n.split('.').next().unwrap_or(n).trim_end_matches(' ');
         let b = stem.as_bytes();
         DEVICES.iter().any(|d| stem.eq_ignore_ascii_case(d))
-            || (b.len() == 4
+            || (b.len() >= 4
                 && [b"COM", b"LPT"]
                     .iter()
                     .any(|p| b[..3].eq_ignore_ascii_case(*p))
-                && b[3].is_ascii_digit())
+                // Three ASCII bytes: index 3 is a character boundary. Windows also reserves ¹ ² ³.
+                && ((b.len() == 4 && b[3].is_ascii_digit())
+                    || ["¹", "²", "³"].contains(&&stem[3..])))
     };
     let plain = path.components().all(|c| match c {
         Component::Normal(n) => {
@@ -797,10 +799,13 @@ pub fn create_private_dir(dir: &Path) -> io::Result<()> {
     if left.is_empty() {
         return Err(e);
     }
-    Err(io::Error::new(
-        e.kind(),
-        format!("{e}; created here and not removed: {}", left.join(", ")),
-    ))
+    let msg = format!("{e}; created here and not removed: {}", left.join(", "));
+    // A refusal stays one (`is_refusal`), with what was left named.
+    Err(if super::is_refusal(&e) {
+        super::refusal(e.kind(), msg)
+    } else {
+        io::Error::new(e.kind(), msg)
+    })
 }
 
 #[cfg(test)]
@@ -1129,9 +1134,10 @@ mod tests {
             .and_then(|u| sid_text(unsafe { (*u.as_ptr().cast::<TOKEN_USER>()).User.Sid }))
             .unwrap();
         icacls(&p, &["/deny", &format!("*{me}:(OI)(CI)(IO)(DE,DC)")]);
-        let t = create_private_dir(&p.join("x").join("y"))
-            .unwrap_err()
-            .to_string();
+        let e = create_private_dir(&p.join("x").join("y")).unwrap_err();
+        // Still a refusal by the rules, with what was left named.
+        assert!(super::super::is_refusal(&e), "{e}");
+        let t = e.to_string();
         assert!(t.contains("other users can change"), "{t}");
         assert!(p.join("x").join("y").exists(), "premise: the folder stayed");
         assert!(t.contains("not removed") && t.contains("y"), "{t}");
@@ -1607,13 +1613,18 @@ mod tests {
         bad(r"\\.\NUL");
         bad(&format!(r"{}\NUL", b.display()));
         bad(&format!(r"{}\com1.txt", b.display()));
+        // Superscript digits name a device too (`COM¹`...`LPT³`), with an extension or a final space.
+        for n in ["COM¹", "lpt²", "COM³.txt", "LPT¹ .log"] {
+            bad(&format!(r"{}\{n}", b.display()));
+        }
         bad("config.toml");
         let dotted = b.join("d.").join("f");
         bad(&dotted.display().to_string());
         assert_eq!(read_all(Path::new(&format!(r"\\?\{s}"))).unwrap(), "x");
         // Names that only look like a device are plain files: a non-ASCII 4-byte name included
         // (the device check must not cut a character in two).
-        for n in ["abİ", "COMx", "console"] {
+        // `COM⁴` is no device, and only an ASCII space is dropped (`NUL` + U+3000 is a plain name).
+        for n in ["abİ", "COMx", "console", "COM⁴", "NUL\u{3000}"] {
             let g = b.join(n);
             std::fs::write(&g, "y").unwrap();
             assert_eq!(read_all(&g).unwrap(), "y", "{n}");
