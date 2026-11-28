@@ -11,8 +11,11 @@
 //! - own child (kept in the launcher's table with its `Child`): the unreaped zombie (Unix) or
 //!   open handle (Windows) pins the pid, so it cannot belong to anyone else. That held handle
 //!   (and job / process group) IS the identity: the child is stopped through it even when its
-//!   start time could not be read (recorded as 0). The caller's start time must still equal
-//!   the one recorded at spawn, checked while the table lock is held across the signal.
+//!   start time could not be read (recorded as 0). The caller names it by the launch id
+//!   `spawn` gave it (never reused; pid + start time can repeat: 0, or the same second on
+//!   Unix), checked while the table lock is held across the signal. Its exit code and its
+//!   registry row are bound to that id too, so a late call for an older child never touches
+//!   a newer one on the same pid.
 //! - leftover from disk (no handle): pid + start time + exe path must all equal the recorded
 //!   row (`reap_leftovers` compares the exe; Windows also re-reads the start time and the
 //!   liveness from the very handle it terminates; Unix has no pidfd, see `kill_foreign`).
@@ -35,6 +38,9 @@ pub struct Spawned {
     /// seconds); 0 = unknown. A leftover row with 0 is never terminated; while the launcher
     /// still holds the child, its handle is the identity and it is stopped through it.
     pub start_time: u64,
+    /// Launch id: unique per spawn of this launcher, never 0. Names this child, not the pid, in
+    /// `is_alive`, `terminate` and `reap`.
+    pub launch: u64,
     pub exe: PathBuf,
     pub stdin: Box<dyn Write + Send>,
     pub stdout: Box<dyn Read + Send>,
@@ -61,9 +67,13 @@ pub trait Launcher: Send + Sync {
     /// foreign process is never ours then); on Unix, a probe that cannot read the start time;
     /// and a child of this launcher whose exit cannot be observed and cannot be confirmed
     /// running (its entry is dropped).
-    fn is_alive(&self, pid: u32, start_time: u64) -> bool;
-    /// Terminates the process (and the tree it started) if it still matches `start_time`.
-    fn terminate(&self, pid: u32, start_time: u64) -> io::Result<()>;
+    /// `launch` is the id `spawn` gave an own child, 0 for a foreign one: a nonzero one is
+    /// answered from the launcher's own children only (false once that child is gone, whoever
+    /// has the pid now), 0 never matches an own child.
+    fn is_alive(&self, pid: u32, start_time: u64, launch: u64) -> bool;
+    /// Terminates the process (and the tree it started) if it still matches `start_time` (a
+    /// foreign one, `launch` 0) or `launch` (an own child).
+    fn terminate(&self, pid: u32, start_time: u64, launch: u64) -> io::Result<()>;
     /// False when `pid`'s identity (state, start time) cannot be read, so it can be neither
     /// confirmed as the recorded process nor ruled out. A launcher that cannot tell says true.
     fn identity_readable(&self, _pid: u32, _start_time: u64) -> bool {
@@ -80,9 +90,9 @@ pub trait Launcher: Send + Sync {
     fn resolve(&self, command: &str, _env: &BTreeMap<String, String>) -> Option<PathBuf> {
         Some(PathBuf::from(command))
     }
-    /// Drops what the launcher still holds for the stopped child `pid` + `start_time` (reaps
-    /// it); its exit code when known. Another child on that pid is left alone.
-    fn reap(&self, _pid: u32, _start_time: u64) -> Option<i32> {
+    /// Drops what the launcher still holds for the stopped child `pid` + `launch` (reaps it);
+    /// its exit code when known. Another child on that pid, and its code, are left alone.
+    fn reap(&self, _pid: u32, _launch: u64) -> Option<i32> {
         None
     }
 }
@@ -110,39 +120,48 @@ impl Backoff {
 /// Never environment values or arguments: they can hold secrets.
 pub struct Registry {
     path: PathBuf,
-    rows: Vec<(String, u32, u64, String)>,
+    /// Each row on disk plus, in memory only (the file keeps its format), the launch id of the
+    /// own child it records; 0 = read from disk, a previous run's.
+    rows: Vec<(Row, u64)>,
 }
+
+/// One row of `services.json`: name, pid, start time, exe path.
+type Row = (String, u32, u64, String);
 
 impl Registry {
     pub fn load(path: &Path) -> Self {
+        let rows = crate::store::load_services(path);
         Self {
             path: path.to_path_buf(),
-            rows: crate::store::load_services(path),
+            rows: rows.into_iter().map(|r| (r, 0)).collect(),
         }
     }
 
-    pub fn record(&mut self, name: &str, pid: u32, start_time: u64, exe: &Path) {
-        self.rows.retain(|r| r.1 != pid);
+    pub fn record(&mut self, name: &str, pid: u32, start_time: u64, exe: &Path, launch: u64) {
+        self.rows.retain(|r| r.0.1 != pid);
         let exe = exe.to_string_lossy().into_owned();
-        self.rows.push((name.to_string(), pid, start_time, exe));
+        let row = (name.to_string(), pid, start_time, exe);
+        self.rows.push((row, launch));
         self.persist();
     }
 
-    /// Only the row of that identity: a late stop of an older child never drops the row of a
-    /// newer one on the same pid.
-    pub fn forget(&mut self, pid: u32, start_time: u64) {
-        self.rows.retain(|r| (r.1, r.2) != (pid, start_time));
+    /// Only the row of that identity and launch (0 = a leftover): a late stop of an older
+    /// child never drops the row of a newer one, even on the same pid and start time.
+    pub fn forget(&mut self, pid: u32, start_time: u64, launch: u64) {
+        self.rows
+            .retain(|(r, l)| (r.1, r.2, *l) != (pid, start_time, launch));
         self.persist();
     }
 
     pub fn leftovers(&self) -> Vec<(String, u32, u64, PathBuf)> {
-        let row = |r: &(String, u32, u64, String)| (r.0.clone(), r.1, r.2, PathBuf::from(&r.3));
+        let row = |(r, _): &(Row, u64)| (r.0.clone(), r.1, r.2, PathBuf::from(&r.3));
         self.rows.iter().map(row).collect()
     }
 
     /// A failed write is reported, not fatal: the child is already running.
     fn persist(&self) {
-        if let Err(e) = crate::store::save_services(&self.path, &self.rows) {
+        let rows: Vec<Row> = self.rows.iter().map(|(r, _)| r.clone()).collect();
+        if let Err(e) = crate::store::save_services(&self.path, &rows) {
             eprintln!("sync_gated: cannot save {}: {e}", self.path.display());
         }
     }
@@ -173,6 +192,7 @@ pub fn stop_own(
     l: &dyn Launcher,
     pid: u32,
     start_time: u64,
+    launch: u64,
     stdin: Option<Box<dyn Write + Send>>,
     grace: Duration,
 ) -> io::Result<Option<i32>> {
@@ -180,13 +200,13 @@ pub fn stop_own(
     let deadline = Instant::now() + grace;
     loop {
         // This check doubles as the identity verification right before `terminate`.
-        if !l.is_alive(pid, start_time) {
-            return Ok(l.reap(pid, start_time));
+        if !l.is_alive(pid, start_time, launch) {
+            return Ok(l.reap(pid, launch));
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            l.terminate(pid, start_time)?;
-            return Ok(l.reap(pid, start_time));
+            l.terminate(pid, start_time, launch)?;
+            return Ok(l.reap(pid, launch));
         }
         std::thread::sleep(left.min(Duration::from_millis(50)));
     }
@@ -220,7 +240,7 @@ fn reap_leftovers_until(l: &dyn Launcher, reg: &mut Registry, deadline: Instant)
             eprintln!("sync_gated: leftover cleanup out of time; {kept} kept for the next start");
             break;
         }
-        if l.is_alive(pid, start_time) {
+        if l.is_alive(pid, start_time, 0) {
             match l.exe_of(pid) {
                 // unreadable is not "another program": neither stopped nor forgotten
                 None => {
@@ -234,7 +254,7 @@ fn reap_leftovers_until(l: &dyn Launcher, reg: &mut Registry, deadline: Instant)
                     eprintln!("sync_gated: cannot verify leftover {name} (pid {pid}); kept");
                     continue;
                 }
-                Some(_) => match l.terminate(pid, start_time) {
+                Some(_) => match l.terminate(pid, start_time, 0) {
                     Ok(()) => stopped += 1,
                     // refused as a target (pid 0, 1, ours): no retry will ever work
                     Err(e) if e.kind() == io::ErrorKind::InvalidInput => {}
@@ -246,7 +266,7 @@ fn reap_leftovers_until(l: &dyn Launcher, reg: &mut Registry, deadline: Instant)
                 },
             }
         }
-        reg.forget(pid, start_time);
+        reg.forget(pid, start_time, 0);
     }
     stopped
 }
@@ -254,7 +274,8 @@ fn reap_leftovers_until(l: &dyn Launcher, reg: &mut Registry, deadline: Instant)
 /// A child this daemon started: its handle pins the pid until it is reaped.
 struct Owned {
     child: Child,
-    start_time: u64,
+    /// The launch id `spawn` gave it: the caller's name for this child.
+    launch: u64,
     /// Windows Job Object holding the whole tree (0 = none; always 0 on Unix).
     job: Job,
 }
@@ -272,9 +293,18 @@ impl Drop for Owned {
 #[derive(Default)]
 struct Table {
     live: std::collections::HashMap<u32, Owned>,
-    /// pid -> (start time, exit code) of a child `is_alive` saw exit and dropped, until `reap`
-    /// with that same identity takes it or a new child takes the pid.
+    /// pid -> (launch id, exit code) of a child `is_alive` saw exit and dropped, until `reap`
+    /// with that launch takes it or a new child takes the pid.
     exits: std::collections::HashMap<u32, (u64, i32)>,
+}
+
+impl Table {
+    /// Holds a new child under `pid`, dropping the code kept for an older child on that pid
+    /// (only ever taken by its own launch; dropping it bounds the table).
+    fn take(&mut self, pid: u32, owned: Owned) {
+        self.exits.remove(&pid);
+        self.live.insert(pid, owned);
+    }
 }
 
 /// The real launcher. Keeps each child in `children` (keyed by pid): the unreaped `Child`
@@ -282,22 +312,26 @@ struct Table {
 #[derive(Default)]
 pub struct OsLauncher {
     children: Mutex<Table>,
+    /// Last launch id given; ids start at 1 (0 = not an own child).
+    launches: AtomicU64,
 }
 
 impl OsLauncher {
     /// One signal round. Own children are signalled with the table lock held, so nobody can
     /// reap them (and free the pid) between the check and the signal.
-    fn kill_once(&self, pid: u32, start_time: u64, hard: bool) -> io::Result<()> {
+    fn kill_once(&self, pid: u32, start_time: u64, launch: u64, hard: bool) -> io::Result<()> {
         let mut children = lock(&self.children);
         if let Some(o) = children.live.get_mut(&pid) {
-            return if o.start_time == start_time {
+            // Not that launch: the pid is another own child's, never the caller's process.
+            return if o.launch == launch {
                 kill_own(o, hard)
             } else {
                 Ok(())
             };
         }
         drop(children);
-        if !self.is_alive(pid, start_time) {
+        // An own child no longer held is gone: whoever has the pid now is not it.
+        if launch != 0 || !self.is_alive(pid, start_time, 0) {
             return Ok(());
         }
         kill_foreign(pid, start_time, hard)
@@ -305,12 +339,8 @@ impl OsLauncher {
 }
 
 impl OsLauncher {
-    /// Holds a new child under `pid`, in one step with dropping the code kept for an older
-    /// child on that pid: it is not this child's.
     fn track(&self, pid: u32, owned: Owned) {
-        let mut t = lock(&self.children);
-        t.exits.remove(&pid);
-        t.live.insert(pid, owned);
+        lock(&self.children).take(pid, owned);
     }
 
     /// `is_alive`, with the exit observation (`observe`) and the group signal for a leader
@@ -319,14 +349,15 @@ impl OsLauncher {
         &self,
         pid: u32,
         start_time: u64,
+        launch: u64,
         observe: &mut dyn FnMut(&mut Child) -> io::Result<bool>,
         on_gone: &mut dyn FnMut(&mut Owned),
     ) -> bool {
         let mut children = lock(&self.children);
         if let Some(o) = children.live.get_mut(&pid) {
             match observe(&mut o.child) {
-                // The held handle is the identity; the recorded start time (even 0) must match.
-                Ok(false) => return o.start_time == start_time,
+                // The held handle is the identity; the caller's launch must be this child's.
+                Ok(false) => return o.launch == launch,
                 // Leader gone but still unreaped, so its pid and group id are still ours:
                 // take the rest of its tree down now. Windows: dropping the entry closes the
                 // job, same effect.
@@ -334,26 +365,27 @@ impl OsLauncher {
                 // Not observable (Unix): signal nothing. A child still running is still ours.
                 Err(_) => {
                     if let Ok(None) = o.child.try_wait() {
-                        return o.start_time == start_time;
+                        return o.launch == launch;
                     }
                 }
             }
-            // Reaped last; nothing is signalled after this. The pid is free from here on, so
-            // the code is recorded before the table lock is let go: a spawn reusing the pid
-            // waits for it and then drops it.
+            // Out of the table, then reaped last; nothing is signalled after this. The pid is
+            // free from the reap on, and a spawn may take it: the code is kept under this
+            // child's launch, so no other launch ever gets it, whatever ran in between.
+            let Some(mut o) = children.live.remove(&pid) else {
+                return false;
+            };
             let code = o.child.try_wait().ok().flatten().and_then(|s| s.code());
-            let start = o.start_time;
             #[cfg(test)]
-            tests::AFTER_REAP.with(|h| h.borrow_mut().as_mut().map(|f| f()));
-            children.live.remove(&pid);
+            tests::AFTER_REAP.with(|h| h.borrow_mut().as_mut().map(|f| f(&mut children)));
             if let Some(code) = code {
-                children.exits.insert(pid, (start, code));
+                children.exits.insert(pid, (o.launch, code));
             }
             return false;
         }
         drop(children);
-        // 0 = unverifiable: never ours.
-        if start_time == 0 {
+        // An own child no longer held is gone; start time 0 = unverifiable: never ours.
+        if launch != 0 || start_time == 0 {
             return false;
         }
         #[cfg(windows)]
@@ -431,6 +463,7 @@ impl Launcher for OsLauncher {
         // First thing: the probe below is slow and a grandchild started meanwhile escapes the job.
         let job = open_job(&child);
         let pid = child.id();
+        let launch = self.launches.fetch_add(1, Ordering::SeqCst) + 1;
         // Windows: the full creation time from the child's own handle; Unix: the probe's seconds.
         #[cfg(windows)]
         let start_time = {
@@ -441,26 +474,16 @@ impl Launcher for OsLauncher {
         let start_time = sync_gate_probe::start_time(pid).unwrap_or(0);
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             // Never leave an untracked child running.
-            let mut o = Owned {
-                child,
-                start_time,
-                job,
-            };
+            let mut o = Owned { child, launch, job };
             let _ = kill_own(&mut o, true);
             let _ = o.child.wait();
             return Err(io::ErrorKind::BrokenPipe.into());
         };
-        self.track(
-            pid,
-            Owned {
-                child,
-                start_time,
-                job,
-            },
-        );
+        self.track(pid, Owned { child, launch, job });
         Ok(Spawned {
             pid,
             start_time,
+            launch,
             exe: process_exe(pid).unwrap_or(program),
             stdin: Box::new(stdin),
             stdout: Box::new(stdout),
@@ -482,17 +505,17 @@ impl Launcher for OsLauncher {
         )
     }
 
-    fn is_alive(&self, pid: u32, start_time: u64) -> bool {
-        self.is_alive_with(pid, start_time, &mut exited_unreaped, &mut |o| {
+    fn is_alive(&self, pid: u32, start_time: u64, launch: u64) -> bool {
+        self.is_alive_with(pid, start_time, launch, &mut exited_unreaped, &mut |o| {
             let _ = kill_own(o, true);
         })
     }
 
-    fn terminate(&self, pid: u32, start_time: u64) -> io::Result<()> {
+    fn terminate(&self, pid: u32, start_time: u64, launch: u64) -> io::Result<()> {
         check_target(pid)?;
         let wait_gone = |limit: Duration| {
             let end = Instant::now() + limit;
-            while self.is_alive(pid, start_time) {
+            while self.is_alive(pid, start_time, launch) {
                 if Instant::now() >= end {
                     return false;
                 }
@@ -500,14 +523,14 @@ impl Launcher for OsLauncher {
             }
             true
         };
-        if !self.is_alive(pid, start_time) {
+        if !self.is_alive(pid, start_time, launch) {
             return Ok(());
         }
-        self.kill_once(pid, start_time, false)?;
+        self.kill_once(pid, start_time, launch, false)?;
         if wait_gone(Duration::from_secs(KILL_WAIT_SECS)) {
             return Ok(());
         }
-        self.kill_once(pid, start_time, true)?;
+        self.kill_once(pid, start_time, launch, true)?;
         if wait_gone(Duration::from_secs(KILL_WAIT_SECS)) {
             Ok(())
         } else {
@@ -526,16 +549,16 @@ impl Launcher for OsLauncher {
         process_exe(pid)
     }
 
-    /// Only the child with this identity: a late call for an older one leaves a newer child on
-    /// the same pid, and its code, alone.
-    fn reap(&self, pid: u32, start_time: u64) -> Option<i32> {
+    /// Only the child of this launch: a late call for an older one leaves a newer child on
+    /// the same pid (even with the same start time), and its code, alone.
+    fn reap(&self, pid: u32, launch: u64) -> Option<i32> {
         let mut t = lock(&self.children);
-        if t.live.get(&pid).is_some_and(|o| o.start_time == start_time) {
+        if t.live.get(&pid).is_some_and(|o| o.launch == launch) {
             let mut o = t.live.remove(&pid)?;
             drop(t);
             return o.child.try_wait().ok().flatten()?.code();
         }
-        if t.exits.get(&pid).is_some_and(|e| e.0 == start_time) {
+        if t.exits.get(&pid).is_some_and(|e| e.0 == launch) {
             return t.exits.remove(&pid).map(|e| e.1);
         }
         None
@@ -635,9 +658,10 @@ fn run_tool_with(
         }
     };
     let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+    // Not in any launcher's table: no launch id.
     let mut own = Owned {
         child,
-        start_time: 0,
+        launch: 0,
         job,
     };
     let mut writer = None;
@@ -1934,7 +1958,7 @@ mod tests {
         ) -> io::Result<Spawned> {
             Err(io::ErrorKind::Unsupported.into())
         }
-        fn is_alive(&self, pid: u32, _: u64) -> bool {
+        fn is_alive(&self, pid: u32, _: u64, _: u64) -> bool {
             self.log.lock().unwrap().push("is_alive".into());
             if self.only.is_empty() {
                 *self.alive.lock().unwrap()
@@ -1942,7 +1966,7 @@ mod tests {
                 self.only.contains(&pid)
             }
         }
-        fn terminate(&self, pid: u32, _: u64) -> io::Result<()> {
+        fn terminate(&self, pid: u32, _: u64, _: u64) -> io::Result<()> {
             self.log.lock().unwrap().push(format!("terminate {pid}"));
             std::thread::sleep(self.slow);
             if self.stuck.contains(&pid) {
@@ -1986,14 +2010,14 @@ mod tests {
     #[test]
     fn stop_own_closes_stdin_first_and_terminates_only_after_grace() {
         let f = Fake::new(true, false);
-        stop_own(&f, 7, 1, f.stdin(), Duration::ZERO).unwrap();
+        stop_own(&f, 7, 1, 1, f.stdin(), Duration::ZERO).unwrap();
         assert_eq!(
             f.calls(),
             ["close_stdin", "is_alive", "terminate 7", "reap 7"]
         );
 
         let f = Fake::new(true, true);
-        stop_own(&f, 7, 1, f.stdin(), Duration::from_secs(5)).unwrap();
+        stop_own(&f, 7, 1, 1, f.stdin(), Duration::from_secs(5)).unwrap();
         assert_eq!(f.calls(), ["close_stdin", "is_alive", "reap 7"]);
     }
 
@@ -2003,7 +2027,7 @@ mod tests {
         let dir = temp_dir("keep");
         let path = dir.join("services.json");
         let mut reg = Registry::load(&path);
-        reg.record("a", 10, 1, Path::new("/bin/a"));
+        reg.record("a", 10, 1, Path::new("/bin/a"), 0);
         let mut f = Fake::new(false, false);
         f.only = vec![10];
         f.exes.insert(10, "/bin/a".into());
@@ -2022,7 +2046,7 @@ mod tests {
         let dir = temp_dir("unreadable");
         let path = dir.join("services.json");
         let mut reg = Registry::load(&path);
-        reg.record("a", 10, 1, Path::new("/bin/a"));
+        reg.record("a", 10, 1, Path::new("/bin/a"), 0);
         let mut f = Fake::new(false, false);
         f.only = vec![10];
         f.exes.insert(10, "/bin/a".into());
@@ -2041,7 +2065,7 @@ mod tests {
     #[test]
     fn stop_own_never_terminates_a_reused_pid() {
         let f = Fake::new(false, false);
-        stop_own(&f, 7, 1, f.stdin(), Duration::ZERO).unwrap();
+        stop_own(&f, 7, 1, 1, f.stdin(), Duration::ZERO).unwrap();
         assert!(f.calls().iter().all(|c| !c.starts_with("terminate")));
     }
 
@@ -2050,9 +2074,9 @@ mod tests {
         let dir = temp_dir("reg");
         let path = dir.join("services.json");
         let mut reg = Registry::load(&path);
-        reg.record("a", 10, 1, Path::new("/bin/a"));
-        reg.record("b", 20, 1, Path::new("/bin/b"));
-        reg.record("c", 30, 1, Path::new("/bin/c"));
+        reg.record("a", 10, 1, Path::new("/bin/a"), 0);
+        reg.record("b", 20, 1, Path::new("/bin/b"), 0);
+        reg.record("c", 30, 1, Path::new("/bin/c"), 0);
         assert_eq!(Registry::load(&path).leftovers().len(), 3);
 
         // 10: all match. 20: alive, but another executable. 30: alive, exe unreadable: not
@@ -2086,8 +2110,8 @@ mod tests {
         let dir = temp_dir("stuck-reg");
         let path = dir.join("services.json");
         let mut reg = Registry::load(&path);
-        reg.record("a", 10, 1, Path::new("/bin/a"));
-        reg.record("b", 20, 1, Path::new("/bin/b"));
+        reg.record("a", 10, 1, Path::new("/bin/a"), 0);
+        reg.record("b", 20, 1, Path::new("/bin/b"), 0);
         let mut f = Fake::new(false, false);
         f.only = vec![10, 20];
         f.exes.insert(10, "/bin/a".into());
@@ -2144,7 +2168,7 @@ mod tests {
         let me = std::process::id();
         let st = identity_of(me).unwrap();
         for pid in [0, 1, me] {
-            let e = l.terminate(pid, st).unwrap_err();
+            let e = l.terminate(pid, st, 0).unwrap_err();
             assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "pid {pid}");
         }
         // A hand-written registry with those rows (our own row even has the true identity):
@@ -2152,8 +2176,8 @@ mod tests {
         let dir = temp_dir("rows");
         let mut reg = Registry::load(&dir.join("services.json"));
         let exe = process_exe(me).unwrap();
-        reg.record("zero", 0, st, &exe);
-        reg.record("me", me, st, &exe);
+        reg.record("zero", 0, st, &exe, 0);
+        reg.record("me", me, st, &exe, 0);
         assert_eq!(reap_leftovers(&l, &mut reg), 0);
         assert!(reg.leftovers().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -2275,8 +2299,8 @@ mod tests {
         let c = Sleeper::start();
         let (ticks, secs) = c.identities();
         let l = OsLauncher::default();
-        assert!(!l.is_alive(c.pid(), secs), "an identity in seconds");
-        assert!(l.is_alive(c.pid(), ticks), "control: the exact identity");
+        assert!(!l.is_alive(c.pid(), secs, 0), "an identity in seconds");
+        assert!(l.is_alive(c.pid(), ticks, 0), "control: the exact identity");
     }
 
     #[cfg(windows)]
@@ -2286,7 +2310,7 @@ mod tests {
         let (_, secs) = c.identities();
         kill_foreign(c.pid(), secs, true).unwrap();
         let l = OsLauncher::default();
-        assert!(l.terminate(c.pid(), secs).is_ok());
+        assert!(l.terminate(c.pid(), secs, 0).is_ok());
         assert!(
             !c.ends_within(Duration::from_secs(1)),
             "a row in seconds must never kill"
@@ -2299,7 +2323,7 @@ mod tests {
         let c = Sleeper::start();
         let (ticks, _) = c.identities();
         let l = OsLauncher::default();
-        l.terminate(c.pid(), ticks).unwrap();
+        l.terminate(c.pid(), ticks, 0).unwrap();
         assert!(
             c.ends_within(Duration::from_secs(10)),
             "the child must really be gone"
@@ -2338,7 +2362,7 @@ mod tests {
     #[test]
     fn a_pid_that_cannot_exist_is_gone() {
         let l = OsLauncher::default();
-        assert!(!l.is_alive(0xFFFF_FFF0, 123));
+        assert!(!l.is_alive(0xFFFF_FFF0, 123, 0));
         kill_foreign(0xFFFF_FFF0, 123, true).unwrap();
     }
 
@@ -2362,7 +2386,7 @@ mod tests {
         assert_ne!(unsafe { GetExitCodeProcess(h, &mut code) }, 0);
         assert_eq!(code, 259, "the trap: an exit code equal to STILL_ACTIVE");
         assert_eq!(seen_through(h, ticks), Seen::Gone);
-        assert!(!OsLauncher::default().is_alive(pid, ticks));
+        assert!(!OsLauncher::default().is_alive(pid, ticks, 0));
     }
 
     /// The wait on the handle fails (no SYNCHRONIZE right): unreadable.
@@ -2773,9 +2797,9 @@ mod tests {
     /// Waits up to 10 s until the launcher no longer counts `pid` with identity `start` as
     /// alive. Once the launcher has released its own entry it answers from the process table,
     /// where an exited process can linger (see `assert_gone`).
-    fn assert_not_alive(l: &OsLauncher, pid: u32, start: u64) {
+    fn assert_not_alive(l: &OsLauncher, pid: u32, start: u64, launch: u64) {
         let end = Instant::now() + Duration::from_secs(10);
-        while l.is_alive(pid, start) {
+        while l.is_alive(pid, start, launch) {
             assert!(Instant::now() < end, "pid {pid} still counts as alive");
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -3035,7 +3059,7 @@ mod tests {
         let _gg = PidfileGuard::new(pidfile.clone());
         let l = OsLauncher::default();
         let s = spawn_child(&l, &format!("pipe-holder:{}", pidfile.display()));
-        let _g = Guard(&l, s.pid, s.start_time);
+        let _g = Guard(&l, s.pid, s.start_time, s.launch);
         // The leader exits at once and leaves a descendant of its group running.
         let end = Instant::now() + Duration::from_secs(20);
         while !leader_unreaped(s.pid) {
@@ -3043,10 +3067,16 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         let mut at_signal = None;
-        let alive = l.is_alive_with(s.pid, s.start_time, &mut exited_unreaped, &mut |o| {
-            at_signal = Some(leader_unreaped(o.child.id()));
-            let _ = kill_own(o, true);
-        });
+        let alive = l.is_alive_with(
+            s.pid,
+            s.start_time,
+            s.launch,
+            &mut exited_unreaped,
+            &mut |o| {
+                at_signal = Some(leader_unreaped(o.child.id()));
+                let _ = kill_own(o, true);
+            },
+        );
         assert!(!alive);
         assert_eq!(
             at_signal,
@@ -3230,11 +3260,12 @@ mod tests {
     fn os_launcher_keeps_a_running_child_it_cannot_observe() {
         let l = OsLauncher::default();
         let s = spawn_child(&l, "sleep");
-        let g = Guard(&l, s.pid, s.start_time);
+        let g = Guard(&l, s.pid, s.start_time, s.launch);
         let mut gone = false;
         let alive = l.is_alive_with(
             s.pid,
             s.start_time,
+            s.launch,
             &mut |_| Err(identity_lost(io::Error::from_raw_os_error(libc::EPERM))),
             &mut |_| gone = true,
         );
@@ -3890,10 +3921,10 @@ mod tests {
     }
 
     /// Terminates the child (and its tree) even when an assertion fails.
-    struct Guard<'a>(&'a OsLauncher, u32, u64);
+    struct Guard<'a>(&'a OsLauncher, u32, u64, u64);
     impl Drop for Guard<'_> {
         fn drop(&mut self) {
-            let _ = self.0.terminate(self.1, self.2);
+            let _ = self.0.terminate(self.1, self.2, self.3);
         }
     }
 
@@ -3941,10 +3972,14 @@ mod tests {
     fn os_launcher_spawns_and_pipes() {
         let l = OsLauncher::default();
         let mut s = spawn_child(&l, "echo");
-        let _g = Guard(&l, s.pid, s.start_time);
+        let _g = Guard(&l, s.pid, s.start_time, s.launch);
         assert!(s.start_time > 0 && s.exe.is_absolute());
-        assert!(l.is_alive(s.pid, s.start_time));
-        assert!(!l.is_alive(s.pid, s.start_time + 1));
+        assert!(l.is_alive(s.pid, s.start_time, s.launch));
+        assert!(
+            !l.is_alive(s.pid, s.start_time, s.launch + 1),
+            "another launch"
+        );
+        assert!(!l.is_alive(s.pid, s.start_time, 0), "a foreign row");
 
         writeln!(s.stdin, "hello").unwrap();
         s.stdin.flush().unwrap();
@@ -3956,11 +3991,12 @@ mod tests {
             &l,
             s.pid,
             s.start_time,
+            s.launch,
             Some(s.stdin),
             Duration::from_secs(10),
         )
         .unwrap();
-        assert_not_alive(&l, s.pid, s.start_time);
+        assert_not_alive(&l, s.pid, s.start_time, s.launch);
         // stop_own released the entry: nothing is left to reap or leak.
         assert!(l.children.lock().unwrap().live.is_empty());
     }
@@ -3980,7 +4016,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let _g = Guard(&l, s.pid, s.start_time);
+        let _g = Guard(&l, s.pid, s.start_time, s.launch);
         writeln!(s.stdin, "PATH").unwrap();
         let rx = lines_of(s.stdout);
         let line = wait_for(&rx, "env:PATH=");
@@ -4103,7 +4139,7 @@ mod tests {
         env.insert("PATH".into(), path.to_string_lossy().into_owned());
         let l = OsLauncher::default();
         let mut s = l.spawn("fgx", &child_args(), &env, &[], None).unwrap();
-        let g = Guard(&l, s.pid, s.start_time);
+        let g = Guard(&l, s.pid, s.start_time, s.launch);
         writeln!(s.stdin, "hello").unwrap();
         s.stdin.flush().unwrap();
         let rx = lines_of(s.stdout);
@@ -4117,33 +4153,46 @@ mod tests {
     fn os_launcher_terminates_a_live_child_and_refuses_a_wrong_identity() {
         let l = OsLauncher::default();
         let s = spawn_child(&l, "echo");
-        let _g = Guard(&l, s.pid, s.start_time);
-        // Wrong start time: treated as someone else's process, left alone.
-        l.terminate(s.pid, s.start_time + 1).unwrap();
-        assert!(l.is_alive(s.pid, s.start_time));
-        // Start time 0 is unverifiable: also left alone.
-        l.terminate(s.pid, 0).unwrap();
-        assert!(l.is_alive(s.pid, s.start_time));
+        let _g = Guard(&l, s.pid, s.start_time, s.launch);
+        // Another launch on that pid: not the caller's child, left alone.
+        l.terminate(s.pid, s.start_time, s.launch + 1).unwrap();
+        assert!(l.is_alive(s.pid, s.start_time, s.launch));
+        // A foreign row (launch 0), even with this start time: an own child is never its.
+        l.terminate(s.pid, s.start_time, 0).unwrap();
+        assert!(l.is_alive(s.pid, s.start_time, s.launch));
+        // A signal round for another launch (its child replaced between the check and the
+        // signal) leaves this one alone too.
+        l.kill_once(s.pid, s.start_time, s.launch + 1, true)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(l.is_alive(s.pid, s.start_time, s.launch));
         // stdin still open, so only terminate can end it.
-        l.terminate(s.pid, s.start_time).unwrap();
-        assert_not_alive(&l, s.pid, s.start_time);
+        l.terminate(s.pid, s.start_time, s.launch).unwrap();
+        assert_not_alive(&l, s.pid, s.start_time, s.launch);
     }
 
     #[test]
     fn stop_own_stops_an_own_child_whose_start_time_is_unknown() {
         let l = OsLauncher::default();
         let s = spawn_child(&l, "sleep");
-        let _g = Guard(&l, s.pid, s.start_time);
+        let _g = Guard(&l, s.pid, s.start_time, s.launch);
         // Simulate an unreadable start time at spawn: the held handle is the identity.
         // The job is parked outside the entry, so dropping the entry cannot hide a missed stop.
         let job = {
             let mut t = l.children.lock().unwrap();
             let o = t.live.get_mut(&s.pid).unwrap();
-            o.start_time = 0;
             std::mem::take(&mut o.job)
         };
         // The "sleep" child ignores stdin EOF, so only terminate can end it.
-        stop_own(&l, s.pid, 0, Some(s.stdin), Duration::from_millis(200)).unwrap();
+        stop_own(
+            &l,
+            s.pid,
+            0,
+            s.launch,
+            Some(s.stdin),
+            Duration::from_millis(200),
+        )
+        .unwrap();
         let end = Instant::now() + Duration::from_secs(10);
         while identity_of(s.pid) == Some(s.start_time) && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(50));
@@ -4175,7 +4224,7 @@ mod tests {
     fn stop_own_takes_down_the_grandchild_too() {
         let l = OsLauncher::default();
         let s = spawn_child(&l, "tree");
-        let _g = Guard(&l, s.pid, s.start_time);
+        let _g = Guard(&l, s.pid, s.start_time, s.launch);
         let rx = lines_of(s.stdout);
         let line = wait_for(&rx, "pids:");
         // `pids:<own>:<grandchild>:<its start time, read by the parent that holds it>`.
@@ -4189,6 +4238,7 @@ mod tests {
             &l,
             s.pid,
             s.start_time,
+            s.launch,
             Some(s.stdin),
             Duration::from_millis(200),
         )
@@ -4198,18 +4248,19 @@ mod tests {
             wait_not_running(grandchild),
             "the grandchild outlived stop_own"
         );
-        assert_not_alive(&l, s.pid, s.start_time);
+        assert_not_alive(&l, s.pid, s.start_time, s.launch);
     }
 
     #[test]
     fn stop_own_reports_the_exit_code_of_an_own_child() {
         let l = OsLauncher::default();
         let s = spawn_child(&l, "exit3");
-        let _g = Guard(&l, s.pid, s.start_time);
+        let _g = Guard(&l, s.pid, s.start_time, s.launch);
         let code = stop_own(
             &l,
             s.pid,
             s.start_time,
+            s.launch,
             Some(s.stdin),
             Duration::from_secs(10),
         )
@@ -4226,12 +4277,12 @@ mod tests {
         let mut c = child_command("exit3").spawn().unwrap();
         c.wait().unwrap();
         let pid = c.id();
-        l.children.lock().unwrap().exits.insert(pid, (0, 7));
+        l.children.lock().unwrap().exits.insert(pid, (2, 7));
         l.track(
             pid,
             Owned {
                 child: c,
-                start_time: 0,
+                launch: 1,
                 job: 0,
             },
         );
@@ -4240,28 +4291,34 @@ mod tests {
             None,
             "old code kept"
         );
-        assert_eq!(l.reap(pid, 0), Some(3));
+        assert_eq!(l.reap(pid, 2), None, "the old code went to a new launch");
+        assert_eq!(l.reap(pid, 1), Some(3));
     }
 
+    type Hook = Box<dyn FnMut(&mut Table)>;
+
     thread_local! {
-        /// Seam: runs in `is_alive_with` between reaping a child and recording its exit code.
-        pub(super) static AFTER_REAP: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        /// Seam: runs in `is_alive_with`, with the table lock held, between reaping a child and
+        /// recording its exit code.
+        pub(super) static AFTER_REAP: std::cell::RefCell<Option<Hook>> =
             const { std::cell::RefCell::new(None) };
     }
 
-    /// Review F08 (r3): a spawn that takes the pid while `is_alive` is reaping the child that
-    /// had it before never ends up with that child's exit code.
+    /// Review F08 (r5): a new child with the same pid AND the same start time (unknown, or the
+    /// same second on Unix) takes the pid right after the old one is reaped, before its code is
+    /// recorded (the order M1' opens; the hook forces it every run). The new child is neither
+    /// lost nor handed the old child's code.
     #[test]
     fn a_spawn_racing_the_reap_of_the_old_child_never_gets_its_code() {
         const PID: u32 = u32::MAX - 7;
-        let l = Arc::new(OsLauncher::default());
+        let l = OsLauncher::default();
         let mut old = child_command("exit3").spawn().unwrap();
         old.wait().unwrap();
         l.track(
             PID,
             Owned {
                 child: old,
-                start_time: 1,
+                launch: 1,
                 job: 0,
             },
         );
@@ -4272,42 +4329,126 @@ mod tests {
             .spawn()
             .unwrap();
         let stdin = new.stdin.take();
-        let racer = Arc::new(Mutex::new(None));
-        let (l2, r2, mut new) = (l.clone(), racer.clone(), Some(new));
+        let mut new = Some(new);
         AFTER_REAP.with(|h| {
-            *h.borrow_mut() = Some(Box::new(move || {
-                let (l3, child) = (l2.clone(), new.take().unwrap());
-                let (tx, rx) = mpsc::channel();
-                let t = std::thread::spawn(move || {
-                    let owned = Owned {
-                        child,
-                        start_time: 2,
-                        job: 0,
-                    };
-                    l3.track(PID, owned);
-                    let _ = tx.send(());
-                });
-                // Gives the spawn every chance to get in before the old code is recorded.
-                let _ = rx.recv_timeout(Duration::from_secs(1));
-                *r2.lock().unwrap() = Some(t);
+            *h.borrow_mut() = Some(Box::new(move |t: &mut Table| {
+                let owned = Owned {
+                    child: new.take().unwrap(),
+                    launch: 2,
+                    job: 0,
+                };
+                t.exits.remove(&PID);
+                t.live.insert(PID, owned);
             }));
         });
-        assert!(!l.is_alive_with(PID, 1, &mut |_| Ok(true), &mut |_| {}));
+        assert!(!l.is_alive_with(PID, 1, 1, &mut |_| Ok(true), &mut |_| {}));
         AFTER_REAP.with(|h| *h.borrow_mut() = None);
-        let t = racer.lock().unwrap().take().expect("the hook never ran");
-        t.join().unwrap();
-        {
-            let t = l.children.lock().unwrap();
-            assert_eq!(t.exits.get(&PID), None, "the old code outlived the spawn");
-            assert_eq!(
-                t.live.get(&PID).map(|o| o.start_time),
-                Some(2),
-                "new child lost"
-            );
-        }
+        let kept = l.children.lock().unwrap().live.get(&PID).map(|o| o.launch);
         let code = l.reap(PID, 2);
         drop(stdin);
+        assert_eq!(kept, Some(2), "new child lost");
         assert_eq!(code, None, "the new child got the old child's exit code");
+    }
+
+    /// Review F08 (r5): `stop_own` of the old child saw it gone (reaped), then a new child took
+    /// the pid with the same start time; the old `stop_own`'s late `reap` leaves it alone.
+    #[test]
+    fn a_late_reap_never_takes_a_new_child_with_the_same_pid_and_start_time() {
+        const PID: u32 = u32::MAX - 9;
+        let l = OsLauncher::default();
+        let mut old = child_command("exit3").spawn().unwrap();
+        old.wait().unwrap();
+        l.track(
+            PID,
+            Owned {
+                child: old,
+                launch: 1,
+                job: 0,
+            },
+        );
+        assert!(!l.is_alive_with(PID, 1, 1, &mut |_| Ok(true), &mut |_| {}));
+        let mut new = child_command("echo")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = new.stdin.take();
+        l.track(
+            PID,
+            Owned {
+                child: new,
+                launch: 2,
+                job: 0,
+            },
+        );
+        let _ = l.reap(PID, 1);
+        let kept = l.children.lock().unwrap().live.get(&PID).map(|o| o.launch);
+        drop(stdin);
+        assert_eq!(kept, Some(2), "a late reap took the new child");
+    }
+
+    /// Review F08 (r5): every spawn gets its own launch id, never 0.
+    #[test]
+    fn each_spawn_gets_its_own_launch_id() {
+        let l = OsLauncher::default();
+        let (a, b) = (spawn_child(&l, "exit3"), spawn_child(&l, "exit3"));
+        let _g = (
+            Guard(&l, a.pid, a.start_time, a.launch),
+            Guard(&l, b.pid, b.start_time, b.launch),
+        );
+        assert!(a.launch != 0 && b.launch != 0 && a.launch != b.launch);
+    }
+
+    /// Review F08 (r5): a launch id this launcher does not hold (its child already reaped)
+    /// names no process: a foreign one with that very pid and start time is neither alive for
+    /// it nor signalled.
+    #[test]
+    fn a_launch_not_held_never_reaches_a_foreign_process() {
+        let l = OsLauncher::default();
+        let mut c = child_command("sleep")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = c.id();
+        let start = identity_of(pid).unwrap_or(0);
+        let foreign = l.is_alive(pid, start, 0);
+        let mine = l.is_alive(pid, start, 5);
+        let stopped = l.terminate(pid, start, 5);
+        let running = c.try_wait().unwrap().is_none();
+        let _ = c.kill();
+        let _ = c.wait();
+        assert!(foreign, "control: the foreign check sees it");
+        assert!(!mine, "a launch not held is alive");
+        assert!(
+            stopped.is_ok() && running,
+            "a launch not held reached it: {stopped:?}"
+        );
+    }
+
+    /// Review F08 (r5): the code of a new child (same pid, same start time) that `is_alive`
+    /// saw exit stays its own: a late `reap` of the old child does not take it.
+    #[test]
+    fn a_late_reap_never_takes_the_code_of_a_new_child() {
+        const PID: u32 = u32::MAX - 10;
+        let l = OsLauncher::default();
+        for launch in [1, 2] {
+            let mut c = child_command("exit3").spawn().unwrap();
+            c.wait().unwrap();
+            let owned = Owned {
+                child: c,
+                launch,
+                job: 0,
+            };
+            l.track(PID, owned);
+            assert!(!l.is_alive_with(PID, 1, launch, &mut |_| Ok(true), &mut |_| {}));
+        }
+        assert_eq!(
+            l.reap(PID, 1),
+            None,
+            "the old child took the new one's code"
+        );
+        assert_eq!(l.reap(PID, 2), Some(3), "the new child lost its code");
     }
 
     /// Review F08 (r3): `reap` (a late `stop_own`) for another generation on the same pid
@@ -4320,7 +4461,7 @@ mod tests {
         c.wait().unwrap();
         let owned = Owned {
             child: c,
-            start_time: 2,
+            launch: 2,
             job: 0,
         };
         l.track(PID, owned);
@@ -4329,7 +4470,7 @@ mod tests {
             l.children.lock().unwrap().live.contains_key(&PID),
             "live entry taken"
         );
-        assert!(!l.is_alive_with(PID, 2, &mut |_| Ok(true), &mut |_| {}));
+        assert!(!l.is_alive_with(PID, 1, 2, &mut |_| Ok(true), &mut |_| {}));
         assert_eq!(l.reap(PID, 1), None, "the code went to another generation");
         assert_eq!(l.reap(PID, 2), Some(3));
         assert_eq!(l.reap(PID, 2), None, "taken twice");
@@ -4341,16 +4482,41 @@ mod tests {
     fn registry_forgets_only_the_row_with_that_identity() {
         let dir = temp_dir("forget-identity");
         let mut reg = Registry::load(&dir.join("services.json"));
-        reg.record("a", 9, 2, Path::new("/bin/a"));
-        reg.forget(9, 1);
+        reg.record("a", 9, 2, Path::new("/bin/a"), 0);
+        reg.forget(9, 1, 0);
         assert_eq!(
             reg.leftovers().len(),
             1,
             "another generation's row was dropped"
         );
-        reg.forget(9, 2);
+        reg.forget(9, 2, 0);
         assert!(reg.leftovers().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review F08 (r5): a late `forget` of the old child never drops the row of a new one
+    /// with the same pid and the same start time.
+    #[test]
+    fn a_late_forget_keeps_the_row_of_a_new_child_with_the_same_identity() {
+        let dir = temp_dir("forget-generation");
+        let mut reg = Registry::load(&dir.join("services.json"));
+        reg.record("a", 9, 2, Path::new("/bin/a"), 1);
+        reg.record("a", 9, 2, Path::new("/bin/a"), 2);
+        reg.forget(9, 2, 1);
+        let kept = reg.leftovers().len();
+        // The file keeps the 0.1.4 format: name, pid, start time, exe; no launch id.
+        let disk = std::fs::read_to_string(dir.join("services.json")).unwrap();
+        let rows = crate::store::load_services(&dir.join("services.json"));
+        reg.forget(9, 2, 2);
+        let gone = reg.leftovers().is_empty();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(kept, 1, "the old child's forget dropped the new row");
+        assert_eq!(
+            rows,
+            [("a".to_string(), 9, 2, "/bin/a".to_string())],
+            "{disk}"
+        );
+        assert!(gone, "its own forget left the row");
     }
 
     #[test]
@@ -4365,7 +4531,7 @@ mod tests {
         .join();
         assert!(l.children.is_poisoned());
         // Neither panics; the poisoning is counted for the hub to note.
-        assert!(!l.is_alive(u32::MAX - 1, 1));
+        assert!(!l.is_alive(u32::MAX - 1, 1, 0));
         assert_eq!(l.reap(u32::MAX - 1, 1), None);
         assert!(!l.children.is_poisoned(), "not recovered");
         assert!(poisonings() > before);
@@ -4379,7 +4545,7 @@ mod tests {
         let path = dir.join("services.json");
         let mut reg = Registry::load(&path);
         for (name, pid) in [("a", 10), ("b", 20), ("c", 30)] {
-            reg.record(name, pid, 1, Path::new("/bin/x"));
+            reg.record(name, pid, 1, Path::new("/bin/x"), 0);
         }
         let mut f = Fake::new(false, false);
         f.only = vec![10, 20, 30];

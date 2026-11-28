@@ -246,6 +246,8 @@ pub struct FakeLauncher {
     pub unresolvable: AtomicBool,
     /// Exit code `reap` reports per pid; absent = unknown.
     pub exit_codes: Mutex<HashMap<u32, i32>>,
+    /// Launch id given to each pid: a call naming another one is not about that child.
+    launches: Mutex<HashMap<u32, u64>>,
 }
 
 impl FakeLauncher {
@@ -274,6 +276,9 @@ impl FakeLauncher {
             .is_some_and(Pipe::writer_gone);
         self.alive.lock().unwrap().contains(&pid)
             && (self.ignore_eof.load(Ordering::SeqCst) || !eof)
+    }
+    fn ours(&self, pid: u32, launch: u64) -> bool {
+        self.launches.lock().unwrap().get(&pid) == Some(&launch)
     }
     /// The child dies: it is no longer alive and its stdout closes.
     pub fn kill(&self, child: &mut FakeChild) {
@@ -317,6 +322,7 @@ impl Launcher for FakeLauncher {
         self.log.lock().unwrap().push(format!("spawn {pid}"));
         self.alive.lock().unwrap().insert(pid);
         self.stdins.lock().unwrap().insert(pid, stdin_pipe);
+        self.launches.lock().unwrap().insert(pid, u64::from(n) + 1);
         self.children.lock().unwrap().push_back(FakeChild {
             pid,
             env: env.clone(),
@@ -330,23 +336,27 @@ impl Launcher for FakeLauncher {
         Ok(Spawned {
             pid,
             start_time: 1,
+            launch: u64::from(n) + 1,
             exe: PathBuf::from("/fake/mcp-server"),
             stdin: Box::new(hub_in),
             stdout: Box::new(hub_out),
         })
     }
-    fn is_alive(&self, pid: u32, _start_time: u64) -> bool {
+    fn is_alive(&self, pid: u32, _start_time: u64, launch: u64) -> bool {
         self.log.lock().unwrap().push(format!("is_alive {pid}"));
-        self.is_alive_quiet(pid)
+        self.ours(pid, launch) && self.is_alive_quiet(pid)
     }
-    fn terminate(&self, pid: u32, _start_time: u64) -> io::Result<()> {
+    fn terminate(&self, pid: u32, _start_time: u64, launch: u64) -> io::Result<()> {
         self.log.lock().unwrap().push(format!("terminate {pid}"));
-        self.alive.lock().unwrap().remove(&pid);
+        if self.ours(pid, launch) {
+            self.alive.lock().unwrap().remove(&pid);
+        }
         Ok(())
     }
-    fn reap(&self, pid: u32, _start_time: u64) -> Option<i32> {
+    fn reap(&self, pid: u32, launch: u64) -> Option<i32> {
         self.log.lock().unwrap().push(format!("reap {pid}"));
-        self.exit_codes.lock().unwrap().get(&pid).copied()
+        let code = self.exit_codes.lock().unwrap().get(&pid).copied();
+        code.filter(|_| self.ours(pid, launch))
     }
     fn resolve(&self, command: &str, _env: &BTreeMap<String, String>) -> Option<PathBuf> {
         if self.unresolvable.load(Ordering::SeqCst) {
