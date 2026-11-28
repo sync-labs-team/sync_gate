@@ -387,6 +387,59 @@ fn check_tree_refuses_a_file_open_for_writing() {
     fs::remove_file(c.data.join("postmaster.pid")).unwrap();
 }
 
+/// B3, Windows: the contract of the DELETE probe that stands in for `open_private_file` in
+/// `check_tree`. Refused, like a read would be: any handle with write or append access to the
+/// data, whatever it shares. Passed, like a read: readers that share deletes, a read-only file.
+/// The one difference, refused here and read by `open_private_file`: a handle that does not share
+/// deletes; told as an error of the system (retry), never as a refusal by the rules.
+#[cfg(windows)]
+#[test]
+fn check_tree_probe_refuses_what_a_read_refuses() {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_APPEND_DATA: u32 = 0x4;
+    const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
+    let (_s, c) = layout("tree-probe");
+    registered(&c);
+    fs::create_dir_all(&c.root).unwrap();
+    fs::write(&c.log, "").unwrap();
+    let open = |access: Option<u32>, share: u32| {
+        let mut o = fs::OpenOptions::new();
+        match access {
+            Some(a) => o.access_mode(a),
+            None => o.read(true),
+        };
+        o.share_mode(share).open(&c.log).unwrap()
+    };
+    let refused_by_both = |h: fs::File, what: &str| {
+        let e = check_tree(&c.root).unwrap_err();
+        assert!(e.to_string().contains("sharing violation"), "{what}: {e}");
+        assert!(!is_policy_refusal(&e), "{what}: {e}");
+        assert!(sync_gate_core::open_private_file(&c.log).is_err(), "{what}");
+        drop(h);
+    };
+    // Writers, sharing everything: a write, an append.
+    refused_by_both(open(Some(0x2), SHARE_ALL), "write");
+    refused_by_both(open(Some(FILE_APPEND_DATA), SHARE_ALL), "append");
+    // A reader that shares deletes, and a read-only file: both pass.
+    let r = open(None, SHARE_ALL);
+    check_tree(&c.root).unwrap();
+    drop(r);
+    let was = fs::metadata(&c.log).unwrap().permissions();
+    let mut p = was.clone();
+    p.set_readonly(true);
+    fs::set_permissions(&c.log, p).unwrap();
+    check_tree(&c.root).unwrap();
+    fs::set_permissions(&c.log, was).unwrap();
+    // The difference: a reader that does not share deletes.
+    let r = open(None, 0x1);
+    let e = check_tree(&c.root).unwrap_err();
+    assert!(e.to_string().contains("sharing violation"), "{e}");
+    assert!(!is_policy_refusal(&e), "{e}");
+    sync_gate_core::open_private_file(&c.log).unwrap();
+    drop(r);
+    check_tree(&c.root).unwrap();
+}
+
 /// 14.3: a refusal by the rules is told apart from an error of the system.
 #[test]
 fn a_policy_refusal_is_told_apart_from_a_system_error() {

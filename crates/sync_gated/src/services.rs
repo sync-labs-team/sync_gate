@@ -2601,11 +2601,12 @@ impl Inner {
     }
 }
 
-/// Loads `leases.json` (R12): readable = known; absent or unreadable in an existing cluster =
-/// unknown (the unreadable file is set aside), and leftover cleanup stays off for good.
+/// Loads `leases.json` (R12): readable = known; absent or not parsing in an existing cluster =
+/// unknown (the unreadable file is set aside), and leftover cleanup stays off for good. A file
+/// that cannot be read now (refused, in use) fails this load: retried, never taken for corrupt.
 fn load_registry(st: &mut State, c: &ClusterPaths) -> Result<(), String> {
     let unknown = match pg_tools::read_registry(&c.leases)? {
-        Ok(bytes) => match parse_registry(&bytes) {
+        Some(bytes) => match parse_registry(&bytes) {
             Some(d) => {
                 st.unknown_before = d.unknown_before;
                 st.rows = d
@@ -2617,8 +2618,7 @@ fn load_registry(st: &mut State, c: &ClusterPaths) -> Result<(), String> {
             }
             None => true,
         },
-        Err(e) if e.kind() == io::ErrorKind::NotFound => c.record.exists(),
-        Err(_) => true,
+        None => c.record.exists(),
     };
     st.rows.clear();
     if !unknown {
@@ -2640,7 +2640,7 @@ fn load_registry(st: &mut State, c: &ClusterPaths) -> Result<(), String> {
 /// existing cluster = unknown for templates only (the unreadable file is set aside).
 fn load_templates(st: &mut State, c: &ClusterPaths) -> Result<(), String> {
     let unknown = match pg_tools::read_registry(&c.templates)? {
-        Ok(bytes) => match parse_templates(&bytes) {
+        Some(bytes) => match parse_templates(&bytes) {
             Some(d) => {
                 st.tpl_unknown = d.unknown_before;
                 st.next_seq = d.next_seq;
@@ -2655,8 +2655,7 @@ fn load_templates(st: &mut State, c: &ClusterPaths) -> Result<(), String> {
             }
             None => true,
         },
-        Err(e) if e.kind() == io::ErrorKind::NotFound => c.record.exists(),
-        Err(_) => true,
+        None => c.record.exists(),
     };
     st.templates.clear();
     st.next_seq = 1;

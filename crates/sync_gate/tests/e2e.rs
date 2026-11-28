@@ -872,6 +872,37 @@ fn a_ticket_that_cannot_be_saved_leaves_no_file_and_runs_directly() {
     assert!(env.pending_files().is_empty(), "{:?}", env.pending_files());
 }
 
+/// 14.1 (B1): a ticket written in part whose cleanup fails too is not called removed: the error
+/// names the file left behind, and the command still runs here, once.
+#[test]
+fn a_torn_ticket_that_cannot_be_removed_is_named() {
+    let env = Env::new();
+    let (cfg, m) = one_job();
+    let d = env.start(cfg, m, OsControl);
+    let fa = env.file("a");
+    let a = Proc::spawn(env.run(&[], &env.ticker("a", 400)));
+    wait_for("a ticking", 20, || read_n(&fa) > 0);
+    let mut c = env.run(&["--max-wait", "0"], &env.ticker("b", 3));
+    c.env("SYNC_GATE_TEST_FAIL", "pending-write,pending-cleanup");
+    let b = Proc::spawn(c).finish();
+    std::fs::write(env.file("a.stop"), "").unwrap();
+    assert_eq!(a.finish().code, 0);
+    d.shutdown();
+    assert_eq!(b.code, 0, "{}", b.stderr);
+    assert_eq!(read_n(&env.file("b")), 3);
+    let left = env.pending_files();
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(
+        b.stderr.contains("could not be removed") && b.stderr.contains(&*left[0].to_string_lossy()),
+        "{}",
+        b.stderr
+    );
+    // Written in part: never a whole ticket that `wait` would run.
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&left[0]).unwrap()).is_err()
+    );
+}
+
 /// 14.1: an empty ticket file (owner and DACL fine) is refused as unreadable; nothing runs.
 #[test]
 fn wait_refuses_an_empty_ticket_file() {
@@ -3664,8 +3695,9 @@ fn shims_remove_says_when_it_is_partial() {
     assert!(s.exists(&npm));
 }
 
-/// 14.4, Windows: an entry remove cannot check is named and makes the removal partial, never
-/// skipped in silence.
+/// 14.4 (B2), Windows: an entry remove cannot check is named, may still be a shim of ours, so the
+/// manifest stays (the folder is still skipped when a real program is looked up) and the removal
+/// fails naming it; never skipped in silence.
 #[cfg(windows)]
 #[test]
 fn shims_remove_names_an_entry_it_cannot_check() {
@@ -3688,14 +3720,15 @@ fn shims_remove_names_an_entry_it_cannot_check() {
     icacls(&["/deny", &me]);
     let (code, out, err) = s.run("remove");
     icacls(&["/reset"]);
-    assert_eq!(code, 0, "{out}{err}");
+    assert_ne!(code, 0, "{out}{err}");
     let all = out + &err;
     assert!(
         all.contains(&format!("kept: {}: cannot check it", shim_name("npm"))),
         "{all}"
     );
-    assert!(all.contains("not all shims were removed"), "{all}");
+    assert!(all.contains("the manifest stays"), "{all}");
     assert!(npm.exists());
+    assert!(s.exists("sync_gate_shims.json"));
 }
 
 #[test]
@@ -3711,6 +3744,24 @@ fn hook_session_skips_an_unsafe_shims_folder() {
         !ctx.contains("ahead of the shims folder on PATH for Bash"),
         "{ctx}"
     );
+}
+
+/// B5, Windows: a refused shims folder (here a shim others can change) that is ALREADY on the
+/// inherited PATH (put there by hand, as `shims install` suggests): the hook adds nothing and never
+/// tells the agent the shims are active; it cannot take the folder off a PATH it did not set
+/// (SECURITY.md "Declared limits": delete the folder).
+#[cfg(windows)]
+#[test]
+fn hook_session_with_a_refused_shims_folder_already_on_path() {
+    let h = Hook::new();
+    h.s.ok("install");
+    file_open_to_others(&h.s.path(&shim_name("npm")));
+    std::fs::write(&h.file, "").unwrap();
+    let path = format!("{};{}", h.s.dir().display(), Hook::base_path());
+    let (ctx, after) = h.start(HOOK_STDIN, &path);
+    assert!(!has_path_line(&after), "{after}");
+    assert!(ctx.contains("sync_gate run --"), "{ctx}");
+    assert!(!ctx.contains("ahead of the shims folder on PATH"), "{ctx}");
 }
 
 /// A PATH assigned by someone else is never overwritten, whatever its form.
