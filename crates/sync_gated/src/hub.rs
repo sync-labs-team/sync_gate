@@ -1895,8 +1895,10 @@ fn target(g: &Inst, c: ClientId, max_in_flight: u32, sub: bool) -> Option<usize>
         .or_else(|| (single && !g.units.iter().any(|u| u.mux.ready())).then_some(0))
 }
 
-/// The pool as `decide` sees it. Requests waiting for a subscriber's unit are left out (a new
-/// unit would not serve them) and that unit never counts as idle. Neither does a unit in its
+/// The pool as `decide` sees it. Requests of a subscriber are left out (a new unit would not
+/// serve its subscription changes; its other requests wait only while every ready unit is full,
+/// and its own unit, down with 0 in flight, blocks growth anyway) and that unit never counts as
+/// idle. Neither does a unit in its
 /// crash-loop pause, one that came up unsupported or one with a crash in the crash window:
 /// shrinking them would drop the Task 5 state that stops respawning, and the pool would grow a
 /// fresh copy at once. With 0 in flight they
