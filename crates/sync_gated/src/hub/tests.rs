@@ -391,7 +391,7 @@ fn env_from_secret_never_leaves_memory() {
 }
 
 #[test]
-fn unsupported_child_is_stopped_and_the_server_is_unavailable_for_good() {
+fn unsupported_child_is_stopped_and_the_server_is_unavailable_until_its_retry() {
     let l = Arc::new(FakeLauncher::default());
     let hub = hub(&l);
     let c = connect(&hub, hello("docs", &[], "/r"));
@@ -404,7 +404,7 @@ fn unsupported_child_is_stopped_and_the_server_is_unavailable_for_good() {
         notes_contain(
             &hub,
             &mut notes,
-            "mcp docs: no supported protocol version; not restarting",
+            "mcp docs: no supported protocol version; not restarting for 10 min",
         )
     });
     assert!(notes_contain(
@@ -419,9 +419,9 @@ fn unsupported_child_is_stopped_and_the_server_is_unavailable_for_good() {
         c.closed.load(Ordering::SeqCst)
     });
     assert_eq!(c.rest(), Vec::<String>::new());
-    // For good: long after the pause and the idle stop, hellos are still refused.
-    hub.tick(Instant::now() + Duration::from_secs(600));
-    hub.tick(Instant::now() + Duration::from_secs(6000));
+    // Long after the crash-loop pause and the idle stop, but before the retry: still refused.
+    hub.tick(Instant::now() + CRASH_PAUSE + Duration::from_secs(1));
+    hub.tick(Instant::now() + UNSUPPORTED_RETRY - Duration::from_secs(1));
     let c2 = connect(&hub, hello("docs", &[], "/r"));
     assert_eq!(c2.reply(), unavailable());
     assert_eq!(l.spawns(), 1, "an unsupported server was restarted");
@@ -456,17 +456,6 @@ fn an_unsupported_first_child_answers_no_queued_initialize() {
     hub.shutdown();
 }
 
-/// The child takes the legacy path and rejects `initialize`: the mux gives it up.
-fn reject_initialize(child: &mut FakeChild) {
-    let probe = child.next();
-    let no = json!({"code": -32601, "message": "no"});
-    child.send(json!({"jsonrpc": "2.0", "id": probe["id"], "error": no}));
-    let init = child.next();
-    assert_eq!(init["method"], "initialize");
-    let boom = json!({"code": -32603, "message": "boom"});
-    child.send(json!({"jsonrpc": "2.0", "id": init["id"], "error": boom}));
-}
-
 #[test]
 fn the_fifth_failed_initialize_answers_no_queued_initialize() {
     let l = Arc::new(FakeLauncher::default());
@@ -475,18 +464,11 @@ fn the_fifth_failed_initialize_answers_no_queued_initialize() {
     assert_eq!(c.reply(), HubReply::Ok);
     for n in 1..=4 {
         let mut child = l.take_child();
-        reject_initialize(&mut child);
-        wait_until("the failure to be seen", || {
-            lock(&hub.inner.map)
-                .instances
-                .values()
-                .all(|i| !matches!(lock(&i.st).units[0].child, Child::Running(_)))
-        });
-        hub.tick(Instant::now() + Duration::from_secs(20));
+        time_out_initialize(&hub, &mut child);
+        hub.tick(Instant::now() + Duration::from_secs(340));
         assert_eq!(l.spawns(), n + 1, "after failure {n}");
     }
     let mut child = l.take_child();
-    let probe = child.next();
     // The reader handles lines in order: this parse error proves initialize is queued.
     c.send(initialize_request(0));
     c.send_raw("{");
@@ -494,12 +476,7 @@ fn the_fifth_failed_initialize_answers_no_queued_initialize() {
         c.recv(),
         json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "parse error"}})
     );
-    let no = json!({"code": -32601, "message": "no"});
-    child.send(json!({"jsonrpc": "2.0", "id": probe["id"], "error": no}));
-    let init = child.next();
-    assert_eq!(init["method"], "initialize");
-    let boom = json!({"code": -32603, "message": "boom"});
-    child.send(json!({"jsonrpc": "2.0", "id": init["id"], "error": boom}));
+    time_out_initialize(&hub, &mut child);
     wait_until("the client to be disconnected", || {
         c.closed.load(Ordering::SeqCst)
     });
@@ -567,6 +544,15 @@ fn a_spawn_error_disconnects_at_once_and_refuses_hellos_until_the_pause_ends() {
     hub.shutdown();
 }
 
+/// Not a modern server: the hub sends `initialize`, which the child never answers; the request
+/// timeout (300 s) gives it up.
+fn time_out_initialize(hub: &Hub, child: &mut FakeChild) {
+    refuse_probe_then_initialize(child);
+    hub.tick(Instant::now() + Duration::from_secs(301));
+}
+
+/// A child that never answers `initialize` is restarted through the backoff (one that rejects
+/// it makes the key run directly: `a_server_that_rejects_initialize_falls_back_to_direct`).
 #[test]
 fn failed_child_is_restarted() {
     let l = Arc::new(FakeLauncher::default());
@@ -574,18 +560,9 @@ fn failed_child_is_restarted() {
     let c = connect(&hub, hello("docs", &[], "/r"));
     assert_eq!(c.reply(), HubReply::Ok);
     let mut child = l.take_child();
-    // Not a modern server: the hub falls back to `initialize`, which the child rejects.
-    let probe = child.next();
-    child.send(
-        json!({"jsonrpc": "2.0", "id": probe["id"], "error": {"code": -32601, "message": "no"}}),
-    );
-    let init = child.next();
-    assert_eq!(init["method"], "initialize");
-    child.send(
-        json!({"jsonrpc": "2.0", "id": init["id"], "error": {"code": -32603, "message": "boom"}}),
-    );
+    time_out_initialize(&hub, &mut child);
     wait_until("stop_own", || l.calls().contains(&"reap 100".to_string()));
-    hub.tick(Instant::now() + Duration::from_secs(2));
+    hub.tick(Instant::now() + Duration::from_secs(340));
     assert_eq!(l.spawns(), 2);
     let mut child = l.take_child();
     child.handshake();
@@ -600,7 +577,7 @@ fn failed_child_is_restarted() {
     assert!(notes_contain(
         &hub,
         &mut notes,
-        "mcp docs: child rejected initialize"
+        "mcp docs: child did not answer initialize in time"
     ));
     hub.shutdown();
 }
@@ -1666,7 +1643,7 @@ fn a_crash_looping_extra_instance_is_kept_until_its_pause_ends() {
 }
 
 #[test]
-fn an_unsupported_extra_instance_is_never_respawned() {
+fn an_unsupported_extra_instance_is_not_respawned_before_its_retry() {
     let l = Arc::new(FakeLauncher::default());
     let hub = patient_pool_hub(&l, 2, 1);
     let (mut c, mut first) = pool_client(&hub, &l, false);
@@ -1678,7 +1655,7 @@ fn an_unsupported_extra_instance_is_never_respawned() {
     let probe = second.next();
     second.send(json!({"jsonrpc": "2.0", "id": probe["id"], "result": {"supportedVersions": ["2099-01-01"]}}));
     wait_until("stop_own", || l.calls().contains(&"reap 101".to_string()));
-    for s in [130, 400, 1000, 3000] {
+    for s in [130, 400, 590] {
         hub.tick(Instant::now() + Duration::from_secs(s));
     }
     assert_eq!(l.spawns(), 2, "an unsupported instance was replaced");
@@ -2467,5 +2444,301 @@ fn a_stopper_thread_that_cannot_start_is_noted() {
         1,
         "{notes:?}"
     );
+    hub.shutdown();
+}
+
+// ---- #2 items 7, 8 and 18 (hub) ----------------------------------------------------------
+
+/// The legacy path: the probe is refused, then comes `initialize` (returned).
+fn refuse_probe_then_initialize(child: &mut FakeChild) -> Value {
+    let probe = child.next();
+    let no = json!({"code": -32601, "message": "no"});
+    child.send(json!({"jsonrpc": "2.0", "id": probe["id"], "error": no}));
+    let init = child.next();
+    assert_eq!(init["method"], "initialize");
+    init
+}
+
+/// A client line that waits in the mux: the parse error the reader sends after it is the
+/// barrier (the reader handles lines in order).
+fn queue_in_the_mux(c: &mut TestClient, line: &str) {
+    c.send_raw(line);
+    c.send_raw("{");
+    assert_eq!(c.recv()["error"]["code"], -32700);
+}
+
+#[test]
+fn a_server_that_rejects_initialize_falls_back_to_direct() {
+    let l = Arc::new(FakeLauncher::default());
+    let hub = hub(&l);
+    let mut c = connect_draining(&hub, hello("docs", &[], "/r"));
+    assert_eq!(c.reply(), HubReply::Ok);
+    let mut child = l.take_child();
+    queue_in_the_mux(&mut c, &initialize_request(0).to_string());
+    let init = refuse_probe_then_initialize(&mut child);
+    let boom = json!({"code": -32603, "message": "boom"});
+    child.send(json!({"jsonrpc": "2.0", "id": init["id"], "error": boom}));
+    wait_until("the client to be disconnected", || {
+        c.closed.load(Ordering::SeqCst)
+    });
+    // Unanswered: the relay replays its initialize on its own server.
+    assert_eq!(c.rest(), Vec::<String>::new());
+    let mut notes = Vec::new();
+    let note =
+        "mcp docs: unavailable through the hub (initialize rejected); sessions run it directly";
+    assert!(notes_contain(&hub, &mut notes, note), "{notes:?}");
+    wait_until("stop_own", || l.calls().contains(&"reap 100".to_string()));
+    assert_eq!(
+        connect(&hub, hello("docs", &[], "/r")).reply(),
+        unavailable()
+    );
+    assert_eq!(l.spawns(), 1, "retried at once");
+    hub.tick(Instant::now() + CRASH_PAUSE + Duration::from_secs(1));
+    let again = connect(&hub, hello("docs", &[], "/r"));
+    assert_eq!(again.reply(), HubReply::Ok);
+    assert_eq!(l.spawns(), 2);
+    hub.shutdown();
+}
+
+/// MCP 2026-07-28 stdio fallback: a modern server whose `server/discover` answer comes after
+/// the probe timeout gets `initialize`, which it rejects. The session still works: directly.
+#[test]
+fn a_discover_answer_after_the_probe_timeout_falls_back_to_direct() {
+    let l = Arc::new(FakeLauncher::default());
+    let hub = hub(&l);
+    let mut c = connect_draining(&hub, hello("docs", &[], "/r"));
+    assert_eq!(c.reply(), HubReply::Ok);
+    let mut child = l.take_child();
+    queue_in_the_mux(&mut c, &initialize_request(0).to_string());
+    let probe = child.next();
+    hub.tick(Instant::now() + sync_gate_hub::PROBE_TIMEOUT + Duration::from_millis(100));
+    let init = child.next();
+    assert_eq!(init["method"], "initialize");
+    let result = json!({"supportedVersions": ["2026-07-28"], "capabilities": {"tools": {}}});
+    child.send(json!({"jsonrpc": "2.0", "id": probe["id"], "result": result}));
+    let no = json!({"code": -32601, "message": "initialize is not supported"});
+    child.send(json!({"jsonrpc": "2.0", "id": init["id"], "error": no}));
+    wait_until("the client to be disconnected", || {
+        c.closed.load(Ordering::SeqCst)
+    });
+    assert_eq!(c.rest(), Vec::<String>::new());
+    let mut notes = Vec::new();
+    assert!(
+        notes_contain(&hub, &mut notes, "(initialize rejected)"),
+        "{notes:?}"
+    );
+    hub.shutdown();
+}
+
+/// A pool of 2 with 1 request in flight each: A subscribed on the SECOND instance, B holds the
+/// first one's only slot with `held`.
+struct Pinned {
+    hub: Hub,
+    l: Arc<FakeLauncher>,
+    a: TestClient,
+    b: TestClient,
+    first: FakeChild,
+    second: FakeChild,
+    held: Value,
+}
+
+fn pinned_to_the_second() -> Pinned {
+    let l = Arc::new(FakeLauncher::default());
+    let hub = patient_pool_hub(&l, 2, 1);
+    let (mut a, first) = pool_client(&hub, &l, true);
+    let mut b = connect(&hub, hello("docs", &[], "/r"));
+    assert_eq!(b.reply(), HubReply::Ok);
+    let held = overflow(&hub, &mut b, &first, 1..=2, 1).remove(0);
+    let mut second = grow(&hub, &l, true);
+    let moved = second.next();
+    reply_to(&mut second, &moved);
+    assert_eq!(b.recv()["id"], 2);
+    // The first instance is full: A's subscription lands on the second.
+    a.send(
+        json!({"jsonrpc": "2.0", "id": 1, "method": "resources/subscribe", "params": {"uri": "u"}}),
+    );
+    let sub = second.next();
+    assert_eq!(sub["method"], "resources/subscribe");
+    reply_to(&mut second, &sub);
+    assert_eq!(a.recv()["id"], 1);
+    Pinned {
+        hub,
+        l,
+        a,
+        b,
+        first,
+        second,
+        held,
+    }
+}
+
+/// A's `resources/read` went to `first` and its echo came back to A.
+fn served_by(a: &TestClient, first: &mut FakeChild) {
+    let seen = first.next();
+    assert_eq!(seen["method"], "resources/read");
+    reply_to(first, &seen);
+    let r = a.recv();
+    assert_eq!(r["id"], 5, "{r}");
+    assert_eq!(r["result"]["echo"], "resources/read", "{r}");
+}
+
+#[test]
+fn a_subscriber_of_an_instance_in_backoff_is_served_by_a_healthy_one() {
+    let Pinned {
+        hub,
+        l,
+        mut a,
+        b,
+        mut first,
+        mut second,
+        held,
+    } = pinned_to_the_second();
+    reply_to(&mut first, &held);
+    assert_eq!(b.recv()["id"], 1);
+    l.kill(&mut second);
+    wait_until("the crash to be seen", || docs(&hub).instances == 1);
+    // No tick: the second instance stays in its backoff, and the first has room.
+    a.send(request(5, "resources/read"));
+    served_by(&a, &mut first);
+    hub.shutdown();
+}
+
+#[test]
+fn a_subscriber_of_a_paused_instance_is_served_by_a_healthy_one() {
+    let Pinned {
+        hub,
+        l,
+        mut a,
+        b,
+        mut first,
+        mut second,
+        held,
+    } = pinned_to_the_second();
+    for n in 1..=5 {
+        l.kill(&mut second);
+        wait_until("the crash to be seen", || docs(&hub).instances == 1);
+        hub.tick(Instant::now() + Duration::from_secs(60));
+        let expected = if n < 5 { n + 2 } else { 6 };
+        assert_eq!(l.spawns(), expected, "after crash {n}");
+        if n < 5 {
+            second = l.take_child();
+        }
+    }
+    let mut notes = Vec::new();
+    assert!(
+        notes_contain(&hub, &mut notes, "keeps crashing"),
+        "{notes:?}"
+    );
+    // The first instance is healthy but full: A waits for it, and never gets "keeps crashing".
+    a.send(request(5, "resources/read"));
+    wait_until("A to wait for the healthy instance", || queued(&hub) == 1);
+    reply_to(&mut first, &held);
+    assert_eq!(b.recv()["id"], 1);
+    served_by(&a, &mut first);
+    hub.shutdown();
+}
+
+#[test]
+fn an_unsupported_instance_is_retried_after_its_ttl() {
+    // The TTL is 10 minutes.
+    let ttl = Duration::from_secs(600);
+    let l = Arc::new(FakeLauncher::default());
+    // Never idle-retired here: the retry itself must clear the verdict, not a fresh instance.
+    let mut cfg = config();
+    if let Some(d) = cfg.mcp.get_mut("docs") {
+        d.idle_stop_secs = 3600;
+    }
+    let hub = Hub::new(&cfg, l.clone(), None, None);
+    let c = connect(&hub, hello("docs", &[], "/r"));
+    assert_eq!(c.reply(), HubReply::Ok);
+    let mut child = l.take_child();
+    let probe = child.next();
+    let result = json!({"supportedVersions": ["2099-01-01"]});
+    child.send(json!({"jsonrpc": "2.0", "id": probe["id"], "result": result}));
+    wait_until("the client to be disconnected", || {
+        c.closed.load(Ordering::SeqCst)
+    });
+    // The TTL counts from the decision, which came after this.
+    let t0 = Instant::now();
+    hub.tick(t0 + ttl - Duration::from_secs(1));
+    assert_eq!(
+        connect(&hub, hello("docs", &[], "/r")).reply(),
+        unavailable()
+    );
+    hub.tick(t0 + ttl + Duration::from_secs(1));
+    // A tick between the retry and the next hello must not bring the old verdict back.
+    hub.tick(t0 + ttl + Duration::from_secs(2));
+    let again = connect(&hub, hello("docs", &[], "/r"));
+    assert_eq!(again.reply(), HubReply::Ok);
+    assert_eq!(l.spawns(), 2, "not retried after the TTL");
+    hub.shutdown();
+}
+
+#[test]
+fn crash_history_survives_idle_retirement() {
+    let l = Arc::new(FakeLauncher::default());
+    let hub = hub(&l);
+    // Each session crashes the server and leaves; each tick is past the backoff and
+    // idle_stop_secs (10 s), and all of them are well inside the 60 s crash window.
+    for n in 1..=5 {
+        let mut c = connect(&hub, hello("docs", &[], "/r"));
+        assert_eq!(c.reply(), HubReply::Ok, "session {n}");
+        let mut child = l.take_child();
+        l.kill(&mut child);
+        wait_until("the crash to be seen", || docs(&hub).instances == 0);
+        c.hang_up();
+        wait_until("the client to leave", || docs(&hub).clients == 0);
+        hub.tick(Instant::now() + Duration::from_secs(11));
+    }
+    assert_eq!(l.spawns(), 5);
+    let mut notes = Vec::new();
+    assert!(
+        notes_contain(&hub, &mut notes, "keeps crashing"),
+        "{notes:?}"
+    );
+    assert_eq!(
+        connect(&hub, hello("docs", &[], "/r")).reply(),
+        unavailable()
+    );
+    hub.shutdown();
+}
+
+#[test]
+fn a_deep_json_request_during_crash_backoff_is_answered() {
+    let l = Arc::new(FakeLauncher::default());
+    let hub = hub(&l);
+    let mut c = connect(&hub, hello("docs", &[], "/r"));
+    assert_eq!(c.reply(), HubReply::Ok);
+    let mut child = l.take_child();
+    child.handshake();
+    l.kill(&mut child);
+    wait_until("the crash to be seen", || docs(&hub).instances == 0);
+    // In the backoff, the deepest request the hub takes waits in the mux...
+    queue_in_the_mux(&mut c, &deep_request(1, DEEPEST_OK));
+    assert_eq!(l.spawns(), 1);
+    // ...and reaches the next child, whose deepest answer reaches the client.
+    hub.tick(Instant::now() + Duration::from_secs(2));
+    let mut child = l.take_child();
+    child.handshake();
+    let seen = child.next();
+    assert_eq!(seen["method"], "tools/call");
+    assert_eq!(
+        seen["params"],
+        serde_json::from_str::<Value>(&nested(DEEPEST_OK)).unwrap()
+    );
+    let result = nested(DEEPEST_OK);
+    child.send_raw(&format!(
+        r#"{{"jsonrpc":"2.0","id":{},"result":{result}}}"#,
+        seen["id"]
+    ));
+    let reply = recv_id(&c, 1);
+    assert!(reply["result"].is_array(), "{reply}");
+    // A deep request that waits through its whole deadline is answered too.
+    l.kill(&mut child);
+    wait_until("the crash to be seen", || docs(&hub).instances == 0);
+    queue_in_the_mux(&mut c, &deep_request(2, DEEPEST_OK));
+    hub.tick(Instant::now() + Duration::from_secs(301));
+    let late = recv_id(&c, 2);
+    assert_eq!(late["error"]["code"], -32001, "{late}");
     hub.shutdown();
 }
