@@ -1444,8 +1444,11 @@ fn an_expired_hub_queued_request_never_reaches_the_server() {
     let e = c.recv();
     assert_eq!(e["id"], 2);
     assert_eq!(e["error"]["code"], -32001);
-    assert!(
-        child.stays_silent(Duration::from_millis(200)),
+    // The server reads its stdin in order: had request 2 gone out, it would come first.
+    c.send(request(3, "tools/list"));
+    assert_eq!(
+        child.next()["method"],
+        "tools/list",
         "the expired request reached the server"
     );
     hub.shutdown();
@@ -1995,7 +1998,11 @@ fn hubreload_a_bare_name_with_no_safe_candidate_runs_per_session() {
     let hub = Hub::new(&cfg, Arc::new(crate::OsLauncher::default()), None, None);
     let c = connect(&hub, hello("node", &[], "/r"));
     assert_eq!(c.reply(), HubReply::PerSession);
-    std::thread::sleep(Duration::from_millis(300));
+    // Only an instance's unit is ever started: with none, nothing ran and nothing will.
+    assert!(
+        lock(&hub.inner.map).instances.is_empty(),
+        "the hub took the server"
+    );
     assert!(!marker.exists(), "the shim ran");
     hub.shutdown();
     let _ = std::fs::remove_dir_all(&d);
@@ -2217,8 +2224,16 @@ fn hubreload_the_hub_starts_the_file_it_compared_or_nothing() {
     wait_until("the hub to start the server", || {
         !l.asked.lock().unwrap().is_empty()
     });
-    // Time for whatever was started to leave its mark.
-    std::thread::sleep(Duration::from_secs(1));
+    // A start that failed pauses the unit; a process that ran ends with its stdout, after its
+    // mark. Either way nothing is left Starting or Running.
+    wait_until("whatever was started to end", || {
+        lock(&hub.inner.map).instances.values().all(|i| {
+            lock(&i.st)
+                .units
+                .iter()
+                .all(|u| !matches!(u.child, Child::Starting | Child::Running(_)))
+        })
+    });
     let asked = l.asked.lock().unwrap().clone();
     hub.shutdown();
     assert!(
