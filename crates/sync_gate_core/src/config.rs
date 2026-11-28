@@ -420,6 +420,19 @@ fn mcp_error(name: &str, s: &McpServer) -> Option<String> {
         Some("name must match [A-Za-z0-9_-]{1,64}")
     } else if s.command.trim().is_empty() {
         Some("command must not be empty")
+    } else if s
+        .env
+        .keys()
+        .chain(&s.env_from)
+        .any(|n| n.is_empty() || n.contains(['=', '\0']))
+    {
+        Some("env and env_from names must be non-empty, without '=' or NUL")
+    } else if s
+        .cwd
+        .as_deref()
+        .is_some_and(|d| d != "inherit" && (!Path::new(d).is_absolute() || d.contains('\0')))
+    {
+        Some("cwd must be \"inherit\" or an absolute path")
     } else if !(1..=16).contains(&s.max_instances) {
         Some("max_instances must be in 1..=16")
     } else if !(1..=1024).contains(&s.max_in_flight) {
@@ -776,6 +789,41 @@ env_from=[\"DOCS_TOKEN\"]",
                 .contains("mcp.docs: DOCS_TOKEN is in both env and env_from"),
             "{e}"
         );
+    }
+
+    // #2 item 20. A name with `=` or NUL cannot be one environment variable (POSIX.1-2017, 8.1:
+    // names do not contain '='; NUL ends the C string), and an empty one is no name.
+    #[test]
+    fn env_names_with_equals_or_nul_are_refused() {
+        for name in ["", "A=B", "=A", "A\\u0000B"] {
+            for t in [
+                format!("[mcp.a]\ncommand=\"x\"\nenv={{\"{name}\"=\"v\"}}"),
+                format!("[mcp.a]\ncommand=\"x\"\nenv_from=[\"{name}\"]"),
+            ] {
+                let e = Config::from_toml(&t).unwrap_err().to_string();
+                assert!(e.contains("[mcp.a] env and env_from names"), "{t}: {e}");
+            }
+        }
+        assert!(
+            Config::from_toml("[mcp.a]\ncommand=\"x\"\nenv={A_1=\"=\"}\nenv_from=[\"B\"]").is_ok()
+        );
+    }
+
+    // #2 item 20. The hub runs a server from the daemon's folder and the relay from the session's,
+    // so a relative `cwd` would name two folders; only `"inherit"` or an absolute path are kept.
+    #[test]
+    fn a_relative_cwd_is_refused() {
+        for cwd in ["", "rel", "./rel", "../up", "rel/sub"] {
+            let t = format!("[mcp.a]\ncommand=\"x\"\ncwd=\"{cwd}\"");
+            let e = Config::from_toml(&t).unwrap_err().to_string();
+            assert!(e.contains("[mcp.a] cwd must be"), "{cwd}: {e}");
+        }
+        let nul = format!("[mcp.a]\ncommand=\"x\"\ncwd=\"{}\\u0000b\"", abs("/a"));
+        assert!(Config::from_toml(&nul).is_err());
+        for cwd in ["inherit".to_string(), abs("/srv/docs")] {
+            let t = format!("[mcp.a]\ncommand=\"x\"\ncwd=\"{cwd}\"");
+            assert!(Config::from_toml(&t).is_ok(), "{cwd}");
+        }
     }
 
     /// Fixtures must be absolute on every platform: `/x` is relative on Windows.
