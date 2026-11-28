@@ -420,8 +420,9 @@ fn unsupported_child_is_stopped_and_the_server_is_unavailable_until_its_retry() 
     });
     assert_eq!(c.rest(), Vec::<String>::new());
     // Long after the crash-loop pause and the idle stop, but before the retry: still refused.
+    let until = unsupported_until(&hub, 0);
     hub.tick(Instant::now() + CRASH_PAUSE + Duration::from_secs(1));
-    hub.tick(Instant::now() + UNSUPPORTED_RETRY - Duration::from_secs(1));
+    hub.tick(until - Duration::from_secs(1));
     let c2 = connect(&hub, hello("docs", &[], "/r"));
     assert_eq!(c2.reply(), unavailable());
     assert_eq!(l.spawns(), 1, "an unsupported server was restarted");
@@ -2669,24 +2670,38 @@ fn an_unsupported_instance_is_retried_after_its_ttl() {
     let mut child = l.take_child();
     let probe = child.next();
     let result = json!({"supportedVersions": ["2099-01-01"]});
+    let before = Instant::now();
     child.send(json!({"jsonrpc": "2.0", "id": probe["id"], "result": result}));
     wait_until("the client to be disconnected", || {
         c.closed.load(Ordering::SeqCst)
     });
-    // The TTL counts from the decision, which came after this.
-    let t0 = Instant::now();
-    hub.tick(t0 + ttl - Duration::from_secs(1));
+    let until = unsupported_until(&hub, 0);
+    assert!(
+        until >= before + ttl && until <= Instant::now() + ttl,
+        "the retry is not 10 min after the decision"
+    );
+    hub.tick(until - Duration::from_secs(1));
     assert_eq!(
         connect(&hub, hello("docs", &[], "/r")).reply(),
         unavailable()
     );
-    hub.tick(t0 + ttl + Duration::from_secs(1));
+    hub.tick(until + Duration::from_secs(1));
     // A tick between the retry and the next hello must not bring the old verdict back.
-    hub.tick(t0 + ttl + Duration::from_secs(2));
+    hub.tick(until + Duration::from_secs(2));
     let again = connect(&hub, hello("docs", &[], "/r"));
     assert_eq!(again.reply(), HubReply::Ok);
     assert_eq!(l.spawns(), 2, "not retried after the TTL");
     hub.shutdown();
+}
+
+/// When unit `i` of the only instance is retried after its unsupported verdict.
+fn unsupported_until(hub: &Hub, i: usize) -> Instant {
+    let map = lock(&hub.inner.map);
+    let inst = map.instances.values().next().expect("an instance");
+    match lock(&inst.st).units[i].child {
+        Child::Unsupported { until } => until,
+        _ => panic!("unit {i} is not unsupported"),
+    }
 }
 
 #[test]
@@ -2755,5 +2770,108 @@ fn a_deep_json_request_during_crash_backoff_is_answered() {
     hub.tick(Instant::now() + Duration::from_secs(301));
     let late = recv_id(&c, 2);
     assert_eq!(late["error"]["code"], -32001, "{late}");
+    hub.shutdown();
+}
+
+#[test]
+fn a_subscriber_s_subscription_changes_wait_for_its_own_instance() {
+    let Pinned {
+        hub,
+        l,
+        mut a,
+        mut b,
+        mut first,
+        mut second,
+        held,
+    } = pinned_to_the_second();
+    reply_to(&mut first, &held);
+    assert_eq!(b.recv()["id"], 1);
+    l.kill(&mut second);
+    wait_until("the crash to be seen", || docs(&hub).instances == 1);
+    // The first instance has room, yet neither change may go there: it holds none of A's
+    // subscriptions, and the second would restore "u" when it comes back.
+    // Subscribe first: A still holds "u" when it goes, so both belong to the second instance.
+    a.send(
+        json!({"jsonrpc": "2.0", "id": 7, "method": "resources/subscribe", "params": {"uri": "v"}}),
+    );
+    a.send(json!({"jsonrpc": "2.0", "id": 6, "method": "resources/unsubscribe", "params": {"uri": "u"}}));
+    wait_until("A's changes to wait for their instance", || {
+        queued(&hub) == 2
+    });
+    hub.tick(Instant::now() + Duration::from_secs(2));
+    let mut third = l.take_child();
+    third.handshake_legacy();
+    let restore = third.next();
+    assert_eq!(restore["method"], "resources/subscribe");
+    assert_eq!(restore["params"]["uri"], "u");
+    reply_to(&mut third, &restore);
+    for (id, method, uri) in [
+        (7, "resources/subscribe", "v"),
+        (6, "resources/unsubscribe", "u"),
+    ] {
+        let seen = third.next();
+        assert_eq!(
+            (seen["method"].as_str(), seen["params"]["uri"].as_str()),
+            (Some(method), Some(uri))
+        );
+        reply_to(&mut third, &seen);
+        assert_eq!(a.recv()["id"], id);
+    }
+    // The first instance never saw them: the next line it reads is B's.
+    b.send(request(9, "tools/list"));
+    assert_eq!(first.next()["method"], "tools/list");
+    hub.shutdown();
+}
+
+#[test]
+fn an_extra_instance_with_a_recent_crash_is_not_shrunk() {
+    let l = Arc::new(FakeLauncher::default());
+    let hub = patient_pool_hub(&l, 2, 1);
+    let (mut c, mut first) = pool_client(&hub, &l, false);
+    let held = overflow(&hub, &mut c, &first, 1..=2, 1);
+    let mut second = grow(&hub, &l, false);
+    second.answer();
+    reply_to(&mut first, &held[0]);
+    assert_eq!(reply_ids(&c, 2), [1, 2].into());
+    // Idle well past SHRINK_IDLE, with a crash 10 s before that tick.
+    let t = Instant::now() + SHRINK_IDLE + Duration::from_secs(1);
+    {
+        let map = lock(&hub.inner.map);
+        let inst = map.instances.values().next().unwrap();
+        lock(&inst.st).units[1]
+            .crashes
+            .push_back(t - Duration::from_secs(10));
+    }
+    hub.tick(t);
+    assert_eq!(docs(&hub).instances, 2, "shrunk with its crash history");
+    hub.tick(t + CRASH_WINDOW);
+    assert_eq!(docs(&hub).instances, 1);
+    hub.shutdown();
+}
+
+#[test]
+fn an_unsupported_extra_instance_keeps_the_key_until_its_retry() {
+    let l = Arc::new(FakeLauncher::default());
+    let hub = patient_pool_hub(&l, 2, 1);
+    let (mut c, first) = pool_client(&hub, &l, false);
+    overflow(&hub, &mut c, &first, 1..=2, 1);
+    hub.set_memory(4 * GIB, GIB / 2);
+    hub.tick(Instant::now() + GROW_WAIT + Duration::from_millis(100));
+    let mut second = l.take_child();
+    let probe = second.next();
+    second.send(json!({"jsonrpc": "2.0", "id": probe["id"], "result": {"supportedVersions": ["2099-01-01"]}}));
+    wait_until("stop_own", || l.calls().contains(&"reap 101".to_string()));
+    c.hang_up();
+    wait_until("the client to leave", || docs(&hub).clients == 0);
+    // Past idle_stop_secs (10 s): retiring now would forget the verdict before its retry.
+    hub.tick(Instant::now() + Duration::from_secs(11));
+    assert_eq!(
+        lock(&hub.inner.map).instances.len(),
+        1,
+        "retired before the retry"
+    );
+    let until = unsupported_until(&hub, 1);
+    hub.tick(until + Duration::from_secs(1));
+    assert_eq!(lock(&hub.inner.map).instances.len(), 0);
     hub.shutdown();
 }
