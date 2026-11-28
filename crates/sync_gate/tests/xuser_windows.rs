@@ -1726,14 +1726,9 @@ fn x13a_elevated_reads_its_own_config() {
         );
         r
     };
-    let made = ps("create", "0");
-    if made.code == 3 {
-        println!("skipped: guest config exists");
-        c.end();
-        return;
-    }
-    // From here every way out (a failed create, a panic) removes what this round made; the normal
-    // way checks it below.
+    // From `create` on, every way out (a failed create, a panic, one inside `create` included)
+    // removes what this round made: `clean` touches only a file with this round's marker and the
+    // folders it listed. The normal way checks it below.
     struct Clean<F: Fn() -> Res>(F, bool);
     impl<F: Fn() -> Res> Drop for Clean<F> {
         fn drop(&mut self) {
@@ -1748,6 +1743,15 @@ fn x13a_elevated_reads_its_own_config() {
         }
     }
     let mut clean = Clean(|| ps("clean", "0"), false);
+    let made = ps("create", "0");
+    if made.code == 3 {
+        // Not ours: nothing to clean.
+        clean.1 = true;
+        drop(clean);
+        println!("skipped: guest config exists");
+        c.end();
+        return;
+    }
     // Removed (only ours) and checked: exit 0, the file gone, no folder this round made left.
     let check = |gone: &Res| {
         assert_eq!(gone.code, 0, "clean: {}{}", gone.out, gone.err);

@@ -224,13 +224,15 @@ fn read_operational(p: &Path) -> io::Result<String> {
     std::fs::read_to_string(p)
 }
 
-/// Windows: nothing holds `p` open for writing its data. Opened for DELETE only (it takes part in
-/// the sharing check without reading the data, which a full read would make the virus scanner do
-/// for every file of the cluster), sharing reads and deletes but not writes. Contract, pinned by
-/// `check_tree_probe_refuses_what_a_read_refuses`: refuses every handle with write or append
-/// access, as `open_private_file` does; also refuses a handle that does not share deletes (a
-/// sharing violation: retried, never disabling); judges nothing (`check_private_file` did, just
-/// before, in a folder only this user can change).
+/// Windows: nothing holds `p` open for writing its data. Opened for DELETE (it takes part in the
+/// sharing check without reading the data, which a full read would make the virus scanner do for
+/// every file of the cluster), sharing reads and deletes but not writes. What
+/// `check_tree_probe_refuses_writers` pins: a handle with write or append access is refused
+/// (sharing violation), as `open_private_file` refuses it; a reader that shares deletes and a
+/// read-only file pass. It is not a read: it also refuses a reader that does not share deletes,
+/// and DELETE access is granted by its own rules, so it may fail where a read would not (that
+/// error stops the start as it is). Judges nothing (`check_private_file` did, just before, in a
+/// folder only this user can change).
 #[cfg(windows)]
 fn no_writer(p: &Path) -> io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
